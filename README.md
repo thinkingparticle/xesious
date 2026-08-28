@@ -76,7 +76,7 @@ off is now a **hard startup error**, not a warning.
 | *(any file)* | Upload it into this topic's `inbox/` (a caption runs as a prompt) |
 | `/whoami` | Show your user/chat/topic ids (for the allowlist) — works for anyone |
 | `/new` (or `/clear`) | Start a fresh session in this topic. The old session id is **kept** (nothing deleted) — `/resume` to undo. Like Claude's own `/clear`, this resets context without deleting the session. |
-| `/resume [id]` | Restore the previous session (undo `/new`), or bind this topic to a specific past session id |
+| `/resume [id]` | Restore the previous session (undo `/new`), or bind this topic to a specific past session — the 8-character prefix `/sessions` prints is enough, and an ambiguous one is refused rather than guessed |
 | `/compact [focus]` | Summarize this topic's session history to free up context (memory kept) |
 | `/stop` | Cancel the task currently running in this topic |
 | `/voice [on\|off]` | Voice mode: transcribe voice notes and speak answers back (eyes-free). Default from `TG_VOICE`. |
@@ -84,12 +84,12 @@ off is now a **hard startup error**, not a warning.
 | `/mode [plan\|acceptEdits\|auto\|bypass]` | Show or set this topic's permission mode. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_PERMISSION_MODE`. |
 | `/plan <task>` | One read-only turn: Claude researches and proposes without editing. Doesn't change the topic's mode, so "go ahead" carries the plan out. |
 | `/model [opus\|sonnet\|haiku\|fable]` | Show or set this topic's model — an alias, a full id, or `default` to clear. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_MODEL`. |
-| `/usage` `/cost` `/context` | Claude's own commands, forwarded to the CLI as-is. They report rather than prompt the model, so they're free and take no turn. |
+| `/usage` `/cost` `/context` | Claude's own commands, forwarded to the CLI as-is. They report rather than prompt the model, so they're free and take no turn. Each answer carries a **🔄 Refresh** button that re-reads the numbers into the same message, so checking twice doesn't leave two. |
 | `/logo bot\|group` | Set the bot's avatar (`setMyProfilePhoto`) or this group's photo (`setChatPhoto`) from `assets/`. Startup only fills these in when they're missing; this replaces an existing one. |
 | `/get <path>` | Send a file from this topic's directory back to you |
 | `/cwd <abs-path>` | Set this topic's working directory (resets its session) |
 | `/status` | Show this topic's session id, cwd and permission mode |
-| `/sessions <dir…>` | List the Claude sessions stored for one or more directories (what the IDE/CLI picker shows) |
+| `/sessions <dir…>` | List the Claude sessions stored for one or more directories (what the IDE/CLI picker shows), as a **tappable picker** — tap one to bind this topic to it, page through with `‹ Prev` / `Next ›` |
 | `/import <dir…>` | Make a topic for each session in the given directories — bound + recent history backfilled |
 | `/history [N]` | Re-post the last N turns of this topic's bound session |
 | `/help` | Usage |

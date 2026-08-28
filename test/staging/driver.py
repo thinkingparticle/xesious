@@ -48,7 +48,14 @@ REAL_CLAUDE = env("STAGING_REAL_CLAUDE", required=False, default="") in ("1", "t
 #   STAGING_ONLY=interrupt STAGING_REAL_CLAUDE=1 test/staging/run-staging.sh
 # Matched as a substring of the test's function name (or, in stub mode, of the
 # prompt). Empty runs everything, which is what CI and a pre-commit check want.
+# Comma-separated selects several — one feature's fix often spans more than one
+# case, and running them one invocation at a time reboots the bridge each round.
 ONLY = env("STAGING_ONLY", required=False, default="").strip().lower()
+ONLY_PARTS = [p.strip() for p in ONLY.split(",") if p.strip()]
+
+
+def selected_by_only(name: str) -> bool:
+    return not ONLY_PARTS or any(p in name.lower() for p in ONLY_PARTS)
 # A forum GROUP, for the tests that need topics. Fan-out gives each part its own
 # topic so it can be steered, which a DM cannot do — without this the spawning path
 # is untestable, and the case says so rather than passing vacuously.
@@ -70,6 +77,20 @@ CASES = [
 def is_status(text: str) -> bool:
     """The bridge's transient '💭 Thinking…' status (or an empty/blank line), not an answer."""
     return (not text.strip()) or ("thinking" in text.lower()) or text.strip().startswith("💭")
+
+
+def is_not_yet(text: str) -> bool:
+    """The "you are behind something" notice — by construction NOT an answer.
+
+    The bridge posts it the moment a message lands while the topic is busy, so it
+    arrives ahead of the real reply. The shared collectors below used to accept it
+    as the reply, which made every stub case after a slow one fail on a message
+    about the previous turn: two of the four canned cases failed every run, and a
+    tier that always exits 1 gates nothing.
+
+    feature_run_alongside, which is ABOUT this notice, finds it with its own
+    iter_messages scan, so filtering it here does not blind that case."""
+    return "will run after it" in text
 
 
 def rich_text(msg) -> str:
@@ -121,7 +142,8 @@ async def send_and_wait_messages(client, bot, prompt: str):
     # winding down. Every DM assertion then reads a message meant for somewhere else.
     @client.on(events.NewMessage(from_users=bot, chats=bot))
     async def handler(ev):
-        if is_status(reply_text(ev.message)):
+        t = reply_text(ev.message)
+        if is_status(t) or is_not_yet(t):
             return
         msgs.append(ev.message)
         got.set()
@@ -153,7 +175,8 @@ async def send_and_collect(client, bot, prompt: str, settle: float = 8.0):
     @client.on(events.NewMessage(from_users=bot, chats=bot))
     async def handler(ev):
         nonlocal last
-        if is_status(reply_text(ev.message)):
+        t = reply_text(ev.message)
+        if is_status(t) or is_not_yet(t):
             return
         msgs.append(ev.message)
         last = asyncio.get_event_loop().time()
@@ -1332,11 +1355,647 @@ async def feature_fanout_worktrees(client, bot):
             f"{len(trees)} worktrees on {len(branches)} branches, each part's file only in its own tree, none in the parent")
 
 
+async def send_and_collect_media(client, bot, prompt: str, settle: float = 10.0):
+    """Like send_and_collect, but never drops a DOCUMENT.
+
+    send_and_collect skips anything is_status() calls a status, and is_status treats
+    EMPTY text as one. The second file of an album carries no caption, so it looks
+    exactly like a blank status and disappears — which would make "both files
+    arrived in one group" fail for a reason that has nothing to do with the bridge.
+    """
+    msgs = []
+    last = asyncio.get_event_loop().time()
+
+    @client.on(events.NewMessage(from_users=bot, chats=bot))
+    async def handler(ev):
+        nonlocal last
+        t = reply_text(ev.message)
+        if ev.message.document or not (is_status(t) or is_not_yet(t)):
+            msgs.append(ev.message)
+            last = asyncio.get_event_loop().time()
+
+    await client.send_message(bot, prompt)
+    deadline = asyncio.get_event_loop().time() + TIMEOUT
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(0.5)
+        if msgs and (asyncio.get_event_loop().time() - last) >= settle:
+            break
+    client.remove_event_handler(handler)
+    return msgs
+
+
+async def _new_topic(client, group, title):
+    """Create a real forum topic and hand back its id, or None."""
+    from telethon.tl import functions
+    peer = await client.get_input_entity(group)
+    res = await client(functions.messages.CreateForumTopicRequest(peer=peer, title=title))
+    tid = next((u.message.id for u in res.updates
+                if getattr(getattr(u, "message", None), "id", None) and getattr(u.message, "action", None)), None)
+    return note_topic(tid)
+
+
+def bridge_state():
+    """The staging bridge's own state.json. Asserting against what the BRIDGE
+    recorded beats inferring from directory listings: the base also holds the DM's
+    directory and anything a previous case left, so "is there a folder named X"
+    cannot tell you which topic actually owns it."""
+    import json
+    try:
+        with open(os.environ.get("TG_STATE_FILE", ""), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def cwd_of_topic(state, chat_id, thread_id):
+    return ((state.get("sessions", {}) or {}).get(f"{chat_id}:{thread_id}") or {}).get("cwd")
+
+
+def _dirs_under_base():
+    base = os.environ.get("TG_SESSIONS_BASE", "")
+    try:
+        return sorted(os.listdir(base))
+    except OSError:
+        return []
+
+
+async def feature_unicode_topic_directories(client, bot):
+    """A topic named in a non-Latin script must get its OWN directory.
+
+    The production bug: sanitize() ran on `\\w`, which is ASCII-only, so every letter
+    of a Persian, Arabic, Hebrew, Cyrillic, CJK or Devanagari name became `-`, the
+    name trimmed to the empty string, and the `|| 'topic'` fallback turned that into
+    the constant `topic`. EVERY non-Latin topic on the deployment therefore shared
+    <SESSIONS_BASE>/topic — one cwd, one git checkout, one outbox — and a YouTube
+    transcript generated in خلاصه یوتیوب was delivered into پک کادو.
+
+    Only this tier can prove the fix: it needs a REAL forum topic (so Telegram sends
+    the forum_topic_created service message the bridge learns the name from) and the
+    REAL directory the bridge then creates on disk. Tier 2 fakes both.
+
+    It also covers the second half — two topics legitimately called the same thing —
+    and the `..` traversal found while verifying, since all three come from the one
+    line of code.
+    """
+    if not GROUP_ID:
+        return ("a non-Latin topic gets its own directory, and its files come back to it", False,
+                "STAGING_GROUP_ID is not set, so no real topic could be created")
+    group = int(GROUP_ID)
+    base = os.environ.get("TG_SESSIONS_BASE", "")
+    problems = []
+    seen = []
+
+    @client.on(events.NewMessage(chats=group))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    # Two Persian names, the exact pair from the production report, plus two topics
+    # deliberately given the SAME name, plus the dot-only name.
+    wanted = [("خلاصه یوتیوب", "خلاصه-یوتیوب"), ("پک کادو", "پک-کادو"),
+              ("notes", "notes"), ("notes", "notes"), ("..", None)]
+    topics = []
+    for title, _ in wanted:
+        tid = await _new_topic(client, group, title)
+        if not tid:
+            problems.append(f"could not create a topic named {title!r}")
+        topics.append(tid)
+        await asyncio.sleep(1)
+
+    # A message in each topic is what makes the bridge resolve (and create) its cwd.
+    for tid, (title, _) in zip(topics, wanted):
+        if tid:
+            await client.send_message(group, "Reply with the single word READY.", reply_to=tid)
+            await asyncio.sleep(2)
+    want = len([t for t in topics if t])
+    await _until(lambda: len([m for m in seen if not m.out and "READY" in (reply_text(m) or "")]) >= want, 240)
+
+    print(f"    directories under the sessions base: {_dirs_under_base()}")
+    state = bridge_state()
+    resolved = {}
+    for tid, (title, _) in zip(topics, wanted):
+        if tid:
+            resolved[title] = cwd_of_topic(state, group, tid)
+    print(f"    topic -> cwd: { {k: (os.path.basename(v) if v else None) for k, v in resolved.items()} }")
+
+    # --- each Persian topic got a directory named in ITS OWN script ---------------
+    # The bug was every one of them landing on the single fallback directory, so the
+    # assertion is per topic and against what the bridge recorded, not against the
+    # mere presence of a folder somebody else may have made.
+    for title, expect in wanted[:2]:
+        got = resolved.get(title)
+        if not got:
+            problems.append(f"{title!r} never got a cwd recorded")
+        elif os.path.basename(got) != expect:
+            problems.append(f"{title!r} resolved to {os.path.basename(got)!r}, expected {expect!r}")
+        # Named explicitly, because THIS is the regression: the fallback constant.
+        elif os.path.basename(got) == "topic":
+            problems.append(f"{title!r} fell back to the shared 'topic' directory — the bug is back")
+    if resolved.get(wanted[0][0]) and resolved.get(wanted[0][0]) == resolved.get(wanted[1][0]):
+        problems.append("both Persian topics share one directory")
+
+    # --- two topics with the same name did not share one directory ---------------
+    notes = [cwd_of_topic(state, group, t) for t in topics[2:4] if t]
+    print(f"    same-name topics resolved to: {[os.path.basename(n) if n else None for n in notes]}")
+    if len(notes) == 2 and notes[0] and notes[0] == notes[1]:
+        problems.append(f"two topics named 'notes' share one directory ({notes[0]})")
+
+    # --- the dot-only name did not escape the base -------------------------------
+    # sanitize('..') used to return '..' untouched, and join(BASE, '..') resolves to
+    # the PARENT of the sessions base. Falling back to the shared 'topic' directory
+    # is the CORRECT outcome for a name with no letters or digits in it — what must
+    # never happen is the path leaving the base.
+    dotdot = cwd_of_topic(state, group, topics[4]) if topics[4] else None
+    print(f"    '..' resolved to: {dotdot}")
+    if dotdot:
+        real, root = os.path.realpath(dotdot), os.path.realpath(base)
+        if not (real == root or real.startswith(root + os.sep)):
+            problems.append(f"a topic named '..' escaped the sessions base: {real}")
+        if os.path.dirname(real.rstrip(os.sep)) != root:
+            problems.append(f"'..' resolved outside the base's immediate children: {real}")
+
+    # --- the symptom itself: a file made in one Persian topic comes back to IT ----
+    # The directory check above is the root cause; this is what the user actually
+    # saw. Two topics, two different files, each asked for at the same time.
+    if topics[0] and topics[1]:
+        mark = seen[-1].id if seen else 0
+        await client.send_message(group,
+            "Write a file named alpha.txt containing exactly ALPHA9 into your outbox directory, then reply DONE.",
+            reply_to=topics[0])
+        await client.send_message(group,
+            "Write a file named beta.txt containing exactly BETA9 into your outbox directory, then reply DONE.",
+            reply_to=topics[1])
+        await _until(lambda: len([m for m in seen if m.id > mark and not m.out and m.document]) >= 2, 300)
+        delivered = {}
+        for m in seen:
+            if m.id > mark and not m.out and m.document:
+                name = next((a.file_name for a in m.document.attributes
+                             if getattr(a, "file_name", None)), "?")
+                delivered.setdefault(_topic_of(m), []).append(name)
+        print(f"    files delivered per topic: {delivered}")
+        a_files = delivered.get(topics[0], [])
+        b_files = delivered.get(topics[1], [])
+        if not any("alpha" in f for f in a_files):
+            problems.append(f"alpha.txt did not come back to خلاصه یوتیوب (got {a_files})")
+        if not any("beta" in f for f in b_files):
+            problems.append(f"beta.txt did not come back to پک کادو (got {b_files})")
+        # The leak, stated as its own assertion: neither topic may receive the other's.
+        if any("beta" in f for f in a_files) or any("alpha" in f for f in b_files):
+            problems.append("a file crossed between the two topics — the outbox is still shared")
+
+    client.remove_event_handler(handler)
+    return ("a non-Latin topic gets its own directory, and its files come back to it",
+            not problems, "; ".join(problems) if problems else
+            f"{ {k: (os.path.basename(v) if v else None) for k, v in resolved.items()} } — "
+            "Persian names intact and distinct, same-name topics separated, '..' contained, "
+            "and each topic's outbox file came back to the topic that made it")
+
+
+async def feature_long_answer_is_one_album(client, bot):
+    """A long answer arrives as ONE grouped message with a FORMATTED caption.
+
+    Two bugs in one delivery. The files were sent with two independent sendDocument
+    calls, so one answer landed as two messages — the .html carrying the preview and
+    a bare .md underneath that read as a stray attachment. And the caption was the
+    only message in the whole bridge sent with no parse mode, so the preview of the
+    longest, most heavily formatted answers was the one place a user saw literal
+    `**bold**` and `| pipe | tables |`.
+
+    Only real Telegram can settle either: `grouped_id` is assigned by the server, and
+    whether a caption's markup became ENTITIES or stayed as characters is a parsing
+    result, not an API argument.
+    """
+    prompt = (
+        "Reply with ONLY the following, no preamble and no commentary. "
+        "Start with a level-2 markdown heading 'Inventory report'. "
+        "Then one sentence containing the bold phrase 'critical shortage' and the "
+        "inline code `resolveCwd()`. Then a markdown table with columns Item, Count, Note "
+        "and three rows. Then a numbered list of 180 lines, each exactly "
+        "'N. The quick brown fox jumps over the lazy dog.' with N counting up from 1."
+    )
+    print("  → asking for a long, heavily formatted answer")
+    msgs = await send_and_collect_media(client, bot, prompt, settle=10.0)
+    docs = [m for m in msgs if m.document]
+    if not docs:
+        return ("a long answer arrives as one album with a formatted caption", False,
+                f"no document came back — the answer may have been short enough to send inline "
+                f"({[len(reply_text(m) or '') for m in msgs]} chars per message)")
+
+    problems = []
+    names = [next((a.file_name for a in d.document.attributes if getattr(a, "file_name", None)), "?")
+             for d in docs]
+    print(f"    documents: {names}")
+
+    # --- one album, not two deliveries -------------------------------------------
+    gids = {getattr(d, "grouped_id", None) for d in docs}
+    print(f"    grouped_id(s): {gids}")
+    if len(docs) < 2:
+        problems.append(f"only one file came back ({names}) — expected .html and .md")
+    elif None in gids:
+        problems.append("the files were sent ungrouped — they arrive as separate messages again")
+    elif len(gids) != 1:
+        problems.append(f"the files landed in different albums: {gids}")
+
+    # --- the caption is formatted, and rides on the first file only ---------------
+    captioned = [d for d in docs if (d.message or "").strip()]
+    if len(captioned) != 1:
+        problems.append(f"expected exactly one captioned file, got {len(captioned)}")
+    if captioned:
+        cap = captioned[0]
+        text = cap.message or ""
+        kinds = [type(e).__name__ for e in (cap.entities or [])]
+        print(f"    caption entities: {kinds or 'none'}")
+        print(f"    caption head: {text[:90]!r}")
+        if not kinds:
+            problems.append("the caption carries NO entities — it was sent with no parse mode again")
+        # The specific thing the user complained about seeing.
+        for raw in ("**", "###"):
+            if raw in text:
+                problems.append(f"literal {raw!r} in the caption — markdown syntax is still leaking through")
+        if "Full answer" not in text:
+            problems.append("the caption lost its 'Full answer attached' note")
+        if len(text) > 1024:
+            problems.append(f"caption is {len(text)} chars, over Telegram's 1024 cap")
+        # A truncation that opens a fence it never closes is what made Telegram
+        # reject the caption outright, which used to cost the FILE.
+        if text.count("```") % 2:
+            problems.append("the caption ends inside an unclosed code fence")
+
+    return ("a long answer arrives as one album with a formatted caption", not problems,
+            "; ".join(problems) if problems else
+            f"{len(docs)} files in one album ({names}), caption formatted "
+            f"({len(captioned[0].entities or []) if captioned else 0} entities, "
+            f"{len(captioned[0].message or '') if captioned else 0} chars)")
+
+
+async def feature_rtl_answer_stays_rich(client, bot):
+    """A Persian answer with a table must arrive as a NATIVE rich message.
+
+    sendRich used to route on `!needsRich(part) || hasRtl(part)`, so ANY text
+    containing one right-to-left character was forced onto the MarkdownV2 path —
+    no tables, no headings, no collapsibles. For anyone working in Persian, Arabic
+    or Hebrew that was not a corner case, it was the permanent renderer, and the
+    worse one. Telegram bug 62877 was re-checked on 2026-08-28 (still open, Android
+    12.8.2) and is scoped to table ALIGNMENT and bullet side, not to rich text as
+    such, so the gate was deleted.
+
+    Only this tier can tell the two apart: a rich message arrives with `.message`
+    EMPTY and its content in `.rich_message`, which is exactly what rich_text()
+    exists to read.
+    """
+    prompt = (
+        "Reply in PERSIAN with ONLY a markdown table, no preamble and no commentary. "
+        "Three columns headed نام, تعداد, وضعیت. Three rows: کتاب / ۱۲ / فعال; "
+        "مجله / ۷ / بسته; دفتر / ۳ / فعال."
+    )
+    print("  → asking for a Persian table")
+    msgs = await send_and_wait_messages(client, bot, prompt)
+    if not msgs:
+        return ("a Persian answer with a table is delivered as rich text", False,
+                "no reply within timeout")
+
+    msg = msgs[-1]
+    rich = rich_text(msg)
+    plain = msg.message or ""
+    print(f"    rich_message: {'yes' if rich else 'no'}; plain len={len(plain)}")
+    print(f"    text: {(rich or plain)[:110]!r}")
+
+    problems = []
+    if not rich:
+        problems.append("delivered on the LEGACY MarkdownV2 path — the hasRtl downgrade is back")
+    # A flattened table is the tell-tale of the legacy path: mdTablesToCode turns it
+    # into an aligned code block because MarkdownV2 has no table.
+    if not rich and "```" in plain:
+        problems.append("the table was flattened into a code block instead of rendered")
+    blob = rich or plain
+    for cell in ("نام", "کتاب", "مجله", "دفتر"):
+        if cell not in blob:
+            problems.append(f"cell {cell!r} did not survive delivery")
+
+    return ("a Persian answer with a table is delivered as rich text", not problems,
+            "; ".join(problems) if problems else
+            "arrived as a native rich message with every Persian cell intact")
+
+
+async def feature_rtl_answer_file_reads_correctly(client, bot):
+    """The .html a long RTL answer becomes must not be hardcoded left-to-right.
+
+    htmlDocument emitted `<html lang="en">` with no `dir`, `text-align: left` on
+    cells and `border-left` on quotes, so an Arabic or Persian answer opened
+    left-aligned, with bullets on the wrong side and table columns in LTR order.
+    Every long RTL answer hit it, since long answers are exactly what become files.
+
+    This tier is the only one that gets the real artefact: it downloads the file
+    Telegram actually delivered and reads what is in it.
+    """
+    # The list has to be long enough to push the answer past TG_REPLY_FILE_CHARS, or
+    # there is no file to inspect and the case fails for a reason that has nothing to
+    # do with direction. A fixed repeated line with a counter is the shape the model
+    # complies with most reliably — a vaguer "write a long answer" came back short.
+    prompt = (
+        "Reply in PERSIAN with ONLY the following, no preamble and no commentary. "
+        "First a level-2 markdown heading 'گزارش'. "
+        "Then a paragraph of Persian prose. "
+        "Then this English sentence on its own line: The identifier resolveCwd is English. "
+        "Then a markdown table with columns نام, تعداد, وضعیت and two rows. "
+        "Then a shell code block containing exactly: cd /home/ops && echo hi\n"
+        "Then a numbered list of 200 lines, each line exactly "
+        "'N. این یک جمله فارسی برای آزمایش است.' with N counting up from 1."
+    )
+    print("  → asking for a long Persian answer")
+    msgs = await send_and_collect_media(client, bot, prompt, settle=12.0)
+    html = next((m for m in msgs if m.document and any(
+        getattr(a, "file_name", "").endswith(".html") for a in m.document.attributes)), None)
+    if not html:
+        sizes = [len(reply_text(m) or "") for m in msgs]
+        return ("the .html of an RTL answer is direction-agnostic", False,
+                f"no .html came back — the answer was {sizes} chars, under the file threshold, "
+                "so the model did not comply with the length instruction")
+
+    path = os.path.join(os.environ.get("TG_SESSIONS_BASE", "/tmp"), "rtl-answer.html")
+    await client.download_media(html, file=path)
+    with open(path, encoding="utf-8") as fh:
+        doc = fh.read()
+    print(f"    downloaded {len(doc)} bytes")
+
+    problems = []
+    # Direction is resolved per block from its own first strong character, so a
+    # Persian answer that opens with an English heading still gets both right.
+    if 'dir="auto"' not in doc:
+        problems.append('no dir="auto" anywhere — the document is direction-blind again')
+    for tag in ('<p dir="auto"', '<td dir="auto"'):
+        if tag not in doc:
+            problems.append(f"{tag}…> missing — that block type carries no direction")
+    # Any heading level: which one the model picks is not the bridge's business.
+    if not any(f'<h{n} dir="auto"' in doc for n in range(1, 7)):
+        problems.append("no heading carries a direction")
+    if 'lang="en"' in doc:
+        problems.append('lang="en" is back — it is a claim about the model output that is not true')
+    # Logical properties, which are correct in BOTH directions.
+    if "text-align: start" not in doc:
+        problems.append("cells still use a physical text-align")
+    if "border-left" in doc:
+        problems.append("blockquote still uses border-left instead of border-inline-start")
+    # And the one thing that must NOT follow the text direction.
+    if "direction: ltr" not in doc:
+        problems.append("code is not pinned LTR — a shell pipeline in an RTL answer reads backwards")
+    if "cd /home/ops" not in doc:
+        problems.append("the shell block did not survive into the file")
+
+    try: os.remove(path)
+    except OSError: pass
+    return ("the .html of an RTL answer is direction-agnostic", not problems,
+            "; ".join(problems) if problems else
+            "per-block dir=auto, logical properties, code pinned LTR, no language claimed")
+
+
+async def feature_usage_refreshes_in_place(client, bot):
+    """/usage must refresh the SAME message, not post another one.
+
+    /usage, /cost and /context are a snapshot of a moving number, and every check
+    used to be a permanent message: look at your limit five times in an evening and
+    the topic is five near-identical blocks with the real conversation scrolled off
+    the top.
+
+    Only this tier proves the two things that matter. That the edit really is
+    in place — same message id, changed text — is a server-side fact. And Telegram
+    rejects an editMessageText whose text is byte-identical, which is the COMMON
+    case for /usage tapped twice in a minute, so the timestamp that avoids it can
+    only be checked against the real API.
+    """
+    # A RAW collector: the shared ones drop status messages, and one of the
+    # assertions here is that NO status message was posted. Filtering them first
+    # would make that check incapable of failing.
+    raw = []
+
+    @client.on(events.NewMessage(from_users=bot, chats=bot))
+    async def collect(ev):
+        raw.append(ev.message)
+
+    print("  → /usage")
+    await client.send_message(bot, "/usage")
+    await _until(lambda: next((m for m in raw if m.reply_markup), None), 90)
+    await asyncio.sleep(4)
+    client.remove_event_handler(collect)
+
+    withkb = next((m for m in raw if m.reply_markup and "Refresh" in
+                   " ".join(b.text for row in m.reply_markup.rows for b in row.buttons)), None)
+    if not withkb:
+        return ("/usage refreshes in place instead of posting again", False,
+                f"no Refresh button on any reply: {[ (reply_text(m) or '')[:60] for m in raw ]}")
+
+    problems = []
+    labels = [b.text for row in withkb.reply_markup.rows for b in row.buttons]
+    before_text = reply_text(withkb)
+    print(f"    button(s): {labels}; message id {withkb.id}")
+    print(f"    messages this turn: {[ (reply_text(m) or '')[:40] for m in raw ]}")
+    # Without a stamp the second render is byte-identical and Telegram refuses the
+    # edit, which makes the button look broken exactly when it is working.
+    if "updated" not in before_text:
+        problems.append("the report carries no 'updated HH:MM:SS' stamp")
+    # A passthrough takes no model turn, so it must not flash an Interrupt status.
+    if any(is_status(reply_text(m)) for m in raw):
+        problems.append("a '💭 Thinking…' status was posted for a command that runs no model turn")
+
+    after = []
+
+    @client.on(events.NewMessage(from_users=bot, chats=bot))
+    async def handler(ev):
+        after.append(ev.message)
+
+    print("    tapping Refresh")
+    await asyncio.sleep(2)   # so the stamp is guaranteed to differ
+    await withkb.click(0)
+
+    # Re-read the SAME message id until it changes. Polling the message rather than
+    # waiting a fixed time is the point: the assertion is that this id's content
+    # moved, which is what "edits in place" means.
+    async def changed():
+        m = await client.get_messages(bot, ids=withkb.id)
+        return m if m and reply_text(m) != before_text else None
+    fresh = None
+    for _ in range(40):
+        await asyncio.sleep(1)
+        fresh = await changed()
+        if fresh:
+            break
+    if not fresh:
+        fresh = await client.get_messages(bot, ids=withkb.id)
+    # Give any (wrong) extra message time to show up before we stop listening.
+    await asyncio.sleep(3)
+    client.remove_event_handler(handler)
+
+    after_text = reply_text(fresh) if fresh else ""
+    print(f"    same id {withkb.id}: text changed={after_text != before_text}")
+    if not fresh:
+        problems.append("the report message disappeared after the tap")
+    elif after_text == before_text:
+        problems.append("the message did not change — the refresh did not land")
+    elif not (fresh.reply_markup and any(
+            "Refresh" in b.text for row in fresh.reply_markup.rows for b in row.buttons)):
+        problems.append("the Refresh button was dropped by the edit, so it can only be used once")
+    # The whole point of the feature: no new message.
+    real_after = [m for m in after if not is_status(reply_text(m))]
+    if real_after:
+        problems.append(f"the tap posted {len(real_after)} NEW message(s) instead of editing")
+
+    return ("/usage refreshes in place instead of posting again", not problems,
+            "; ".join(problems) if problems else
+            f"message {withkb.id} was edited in place, kept its button, and nothing new was posted")
+
+
+async def feature_sessions_picker(client, bot):
+    """/sessions must be tappable, and /resume must accept what it prints.
+
+    Reported as "how the fuck do I switch to a session from that list?" — and the
+    honest answer was that you could not. The listing printed an 8-character prefix
+    while /resume did a literal existsSync() on the full 36-character uuid, so
+    copying exactly what the bridge had just shown you failed. And nothing was a
+    code span, so on a phone you were hand-selecting hex out of a paragraph.
+
+    Real Telegram is what makes this testable: a callback button is the only in-chat
+    tap that carries a payload back to the bot (a text link can only open a URL, and
+    a printed `/resume <id>` taps as a BARE /resume, which is not a no-op — it swaps
+    in prevSessionId and rebinds the topic to the wrong session).
+
+    Restores the DM's original binding on the way out, so the cases after this one
+    do not inherit a topic pointed at some older conversation.
+    """
+    import json
+    state_file = os.environ.get("TG_STATE_FILE", "")
+    key = f"{(await client.get_me()).id}:main"
+
+    def bound():
+        try:
+            with open(state_file, encoding="utf-8") as fh:
+                return (json.load(fh).get("sessions", {}).get(key) or {}).get("sessionId")
+        except (OSError, ValueError):
+            return None
+
+    # Guarantee at least one session exists in this DM's directory, so the case is
+    # not silently vacuous when run on its own with STAGING_ONLY.
+    await send_and_wait(client, bot, "Reply with the single word READY.")
+    original = bound()
+    print(f"    bound before: {original}")
+
+    print("  → /sessions")
+    msgs, _ = await send_and_collect(client, bot, "/sessions", settle=6.0)
+    picker = next((m for m in msgs if m.reply_markup), None)
+    if not picker:
+        return ("/sessions is tappable and /resume takes the id it prints", False,
+                f"no picker keyboard: {[ (reply_text(m) or '')[:60] for m in msgs ]}")
+
+    import re
+    problems = []
+    body = reply_text(picker)
+    buttons = [b for row in picker.reply_markup.rows for b in row.buttons
+               if (getattr(b, "data", b"") or b"").startswith(b"res:")]
+    labels = [b.text for b in buttons]
+    # The listing prints each entry as "N. <title>" with "<id8> · N turns · <ago>"
+    # underneath, so the ids come from the BODY. Reading them off the buttons is what
+    # the earlier version did, and it broke the moment the buttons started carrying
+    # the title instead — which is the whole point of them.
+    ids = re.findall(r"^\s+([0-9a-f]{8}) · \d+ turns", body, re.M)
+    print(f"    {len(buttons)} button(s): {labels[:3]}{' …' if len(labels) > 3 else ''}")
+    print(f"    ids in the body: {ids[:3]}{' …' if len(ids) > 3 else ''}")
+
+    # The reported complaint, as an assertion: a button that says only `d2b39072 ·
+    # 10 turns · 4m ago` identifies a session to the filesystem and to nobody else.
+    # Every button must say what its session was ABOUT.
+    if len(ids) != len(buttons):
+        problems.append(f"{len(buttons)} buttons but {len(ids)} ids in the body — they cannot be matched up")
+    for i, l in enumerate(labels):
+        stripped = re.sub(r"^\d+\.\s*", "", l).strip().rstrip("…").strip()
+        if not stripped:
+            problems.append(f"button {i} carries no session title: {l!r}")
+        elif re.fullmatch(r"[0-9a-f]{8}.*", stripped) and "turns" in l:
+            problems.append(f"button {i} is still just a hash and a turn count: {l!r}")
+        if len(l) > 64:
+            problems.append(f"button {i} label is {len(l)} chars, too long to render on a phone")
+    # …and the body still carries the id and age the label spends no room on.
+    if not ids:
+        problems.append("the listing body carries no session ids at all")
+
+    # 64 bytes is Telegram's hard cap on callback_data; a path would not fit, which
+    # is why the payload is an index into a server-side listing.
+    for b in buttons:
+        data = getattr(b, "data", b"") or b""
+        if len(data) > 64:
+            problems.append(f"callback_data is {len(data)} bytes, over Telegram's 64-byte cap")
+
+    # --- tapping one binds the topic ---------------------------------------------
+    # NOT the first button: the listing is newest-first and the turn above just made
+    # the newest session, so button 0 is the one already bound. Tapping it correctly
+    # answers "already on this" and proves nothing about switching.
+    pick = next((i for i, sid in enumerate(ids) if not (original or "").startswith(sid)), None)
+    if pick is None or pick >= len(buttons):
+        return ("/sessions is tappable and /resume takes the id it prints", False,
+                f"only one session exists in this directory, so there is nothing to switch TO: {ids}")
+    print(f"    tapping session {pick}: {labels[pick]!r} (button 0 is the one already bound)")
+    await picker.click(pick)
+    await asyncio.sleep(6)
+    fresh = await client.get_messages(bot, ids=picker.id)
+    confirm = reply_text(fresh) if fresh else ""
+    print(f"    picker now says: {confirm[:80]!r}")
+    picked = bound()
+    print(f"    bound after tap: {picked}")
+    if picked == original:
+        problems.append("the tap did not change the topic's session binding")
+    if not any(w in confirm for w in ("Bound", "Switched", "Already on")):
+        problems.append(f"the tap gave no confirmation of what it switched: {confirm[:80]!r}")
+    # A stale picker above a switched topic invites a second, accidental tap.
+    # Assert on the BUTTONS, not on reply_markup being None: Telegram may hand back
+    # an empty ReplyInlineMarkup rather than dropping the field, and "no buttons" is
+    # what the user experiences either way.
+    left = [b for row in (fresh.reply_markup.rows if fresh and fresh.reply_markup else [])
+            for b in row.buttons]
+    if left:
+        problems.append(f"the picker kept {len(left)} button(s) after a selection was made")
+
+    # --- the reported bug: the 8-char prefix the listing prints must work ---------
+    # The prefix of a DIFFERENT session again, so /resume has a real switch to make.
+    prefix = next((sid for i, sid in enumerate(ids) if i != pick), "")
+    if not prefix:
+        # Never send a BARE /resume as a fallback: it is not a no-op, it swaps in
+        # prevSessionId and would rebind the topic to the wrong session.
+        problems.append("could not read an id prefix off any button label — /resume was not exercised")
+    else:
+        print(f"  → /resume {prefix}  (the prefix the listing printed)")
+        replies = await send_and_wait(client, bot, f"/resume {prefix}")
+        print(f"    ← {[r[:70] for r in replies]}")
+        if any("No session" in r for r in replies):
+            problems.append(f"/resume refused the 8-char prefix {prefix!r} that /sessions had just printed")
+        if not any(w in r for r in replies for w in ("Bound", "Switched", "Already on")):
+            problems.append(f"/resume gave no confirmation: {replies}")
+
+    # --- put the DM back where it was --------------------------------------------
+    if original:
+        await send_and_wait(client, bot, f"/resume {original}")
+        restored = bound()
+        print(f"    restored to: {restored}")
+        if restored != original:
+            problems.append(f"could not restore the original binding ({restored} != {original})")
+
+    return ("/sessions is tappable and /resume takes the id it prints", not problems,
+            "; ".join(problems) if problems else
+            f"{len(buttons)} tappable sessions, each button naming what its session was about "
+            f"({labels[0]!r}), the tap rebound the topic and dropped the keyboard, "
+            f"and /resume accepted the printed prefix {prefix!r}")
+
+
 FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
+                 feature_rtl_answer_stays_rich,
                  feature_midturn_text, feature_attribution, feature_reply_threading,
+                 feature_long_answer_is_one_album, feature_rtl_answer_file_reads_correctly,
+                 feature_usage_refreshes_in_place,
                  feature_interrupt_kills_the_tree, feature_run_alongside,
                  feature_files_in_and_out, feature_fork_carries_the_conversation,
+                 # After the other DM cases: it rebinds this DM's session to a past one
+                 # and puts it back afterwards, so anything running between the two would
+                 # be talking to the wrong conversation.
+                 feature_sessions_picker,
                  feature_fanout_guard,
+                 # Needs a real forum group and creates five topics of its own.
+                 feature_unicode_topic_directories,
                  # Last, and in this order: they drive a group, spawn several sessions and
                  # keep talking for a while after they return. Ahead of the DM cases they
                  # simply make more noise for those to trip over.
@@ -1354,7 +2013,7 @@ async def main():
 
     failures = total = 0
     if REAL_CLAUDE:
-        selected = [t for t in FEATURE_TESTS if not ONLY or ONLY in t.__name__.lower()]
+        selected = [t for t in FEATURE_TESTS if selected_by_only(t.__name__)]
         # Say what was skipped. A filtered run that looks like a full one is how a
         # green suite ends up meaning nothing.
         if ONLY:
@@ -1377,11 +2036,16 @@ async def main():
             # that dies mid-way is exactly the one that leaves the most behind.
             await cleanup_topics(client)
     else:
-        cases = [c for c in CASES if not ONLY or ONLY in c[0].lower()]
+        cases = [c for c in CASES if selected_by_only(c[0])]
         if ONLY and len(cases) != len(CASES):
             print(f"[driver] STAGING_ONLY={ONLY!r} -> running {len(cases)} of {len(CASES)} stub cases")
         for prompt, expect in cases:
             total += 1
+            # send_and_wait returns on the FIRST reply, which is not the same as the
+            # turn being over — the bridge is still deleting its status message and
+            # draining the queue. Sending the next case straight into that is what
+            # produced the "already queued" notice these cases used to fail on.
+            await asyncio.sleep(3)
             replies = await send_and_wait(client, bot, prompt)
             ok = any(expect in r for r in replies)
             print(f"[{'PASS' if ok else 'FAIL'}] prompt={prompt!r} expect~{expect!r} got={replies}")

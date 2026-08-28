@@ -51,6 +51,13 @@ let nextMessageId = 1000
 // because the fallback to merely closing is the interesting half — a fallback that
 // no test ever reaches is a fallback nobody knows is broken.
 let denyDelete = false
+// A media group is all-or-nothing, so the fallback to two individual sends is the
+// half that keeps a failure cosmetic instead of losing the answer. A fallback no
+// test ever reaches is a fallback nobody knows is broken.
+let failMediaGroup = false
+// Telegram rejects an unbalanced entity outright. Before the retry existed, a
+// caption Telegram would not parse cost the user the FILE, not just the formatting.
+let failParsedCaption = false
 
 bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
   calls.push({ method, payload })
@@ -74,6 +81,13 @@ bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
     // The real API returns a thread id, and the fan-out code depends on it: without
     // one, every part would fall back to the parent's key.
     return { ok: true, result: { message_thread_id: nextMessageId++, name: payload.name, icon_color: 0 } }
+  }
+  if (method === 'sendDocument' && failParsedCaption && payload.parse_mode) {
+    return { ok: false, error_code: 400, description: "Bad Request: can't parse entities" }
+  }
+  if (method === 'sendMediaGroup') {
+    if (failMediaGroup) return { ok: false, error_code: 400, description: 'Bad Request: group send failed' }
+    return { ok: true, result: (payload.media ?? []).map(() => ({ message_id: nextMessageId++, date: 0, chat: { id: payload.chat_id, type: 'private' } })) }
   }
   // deleteMessage, deleteWebhook, setMyCommands, everything else.
   return { ok: true, result: true }
@@ -102,6 +116,10 @@ async function incoming(chatId: number, text: string, fromId = 1): Promise<Call[
     },
   })
   await bridge._drainQueue(`${chatId}:main`)
+  // /usage and friends run on their OWN queue key so a refresh tapped during a long
+  // turn doesn't sit behind it. Draining only the topic's key would return before
+  // they finished and read as an empty reply.
+  await bridge._drainQueue(`${chatId}:main#pt`)
   return calls.slice(before)
 }
 
@@ -600,30 +618,50 @@ describe('/effort plumbs --effort through to the CLI (C5)', () => {
 })
 
 describe('a long answer is delivered as a readable file (C7)', () => {
-  const docs = (cs: any[]) => cs.filter(c => c.method === 'sendDocument')
+  const groups = (cs: any[]) => cs.filter(c => c.method === 'sendMediaGroup')
+  const items = (cs: any[]) => groups(cs).flatMap(c => c.payload?.media ?? [])
 
   test('both an .html and an .md are sent', async () => {
     // The .md alone was close to unreadable on macOS: no default viewer, no
     // preview in Telegram Desktop, and double-clicking shows raw pipe-tables —
     // exactly the content that needed a file in the first place.
     const cs = await incoming(1120, 'LONG')
-    const names = docs(cs).map(c => String(c.payload?.document?.filename ?? ''))
-    expect(names.some(n => n.endsWith('.html'))).toBe(true)
-    expect(names.some(n => n.endsWith('.md'))).toBe(true)
+    const names = items(cs).map((m: any) => String(m?.media?.filename ?? ''))
+    expect(names.some((n: string) => n.endsWith('.html'))).toBe(true)
+    expect(names.some((n: string) => n.endsWith('.md'))).toBe(true)
+  }, 10000)
+
+  test('they arrive as ONE grouped message, not two deliveries', async () => {
+    // Two independent sendDocument calls read on a phone as two different things,
+    // and the second — the source of truth — looked like a stray attachment.
+    const cs = await incoming(1123, 'LONG')
+    expect(groups(cs)).toHaveLength(1)
+    expect(cs.filter(c => c.method === 'sendDocument')).toHaveLength(0)
+    expect(items(cs)).toHaveLength(2)
   }, 10000)
 
   test('the preview caption rides on the first file only', async () => {
     const cs = await incoming(1121, 'LONG')
-    const captioned = docs(cs).filter(c => c.payload?.caption)
+    const captioned = items(cs).filter((m: any) => m?.caption)
     expect(captioned).toHaveLength(1)
-    expect(String(captioned[0].payload.caption)).toContain('Full answer')
+    expect(String(captioned[0].caption)).toContain('Full answer')
+  }, 10000)
+
+  test('the caption is FORMATTED, not raw markdown syntax', async () => {
+    // It used to be the only message in the bridge sent with no parse mode, so the
+    // preview of the longest, most structured answers was the one place a user saw
+    // literal **bold** and | pipe | tables |.
+    const cs = await incoming(1124, 'LONG')
+    const first = items(cs).find((m: any) => m?.caption)
+    expect(first.parse_mode).toBe('MarkdownV2')
+    expect(String(first.caption).length).toBeLessThanOrEqual(1024)
   }, 10000)
 
   test('the files follow the same threading rule as any other answer', async () => {
     // A lone question, so no quoted header — the .md and .html are obviously its
     // answer and the link would only cost space.
     const cs = await incoming(1122, 'LONG')
-    expect(docs(cs).every(c => !c.payload?.reply_parameters)).toBe(true)
+    expect(groups(cs).every(c => !c.payload?.reply_parameters)).toBe(true)
   }, 10000)
 })
 
@@ -1401,5 +1439,417 @@ describe('fan-out: steering a part changes the combined answer', () => {
     await bridge._disposeFanoutTopics(fake, f)
     delete process.env.TG_FANOUT_TOPICS
     expect(calls.slice(before).length).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Topic directories: one per topic, in the topic's own script
+//
+// sanitize() used to run on \w, which is ASCII-only, so EVERY Persian, Arabic,
+// Hebrew, Cyrillic, CJK or Devanagari topic name reduced to the empty string and
+// then to the constant 'topic'. All of them shared <SESSIONS_BASE>/topic — one cwd,
+// one git checkout, one outbox. Found in production when a YouTube transcript
+// generated in خلاصه یوتیوب was delivered into پک کادو.
+// ---------------------------------------------------------------------------
+describe('a topic gets its own directory, whatever its name is written in', () => {
+  const named = async (threadId: number, name: string, text: string) => {
+    // The service message the bot uses to learn a topic's name.
+    await bridge.bot.handleUpdate({
+      update_id: 97000 + threadId,
+      message: {
+        message_id: 97000 + threadId, date: 0, message_thread_id: threadId,
+        chat: { id: -100777, type: 'supergroup', title: 'G', is_forum: true },
+        from: { id: 1, is_bot: false, first_name: 'T' },
+        forum_topic_created: { name, icon_color: 0 },
+      },
+    })
+    await bridge.bot.handleUpdate({
+      update_id: 97500 + threadId,
+      message: {
+        message_id: 97500 + threadId, date: 0, message_thread_id: threadId,
+        chat: { id: -100777, type: 'supergroup', title: 'G', is_forum: true },
+        from: { id: 1, is_bot: false, first_name: 'T' }, text,
+      },
+    })
+    await bridge._drainQueue(`-100777:${threadId}`)
+    return bridge._sessions()[`-100777:${threadId}`]?.cwd as string
+  }
+
+  test('two non-Latin topics do not share one directory', async () => {
+    const a = await named(7101, 'خلاصه یوتیوب', 'hello there')
+    const b = await named(7102, 'پک کادو', 'hello there')
+    expect(a).toBeTruthy()
+    expect(a).not.toBe(b)
+    // And the name survives rather than being replaced by the fallback.
+    expect(a).toContain('خلاصه-یوتیوب')
+    expect(b).toContain('پک-کادو')
+  }, 20000)
+
+  test('two topics with the SAME name get separate directories', async () => {
+    // Perfect Unicode handling still leaves two topics legitimately called "notes"
+    // sharing a cwd. The second one takes its thread id as a suffix.
+    const a = await named(7103, 'notes', 'hello there')
+    const b = await named(7104, 'notes', 'hello there')
+    expect(a).not.toBe(b)
+    expect(b).toContain('notes-7104')
+  }, 20000)
+
+  test('a topic named ".." cannot escape the sessions base', async () => {
+    // '.' and '-' were both legal, so a dot-only name passed through untouched and
+    // join(SESSIONS_BASE, '..') resolved to the PARENT of the sessions base.
+    const d = await named(7105, '..', 'hello there')
+    expect(d.startsWith(process.env.TG_SESSIONS_BASE!)).toBe(true)
+    expect(d).not.toContain('..')
+  }, 20000)
+})
+
+// ---------------------------------------------------------------------------
+// /usage and friends are a live gauge, not conversation
+// ---------------------------------------------------------------------------
+describe('the passthrough reports refresh in place', () => {
+  const kbOf = (c: any) => c.payload?.reply_markup?.inline_keyboard
+
+  test('the answer carries a Refresh button', async () => {
+    const cs = await incoming(1301, '/usage')
+    const withKb = sends(cs).find(c => kbOf(c) && String(kbOf(c)[0][0].callback_data).startsWith('psx:'))
+    expect(withKb).toBeTruthy()
+    expect(kbOf(withKb)[0][0].text).toContain('Refresh')
+    expect(kbOf(withKb)[0][0].callback_data).toBe('psx:usage')
+  }, 15000)
+
+  test('it stamps the time, so a tap that finds the same numbers still shows a change', async () => {
+    // Telegram rejects an editMessageText whose text is byte-identical, which is the
+    // COMMON case for /usage tapped twice in a minute — the button would look broken
+    // exactly when it was working.
+    const cs = await incoming(1302, '/usage')
+    const withKb = sends(cs).find(c => kbOf(c))
+    expect(String(withKb!.payload.text)).toMatch(/updated \d\d:\d\d:\d\d/)
+  }, 15000)
+
+  test('tapping it EDITS the message rather than posting another one', async () => {
+    await incoming(1303, '/usage')
+    const before = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 97900,
+      callback_query: {
+        id: 'px1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data: 'psx:usage',
+        message: { message_id: 97901, date: 0, chat: { id: 1303, type: 'private' } },
+      },
+    })
+    await bridge._drainQueue('1303:main#pt')
+    await new Promise(r => setTimeout(r, 300))
+    const after = calls.slice(before)
+    expect(after.some(c => c.method === 'editMessageText')).toBe(true)
+    // The whole point: checking your limit five times must not leave five messages.
+    expect(after.filter(c => c.method === 'sendMessage')).toHaveLength(0)
+  }, 15000)
+
+  test('a passthrough run posts no "thinking" status at all', async () => {
+    // It spawns a CLI but takes no model turn, so the status flashed for two seconds
+    // offering to Interrupt a run that does nothing.
+    const cs = await incoming(1304, '/usage')
+    expect(sends(cs).some(c => textOf(c).includes('Thinking'))).toBe(false)
+  }, 15000)
+})
+
+// ---------------------------------------------------------------------------
+// /sessions used to print an 8-char prefix that /resume then refused to accept
+// ---------------------------------------------------------------------------
+describe('/sessions is a picker, and /resume accepts what it prints', () => {
+  const IDS = [
+    'aaaaaaaa-1111-4111-8111-111111111111',
+    'bbbbbbbb-2222-4222-8222-222222222222',
+  ]
+  let cwd = ''
+
+  test('setup: a topic with two past transcripts on disk', async () => {
+    await incoming(1310, 'hello there')
+    cwd = bridge._sessions()['1310:main'].cwd
+    const pdir = bridge._projectDir(cwd)
+    mkdirSync(pdir, { recursive: true })
+    for (const id of IDS) {
+      writeFileSync(join(pdir, `${id}.jsonl`), [
+        JSON.stringify({ type: 'summary', summary: `session ${id.slice(0, 4)}` }),
+        JSON.stringify({ type: 'user', sessionId: id, message: { role: 'user', content: 'a question' } }),
+      ].join('\n') + '\n')
+    }
+    expect(existsSync(join(pdir, `${IDS[0]}.jsonl`))).toBe(true)
+  }, 15000)
+
+  test('the listing is tappable — one button per session', async () => {
+    const cs = await incoming(1310, '/sessions')
+    const picker = sends(cs).find(c => c.payload?.reply_markup?.inline_keyboard?.length)
+    expect(picker).toBeTruthy()
+    const rows = picker!.payload.reply_markup.inline_keyboard
+    expect(rows.length).toBeGreaterThanOrEqual(2)
+    expect(String(rows[0][0].callback_data)).toStartWith('res:')
+    // callback_data caps at 64 bytes; an index into the listing is what keeps a
+    // directory path out of the payload.
+    expect(Buffer.byteLength(String(rows[0][0].callback_data))).toBeLessThanOrEqual(64)
+    // The button must say what the session was ABOUT. `d2b39072 · 10 turns · 4m ago`
+    // identifies a session to the filesystem and to nobody else — you cannot pick
+    // your own conversation out of a list of hashes.
+    const labels = rows.filter((r: any) => String(r[0].callback_data).startsWith('res:'))
+      .map((r: any) => String(r[0].text))
+    expect(labels.some((l: string) => l.includes('session aaaa'))).toBe(true)
+    expect(labels.some((l: string) => l.includes('session bbbb'))).toBe(true)
+    // …and the message body carries the id and age the label spends no room on.
+    expect(String(picker!.payload.text)).toMatch(/turns/)
+    expect(String(picker!.payload.text)).toContain('session aaaa')
+  }, 15000)
+
+  test('the message shows a long title in full; only the button truncates', async () => {
+    const pdir = bridge._projectDir(cwd)
+    const id = 'dddddddd-5555-4555-8555-555555555555'
+    const file = join(pdir, `${id}.jsonl`)
+    const long = 'I want to build a trading app that lets people trade forex and tokenized stocks on chain, through spot and perps, and I need to pick between a few venues'
+    writeFileSync(file, [
+      JSON.stringify({ type: 'summary', summary: long }),
+      JSON.stringify({ type: 'user', sessionId: id, message: { role: 'user', content: 'q' } }),
+    ].join('\n') + '\n')
+    try {
+      const cs = await incoming(1310, '/sessions')
+      const picker = sends(cs).find(c => c.payload?.reply_markup?.inline_keyboard?.length)
+      // The body has 4096 characters to work with, so it shows the sentence.
+      expect(String(picker!.payload.text)).toContain(long)
+      // The button has one line, so it does not.
+      const label = picker!.payload.reply_markup.inline_keyboard
+        .map((r: any) => String(r[0].text)).find((l: string) => l.includes('I want to build'))
+      expect(label!.length).toBeLessThanOrEqual(64)
+      expect(label).not.toContain(long)
+    } finally { rmSync(file, { force: true }) }
+  }, 15000)
+
+  test('scaffolding is never used as a session title', async () => {
+    // Reported: a session showed up as "<local-command-caveat>Caveat: The messages
+    // below were generated by the user whil". Both kinds of noise are covered — the
+    // harness's injected block, and the bridge's own attribution framing.
+    const pdir = bridge._projectDir(cwd)
+    const id = 'eeeeeeee-6666-4666-8666-666666666666'
+    const file = join(pdir, `${id}.jsonl`)
+    writeFileSync(file, [
+      // No summary line, so the label has to come from the user turns.
+      JSON.stringify({ type: 'user', sessionId: id, message: { role: 'user', content:
+        '<local-command-caveat>Caveat: The messages below were generated by the user while running local commands.</local-command-caveat>\n<command-name>/clear</command-name>' } }),
+      JSON.stringify({ type: 'user', sessionId: id, message: { role: 'user', content:
+        '[xesious:cfe601edd91a] this directory is shared with another topic (a fork).' } }),
+      JSON.stringify({ type: 'user', sessionId: id, message: { role: 'user', content:
+        '[xesious:cfe601edd91a] message from G, id 93362715:\nwhy is the gold fund premium moving?' } }),
+    ].join('\n') + '\n')
+    try {
+      const cs = await incoming(1310, '/sessions')
+      const picker = sends(cs).find(c => c.payload?.reply_markup?.inline_keyboard?.length)
+      const body = String(picker!.payload.text)
+      expect(body).not.toContain('local-command-caveat')
+      expect(body).not.toContain('[xesious:')
+      expect(body).not.toContain('shared with another topic')
+      // It fell through the two scaffolding turns to the thing the user actually said.
+      expect(body).toContain('why is the gold fund premium moving?')
+    } finally { rmSync(file, { force: true }) }
+  }, 15000)
+
+  test('a long title is truncated to something a phone can render', async () => {
+    const pdir = bridge._projectDir(cwd)
+    const longId = 'cccccccc-3333-4333-8333-333333333333'
+    const file = join(pdir, `${longId}.jsonl`)
+    writeFileSync(file, [
+      JSON.stringify({ type: 'summary', summary: 'x'.repeat(200) }),
+      JSON.stringify({ type: 'user', sessionId: longId, message: { role: 'user', content: 'q' } }),
+    ].join('\n') + '\n')
+    try {
+      const cs = await incoming(1310, '/sessions')
+      const picker = sends(cs).find(c => c.payload?.reply_markup?.inline_keyboard?.length)
+      const labels = picker!.payload.reply_markup.inline_keyboard
+        .filter((r: any) => String(r[0].callback_data).startsWith('res:'))
+        .map((r: any) => String(r[0].text))
+      expect(labels.every((l: string) => l.length <= 64)).toBe(true)
+      expect(labels.some((l: string) => l.endsWith('…'))).toBe(true)
+    } finally {
+      // Removed again: it is the NEWEST session, so leaving it behind would make the
+      // next case's "tap the first button" land on this fixture instead.
+      rmSync(file, { force: true })
+    }
+  }, 15000)
+
+  test('tapping one binds the topic to that session', async () => {
+    const cs = await incoming(1310, '/sessions')
+    const picker = sends(cs).find(c => c.payload?.reply_markup?.inline_keyboard?.length)
+    const btn = picker!.payload.reply_markup.inline_keyboard[0][0]
+    await bridge.bot.handleUpdate({
+      update_id: 97950,
+      callback_query: {
+        id: 'rs1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data: btn.callback_data,
+        message: { message_id: 97951, date: 0, chat: { id: 1310, type: 'private' } },
+      },
+    })
+    await new Promise(r => setTimeout(r, 200))
+    expect(IDS).toContain(bridge._sessions()['1310:main'].sessionId)
+  }, 15000)
+
+  test('/resume accepts the 8-char prefix the listing prints', async () => {
+    // The reported bug in one line: the command told you the answer in a form it
+    // then refused to accept.
+    const cs = await incoming(1310, `/resume ${IDS[1].slice(0, 8)}`)
+    expect(finalReply(cs)).not.toMatch(/No session/i)
+    expect(bridge._sessions()['1310:main'].sessionId).toBe(IDS[1])
+  }, 15000)
+
+  test('an ambiguous prefix fails loudly instead of picking one', async () => {
+    // Silently continuing the wrong conversation is the failure to avoid.
+    const pdir = bridge._projectDir(cwd)
+    writeFileSync(join(pdir, 'aaaaaaaa-9999-4999-8999-999999999999.jsonl'),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'x' } }) + '\n')
+    const cs = await incoming(1310, '/resume aaaaaaaa')
+    expect(finalReply(cs)).toMatch(/matches 2 sessions/i)
+  }, 15000)
+
+  test('an unknown prefix points at the picker rather than just failing', async () => {
+    const cs = await incoming(1310, '/resume zzzzzzzz')
+    expect(finalReply(cs)).toMatch(/\/sessions/)
+  }, 15000)
+})
+
+// ---------------------------------------------------------------------------
+// The preview caption used to be the ONE message in the bridge sent with no parse
+// mode, so the preview of the longest, most heavily formatted answers was the only
+// place a user ever saw literal **bold** and | pipe | tables |.
+// ---------------------------------------------------------------------------
+describe('the caption on a long answer', () => {
+  const cap = (t: string) => bridge._answerCaption(t) as { text: string; mode?: string }
+  const long = (s: string) => s + '\n\n' + 'tail padding. '.repeat(600)
+
+  test('is formatted, and stays inside the 1024 cap', () => {
+    const c = cap(long('## Heading\n\nSome **bold** and a `span`.'))
+    expect(c.mode).toBe('MarkdownV2')
+    expect(c.text.length).toBeLessThanOrEqual(1024)
+    expect(c.text).not.toContain('**bold**')     // rendered, not shown as syntax
+    expect(c.text).toContain('Full answer')
+  })
+
+  test('a table is flattened into a code block, which captions CAN render', () => {
+    // Captions have no table entity, so the alternative to flattening is pipes.
+    const c = cap(long('| a | b |\n|---|---|\n| 1 | 2 |'))
+    expect(c.text).toContain('```')
+    expect((c.text.match(/```/g) || []).length % 2).toBe(0)
+  })
+
+  test('escaping inflation is measured, not assumed', () => {
+    // A preview made entirely of characters MarkdownV2 must escape roughly doubles
+    // when escaped. Slicing to 900 first and escaping after would sail past 1024
+    // and Telegram would reject the whole caption — which used to cost the FILE.
+    const c = cap(long('.'.repeat(900)))
+    expect(c.text.length).toBeLessThanOrEqual(1024)
+  })
+
+  test('a fence opened by the truncation is closed', () => {
+    // An unbalanced entity is exactly what Telegram refuses to parse.
+    const c = cap('intro\n```sh\n' + 'echo one line\n'.repeat(400) + '```\ntail')
+    expect((c.text.match(/```/g) || []).length % 2).toBe(0)
+  })
+})
+
+describe('a media group that fails falls back rather than dropping the answer', () => {
+  test('both files still arrive, as individual sends', async () => {
+    failMediaGroup = true
+    try {
+      const cs = await incoming(1125, 'LONG')
+      const docs = cs.filter(c => c.method === 'sendDocument')
+      // Two messages is the cosmetic problem this feature set out to remove. A lost
+      // answer is not cosmetic, so that is the trade the fallback makes.
+      expect(docs).toHaveLength(2)
+      const names = docs.map(c => String(c.payload?.document?.filename ?? ''))
+      expect(names.some(n => n.endsWith('.html'))).toBe(true)
+      expect(names.some(n => n.endsWith('.md'))).toBe(true)
+      // And the caption still rides on the first one only.
+      expect(docs.filter(c => c.payload?.caption)).toHaveLength(1)
+    } finally { failMediaGroup = false }
+  }, 15000)
+})
+
+describe('a caption Telegram refuses to parse costs the formatting, never the file', () => {
+  test('the send is retried unformatted instead of failing', async () => {
+    failMediaGroup = true      // force the individual-send path, which is where
+    failParsedCaption = true   // sendFile's own retry lives
+    try {
+      const cs = await incoming(1126, 'LONG')
+      const docs = cs.filter(c => c.method === 'sendDocument')
+      // Two attempts for the captioned file (parsed, then plain) plus the second
+      // file — what matters is that a file with no parse_mode got through.
+      const delivered = docs.filter(c => !c.payload?.parse_mode)
+      expect(delivered.length).toBeGreaterThan(0)
+      expect(delivered.some(c => String(c.payload?.caption ?? '').includes('Full answer'))).toBe(true)
+      // The retry must send the UNESCAPED caption. Resending the MarkdownV2 string
+      // with no parse mode would show the user its backslashes.
+      const retried = delivered.find(c => String(c.payload?.caption ?? '').includes('Full answer'))!
+      expect(String(retried.payload.caption)).toContain('Full answer (')
+      expect(String(retried.payload.caption)).not.toContain('\\(')
+      // And the user is not told the send failed, because it did not.
+      expect(sends(cs).some(c => String(c.payload.text ?? '').includes('could not send'))).toBe(false)
+    } finally { failMediaGroup = false; failParsedCaption = false }
+  }, 15000)
+})
+
+describe('the /sessions picker paginates', () => {
+  // Page 1 is all the flow test above reaches. This directory has far more sessions
+  // than fit one keyboard, which is the case the pager exists for.
+  const dir = join(TMP, 'paged')
+  let token = ''
+
+  test('setup: 20 sessions in one directory', () => {
+    mkdirSync(dir, { recursive: true })
+    const pdir = bridge._projectDir(dir)
+    mkdirSync(pdir, { recursive: true })
+    for (let i = 0; i < 20; i++) {
+      const id = `${String(i).padStart(8, '0')}-4444-4444-8444-444444444444`
+      writeFileSync(join(pdir, `${id}.jsonl`), [
+        JSON.stringify({ type: 'summary', summary: `topic number ${i}` }),
+        JSON.stringify({ type: 'user', sessionId: id, message: { role: 'user', content: 'q' } }),
+      ].join('\n') + '\n')
+    }
+    token = bridge._listing.make(dir, bridge._listSessions(dir))
+    expect(bridge._listSessions(dir)).toHaveLength(20)
+  })
+
+  const sessionRows = (kb: any) => kb.inline_keyboard.filter((r: any) => String(r[0].callback_data).startsWith('res:'))
+  const navRow = (kb: any) => kb.inline_keyboard.find((r: any) => r.some((b: any) => String(b.callback_data).startsWith('spg:')))
+
+  test('page 1 shows 8 and offers Next but not Prev', () => {
+    const kb = bridge._listing.kb(token, 0)
+    expect(sessionRows(kb)).toHaveLength(8)
+    const nav = navRow(kb).map((b: any) => b.text)
+    expect(nav).toContain('1/3')
+    expect(nav.some((t: string) => t.includes('Next'))).toBe(true)
+    expect(nav.some((t: string) => t.includes('Prev'))).toBe(false)
+    expect(bridge._listing.text(token, 0)).toContain('page 1/3')
+  })
+
+  test('the middle page offers both directions', () => {
+    const nav = navRow(bridge._listing.kb(token, 8)).map((b: any) => b.text)
+    expect(nav).toContain('2/3')
+    expect(nav.some((t: string) => t.includes('Prev'))).toBe(true)
+    expect(nav.some((t: string) => t.includes('Next'))).toBe(true)
+  })
+
+  test('the last page is short and offers no Next', () => {
+    const kb = bridge._listing.kb(token, 16)
+    expect(sessionRows(kb)).toHaveLength(4)          // 20 - 16
+    const nav = navRow(kb).map((b: any) => b.text)
+    expect(nav.some((t: string) => t.includes('Next'))).toBe(false)
+    expect(nav.some((t: string) => t.includes('Prev'))).toBe(true)
+  })
+
+  test('every page numbers its entries continuously, so a button matches its line', () => {
+    // The button says "9. …" and the body's ninth entry must be the same session, or
+    // the number that ties them together is a lie.
+    const kb = bridge._listing.kb(token, 8)
+    expect(String(sessionRows(kb)[0][0].text)).toStartWith('9.')
+    expect(bridge._listing.text(token, 8)).toContain('9. ')
+  })
+
+  test('an expired listing says so instead of rendering an empty picker', () => {
+    expect(bridge._listing.text('nosuch', 0)).toMatch(/expired/i)
+    expect(bridge._listing.kb('nosuch', 0).inline_keyboard).toHaveLength(0)
   })
 })

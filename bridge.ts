@@ -17,7 +17,7 @@
  *
  * Config comes from the environment (and a sibling .env). See .env.example.
  */
-import { Bot, InputFile, type Context } from 'grammy'
+import { Bot, InputFile, InputMediaBuilder, type Context } from 'grammy'
 import { run, type RunnerHandle } from '@grammyjs/runner'
 import telegramify from 'telegramify-markdown'
 import { autoRetry } from '@grammyjs/auto-retry'
@@ -32,12 +32,12 @@ import {
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
   EFFORT_LEVELS, EFFORT_DEFAULT, normalizeEffort,
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
-  markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
+  markdownToHtml, htmlDocument, previewCut, transcriptSpeech, lastEffortFrom, needsReplyLink,
   fanoutPlanPrompt, parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble,
   FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName, filesPreamble,
   type FanoutPlanItem,
   frameUserMessage, attributionProfileLines,
-  needsRich, hasRtl, sanitizeProse,
+  needsRich, sanitizeProse,
   normalizeMode as libNormalizeMode,
   permissionArgs as libPermissionArgs,
   renderSteps as libRenderSteps,
@@ -409,12 +409,41 @@ function resolveCwd(ctx: Context, threadId: number | undefined): string {
     dir = join(SESSIONS_BASE, `${chat.id}-general`)
   } else {
     const name = names[key]
-    dir = join(SESSIONS_BASE, name ? sanitize(name) : `topic-${threadId}`)
+    dir = name ? uniqueTopicDir(sanitize(name), key, threadId) : join(SESSIONS_BASE, `topic-${threadId}`)
   }
   ensureDir(dir)
   sessions[key] = { ...(sessions[key] ?? {}), cwd: dir }
   saveState()
   return dir
+}
+// A directory for a NAMED topic that no other topic has already claimed.
+//
+// Two topics legitimately named "notes" would otherwise share one cwd — one git
+// repo, one set of files, and (for anything the model drops in the shared root
+// ./outbox/ rather than its own tagged subdir) one delivery race. So the plain
+// name is used when it is free, and the thread id is appended when it is not:
+// `notes`, then `notes-96`. The suffix is the topic's own id rather than a
+// counter because that is the one value already guaranteed unique per chat, and
+// it makes the directory traceable back to the topic that owns it.
+//
+// The check-then-claim looks racy and is not: resolveCwd is fully synchronous and
+// writes sessions[key] before it returns, so no other topic can be resolved in
+// between on a single-threaded runtime.
+function uniqueTopicDir(base: string, key: string, threadId: number): string {
+  const claimed = new Set<string>()
+  for (const [k, e] of Object.entries(sessions)) if (k !== key && e?.cwd) claimed.add(resolve(e.cwd))
+  const free = (d: string) => !claimed.has(resolve(d))
+  const first = join(SESSIONS_BASE, base)
+  if (free(first)) return first
+  // Thread ids are unique within a chat but not across chats, so the id alone can
+  // still land on a taken directory; the counter is the last resort, not the norm.
+  const withId = join(SESSIONS_BASE, `${base}-${threadId}`)
+  if (free(withId)) return withId
+  for (let n = 2; n < 1000; n++) {
+    const d = join(SESSIONS_BASE, `${base}-${threadId}-${n}`)
+    if (free(d)) return d
+  }
+  return withId
 }
 function ensureDir(dir: string): string {
   try { mkdirSync(dir, { recursive: true }) } catch (e) { console.error(`[warn] mkdir ${dir}: ${e}`) }
@@ -818,9 +847,13 @@ type RunOpts = {
   // for anything running in parallel with the topic.
   fork?: boolean
   queueKey?: string
+  // Skip the live status message entirely. For runs the user did not experience as
+  // a "turn": /usage and friends take no model time, so the status flashed for two
+  // seconds offering an Interrupt button for a run that does nothing.
+  silent?: boolean
 }
 async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE, model: string = MODEL, ro: RunOpts = {}): Promise<ClaudeResult> {
-  const { onInit, effort = EFFORT_TIER, askedBy, fork } = ro
+  const { onInit, effort = EFFORT_TIER, askedBy, fork, silent } = ro
   const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...permissionArgs(mode)]
   if (TELEGRAM_PROFILE.trim()) args.push('--append-system-prompt', TELEGRAM_PROFILE)
   if (resumeId) args.push('--resume', resumeId)
@@ -836,7 +869,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
   const interruptKb = { inline_keyboard: [[{ text: INTERRUPT_LABEL, callback_data: `int:${jobId}` }]] }
   // Status is machine chatter, not an answer — post and edit it silently so only
   // the real reply buzzes the user's phone.
-  const status = await ctx.api.sendMessage(ctx.chat!.id, THINKING,
+  const status = silent ? null : await ctx.api.sendMessage(ctx.chat!.id, THINKING,
     { ...opts, disable_notification: true, reply_markup: interruptKb }).catch(() => null)
   if (status) { pending.push({ chat: ctx.chat!.id, id: status.message_id }); saveState() }
   const steps: Step[] = []
@@ -1128,7 +1161,7 @@ async function sendLegacyMd(ctx: Context, opts: any, text: string): Promise<void
   }
 }
 
-// needsRich and hasRtl (the rich-vs-MarkdownV2 routing rules) and sanitizeProse
+// needsRich (the rich-vs-MarkdownV2 routing rule) and sanitizeProse
 // (the one escaping stage per dialect) are pure, so they live in ./lib and are
 // unit-tested there. The long note on WHY rich is rationed is on needsRich, and the
 // character table is on PROSE_RULES.
@@ -1141,7 +1174,7 @@ async function sendRich(ctx: Context, threadId: number | undefined, text: string
   noteBotMessage(keyFor(ctx.chat!.id, threadId))
   const opts: any = destOpts({ threadId, replyTo })
   for (const part of chunk(text, RICH_MAX)) {
-    if (!needsRich(part) || hasRtl(part)) { await sendLegacyMd(ctx, opts, part); continue }
+    if (!needsRich(part)) { await sendLegacyMd(ctx, opts, part); continue }
     try {
       await ctx.api.sendRichMessage(ctx.chat!.id, { markdown: sanitizeProse(part, 'rich') }, opts)
     } catch (e) {
@@ -1271,7 +1304,11 @@ function fmtBytes(n: number): string {
 
 // Strip path components and unsafe chars; keep a sensible name + extension.
 function safeName(name: string, fallbackExt = ''): string {
-  const base = basename(name || '').normalize('NFKD').replace(/[^\w.\- ]+/g, '_').replace(/^[.\s]+/, '').trim()
+  // Unicode-aware for the same reason sanitize() is: \w is ASCII-only, so a Persian
+  // upload named سند.docx used to be saved as `_ _ _.docx` — three underscores, no
+  // way to tell two such files apart. Marks are kept so Devanagari survives; NFC
+  // rather than NFKD so a kept mark isn't decomposed back out of the name.
+  const base = basename(name || '').normalize('NFC').replace(/[^\p{L}\p{N}\p{M}._\- ]+/gu, '_').replace(/^[.\s]+/, '').trim()
   return (base || `file${fallbackExt}`).slice(0, 120)
 }
 
@@ -1320,23 +1357,101 @@ async function receiveFile(ctx: Context, att: { fileId: string; name: string; si
   return dest
 }
 
-// Send one file from disk to the chat/topic. Returns true on success.
-async function sendFile(ctx: Context, threadId: number | undefined, path: string, caption?: string, replyTo?: number): Promise<boolean> {
-  if (!existsSync(path) || !statSync(path).isFile()) { await send(ctx, threadId, `Not a file: ${path}`); return false }
+// A file that is too big to send, described the way the user needs to hear it.
+// Returns '' when the file is fine.
+function tooBig(path: string): string {
   const size = statSync(path).size
-  if (size > TG_UPLOAD_LIMIT) {
-    await send(ctx, threadId, `${basename(path)} is ${fmtBytes(size)} — over the ${fmtBytes(TG_UPLOAD_LIMIT)} bot upload limit.` +
-      (LOCAL_API ? '' : `\nA local Bot API server raises this to 2000 MB (set TG_API_ROOT — see README).`))
-    return false
+  if (size <= TG_UPLOAD_LIMIT) return ''
+  return `${basename(path)} is ${fmtBytes(size)} — over the ${fmtBytes(TG_UPLOAD_LIMIT)} bot upload limit.` +
+    (LOCAL_API ? '' : `\nA local Bot API server raises this to 2000 MB (set TG_API_ROOT — see README).`)
+}
+
+// Send one file from disk to the chat/topic. Returns true on success.
+//
+// `captionMode` is the parse mode for the caption. It exists because the caption on
+// a long answer used to be sent with NO parse mode at all, so the only message in
+// the bridge that showed the user raw `**bold**` and `| pipe | tables |` was the
+// preview of its longest, most heavily formatted replies. Passing a parse mode
+// brings the risk that made it tempting to skip: Telegram rejects an unbalanced
+// entity outright, and this call has no chunk-level retry the way sendRich does —
+// so a rejected caption cost the user the FILE, not just the formatting. Hence the
+// retry below, which drops the caption's markup rather than the delivery.
+//
+// `plainCaption` is the UNESCAPED source. The retry must not resend `caption`: that
+// string is MarkdownV2, so without a parse mode the user reads its backslashes.
+async function sendFile(ctx: Context, threadId: number | undefined, path: string, caption?: string, replyTo?: number, captionMode?: string, plainCaption?: string): Promise<boolean> {
+  if (!existsSync(path) || !statSync(path).isFile()) { await send(ctx, threadId, `Not a file: ${path}`); return false }
+  const big = tooBig(path)
+  if (big) { await send(ctx, threadId, big); return false }
+  const size = statSync(path).size
+  noteBotMessage(keyFor(ctx.chat!.id, threadId))
+  const opts: any = destOpts({ threadId, replyTo })
+  if (caption) {
+    opts.caption = caption.slice(0, 1024)
+    if (captionMode) opts.parse_mode = captionMode
+  }
+  const doc = () => new InputFile(path, basename(path))
+  try {
+    await ctx.api.sendDocument(ctx.chat!.id, doc(), opts)
+    console.log(`[file->] ${path} (${fmtBytes(size)})`)
+    return true
+  } catch (e) {
+    if (!captionMode) { await send(ctx, threadId, `⚠️ could not send ${basename(path)}: ${e}`); return false }
+    // Formatting is best-effort, delivery is not.
+    console.error(`[warn] captioned sendDocument, retrying unformatted: ${e}`)
+    delete opts.parse_mode
+    if (caption) opts.caption = (plainCaption ?? stripMd(caption)).slice(0, CAPTION_MAX)
+    try {
+      await ctx.api.sendDocument(ctx.chat!.id, doc(), opts)
+      console.log(`[file->] ${path} (${fmtBytes(size)}, caption unformatted)`)
+      return true
+    } catch (e2) { await send(ctx, threadId, `⚠️ could not send ${basename(path)}: ${e2}`); return false }
+  }
+}
+
+// Send several files as ONE grouped message, caption on the first.
+//
+// Two files that are two renderings of a single answer used to arrive as two
+// independent messages — the .html with the preview, then a bare .md underneath
+// with no context, which on a phone reads as a stray attachment rather than the
+// source of truth. A media group is how Telegram says "these belong together".
+//
+// The trade, stated because it constrains later work: a media group takes NO
+// reply_markup, so a button on an answer has to live on its own message; and the
+// group succeeds or fails as a unit, so every item is size-checked up front —
+// one oversized file would otherwise fail the whole group with an opaque error.
+// On any failure it falls back to sending them individually, because two messages
+// is a cosmetic problem and a dropped answer is not.
+async function sendFileGroup(ctx: Context, threadId: number | undefined, paths: string[], caption?: string, replyTo?: number, captionMode?: string, plainCaption?: string): Promise<boolean> {
+  const usable = paths.filter(p => existsSync(p) && statSync(p).isFile())
+  if (usable.length === 0) return false
+  const oversized = usable.map(tooBig).filter(Boolean)
+  if (oversized.length) { await send(ctx, threadId, oversized.join('\n\n')); return false }
+  if (usable.length === 1) return sendFile(ctx, threadId, usable[0], caption, replyTo, captionMode, plainCaption)
+
+  const one = (p: string, i: number) => {
+    const extra: any = {}
+    if (i === 0 && caption) {
+      extra.caption = caption.slice(0, 1024)
+      if (captionMode) extra.parse_mode = captionMode
+    }
+    return InputMediaBuilder.document(new InputFile(p, basename(p)), extra)
   }
   noteBotMessage(keyFor(ctx.chat!.id, threadId))
   const opts: any = destOpts({ threadId, replyTo })
-  if (caption) opts.caption = caption.slice(0, 1024)
   try {
-    await ctx.api.sendDocument(ctx.chat!.id, new InputFile(path, basename(path)), opts)
-    console.log(`[file->] ${path} (${fmtBytes(size)})`)
+    await ctx.api.sendMediaGroup(ctx.chat!.id, usable.map(one), opts)
+    console.log(`[file->] group ${usable.map(p => basename(p)).join(' + ')}`)
     return true
-  } catch (e) { await send(ctx, threadId, `⚠️ could not send ${basename(path)}: ${e}`); return false }
+  } catch (e) {
+    console.error(`[warn] sendMediaGroup, falling back to individual sends: ${e}`)
+    let ok = false, first = true
+    for (const p of usable) {
+      if (await sendFile(ctx, threadId, p, first ? caption : undefined, replyTo, captionMode, first ? plainCaption : undefined)) ok = true
+      first = false
+    }
+    return ok
+  }
 }
 
 // After a run, deliver anything Claude left in the topic's outbox, then archive
@@ -1373,6 +1488,38 @@ async function drainOutbox(ctx: Context, threadId: number | undefined, dir: stri
   }
 }
 
+// Telegram's caption cap. The limit applies to the RENDERED text, so escaping
+// inflates the string we measure and not what the user sees — measuring the escaped
+// form is therefore conservative, which is the direction to be wrong in: a caption
+// one character over is rejected, and rejection used to cost the file.
+const CAPTION_MAX = 1024
+// How much of the answer to preview. Deliberately below CAPTION_MAX to leave room
+// for the "Full answer attached" line and for escaping.
+const CAPTION_PREVIEW = 900
+
+// Build the caption for a long answer: a preview that ends on a structure boundary,
+// formatted the way every other message in the topic is, plus the size note.
+// Falls back to plain text if the escaped form cannot be made to fit.
+function answerCaption(text: string): { text: string; mode?: string; plain: string } {
+  const note = `\n\n📄 Full answer (${text.length} chars) attached.`
+  const body = (cut: string) => `${cut}${cut.length < text.length ? ' …' : ''}${note}`
+  for (let budget = CAPTION_PREVIEW; budget >= 200; budget = Math.floor(budget * 0.75)) {
+    const raw = body(previewCut(text, budget))
+    // The same pipeline sendLegacyMd uses, for the same reason: a table has no
+    // MarkdownV2 form, so it is flattened into a code block first — which captions
+    // DO support — and sanitizeProse runs between the two stages, not around them.
+    const md = telegramify(sanitizeProse(mdTablesToCode(raw), 'markdownv2'), 'escape')
+    // `plain` is what the send falls back to if Telegram still refuses to parse.
+    // It is built from the same slice, NOT from the escaped string, or the fallback
+    // shows the user the backslashes the escaping added.
+    if (md.length <= CAPTION_MAX) return { text: md, mode: 'MarkdownV2', plain: stripMd(raw).slice(0, CAPTION_MAX) }
+  }
+  // Nothing fit even at the smallest budget: send it unformatted rather than not
+  // at all. stripMd is what sendLegacyMd falls back to, so it reads the same.
+  const plain = stripMd(body(previewCut(text, 600))).slice(0, CAPTION_MAX)
+  return { text: plain, plain }
+}
+
 // One-line note telling Claude how the bridge works: it's a live chat (so it can
 // ask clarifying questions) and how files flow in/out.
 // Run one prompt against a topic's session, post the reply, deliver the outbox.
@@ -1385,19 +1532,19 @@ async function deliver(ctx: Context, threadId: number | undefined, text: string,
       // The HTML goes first when both are sent: it is the one the user opens, and
       // the caption preview belongs on the file they will actually read. The .md
       // follows as the source of truth.
-      const caption = `${text.slice(0, 900).trimEnd()} …\n\n📄 Full answer (${text.length} chars) attached.`
-      let first = true
+      const files: string[] = []
       if (REPLY_FILE_FORMAT !== 'md') {
         const h = join(dir, 'answer.html')
         writeFileSync(h, htmlDocument('Answer', markdownToHtml(text)))
-        await sendFile(ctx, threadId, h, first ? caption : undefined, replyTo)
-        first = false
+        files.push(h)
       }
       if (REPLY_FILE_FORMAT !== 'html') {
         const m = join(dir, 'answer.md')
         writeFileSync(m, text)
-        await sendFile(ctx, threadId, m, first ? caption : undefined, replyTo)
+        files.push(m)
       }
+      const cap = answerCaption(text)
+      await sendFileGroup(ctx, threadId, files, cap.text, replyTo, cap.mode, cap.plain)
     } finally { rmSync(dir, { recursive: true, force: true }) }
   } else {
     await sendRich(ctx, threadId, text, replyTo)
@@ -1988,18 +2135,58 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
 // bridge already owns (/status, /new, …) is deliberately not here.
 const PASSTHROUGH = new Set(['/usage', '/cost', '/context'])
 
-// Forward one such command to the CLI and post what it printed. The session id it
+// /usage, /cost and /context are SNAPSHOTS of a moving number, not conversation.
+// Every check used to be a permanent message, so looking at your limit five times
+// in an evening buried the real work under five near-identical blocks. They now
+// carry a Refresh button that re-runs the command and edits the same message.
+//
+// A refresh must NOT take the topic's queue key. Passthrough neither reads nor
+// writes the topic's session, so it has no ordering to preserve — and on the topic's
+// chain a refresh tapped during a long agentic turn just sits there, which is
+// indistinguishable from a dead button. Its own key lets it answer in ~2s.
+const passthroughQueueKey = (key: string) => `${key}#pt`
+
+// In-flight guard, per message. Each tap is a whole `claude -p` — a ~2s start and a
+// ~300 MB child — so a double-tap or a held button must not fan out into a queue of
+// them. Keyed by the message being refreshed, not by topic, so two report messages
+// in one topic stay independent.
+const refreshing = new Set<string>()
+
+// Forward one such command to the CLI and return what it printed. The session id it
 // returns is NEVER stored: with --resume it's the same id anyway, and without one
 // the CLI mints a throwaway that would otherwise bind this topic to an empty session.
-async function handlePassthrough(ctx: Context, threadId: number | undefined, key: string, text: string): Promise<void> {
+// The button path goes through HERE rather than reaching for runStreaming directly,
+// so that guarantee is made in one place instead of two.
+async function runPassthrough(ctx: Context, threadId: number | undefined, key: string, text: string): Promise<string> {
   const cwd = resolveCwd(ctx, threadId)
+  const res = await runStreaming(ctx, threadId, key, text, cwd, sessions[key]?.sessionId, modeFor(key), modelFor(key), { silent: true })
+  return res.text
+}
+
+const refreshKb = (cmd: string) => ({ inline_keyboard: [[{ text: '🔄 Refresh', callback_data: `psx:${cmd.replace(/^\//, '')}` }]] })
+// Stamped on every render so two taps a minute apart always differ. Without it a
+// refresh that found the same numbers is rejected by Telegram as "message is not
+// modified" and the button looks broken exactly when it is working.
+const stamped = (body: string) => `${body}\n\n_updated ${new Date().toTimeString().slice(0, 8)}_`
+
+async function handlePassthrough(ctx: Context, threadId: number | undefined, key: string, text: string): Promise<void> {
+  let out: string
   try {
-    const res = await runStreaming(ctx, threadId, key, text, cwd, sessions[key]?.sessionId, modeFor(key), modelFor(key))
-    if (stopped.has(key)) { stopped.delete(key); return }
-    await deliver(ctx, threadId, res.text)
-  } catch (e) {
-    await send(ctx, threadId, `⚠️ ${e}`)
-  }
+    out = await runPassthrough(ctx, threadId, key, text)
+  } catch (e) { await send(ctx, threadId, `⚠️ ${e}`); return }
+  if (stopped.has(key)) { stopped.delete(key); return }
+  const cmd = text.trim().split(/\s+/)[0].toLowerCase().replace(/@\S+$/, '')
+  const body = stamped(out.trim())
+  // The button only goes on an answer that fits ONE message. A chunked report has
+  // no single message to edit, and a Refresh that silently replaced the first of
+  // four chunks would be worse than no button.
+  if (chunk(body).length !== 1) { await deliver(ctx, threadId, out); return }
+  noteBotMessage(key)
+  const opts: any = { ...destOpts({ threadId }), reply_markup: refreshKb(cmd) }
+  await ctx.api.sendMessage(ctx.chat!.id, telegramify(sanitizeProse(mdTablesToCode(body), 'markdownv2'), 'escape'),
+    { ...opts, parse_mode: 'MarkdownV2' })
+    .catch(() => ctx.api.sendMessage(ctx.chat!.id, stripMd(body), opts))
+    .catch(e => console.error(`[warn] passthrough send: ${e}`))
 }
 
 // ---------------------------------------------------------------------------
@@ -2074,6 +2261,109 @@ function blockText(content: any): string {
 
 interface SessionInfo { id: string; file: string; mtimeMs: number; title: string; turns: number }
 
+// ---------------------------------------------------------------------------
+// The /sessions picker
+//
+// /sessions used to print `965a503a · 162 turns · 3h ago` — an EIGHT-character
+// prefix — while /resume did a literal existsSync(<arg>.jsonl) on the full 36-char
+// uuid. So copying exactly what the bridge had just shown you and pasting it back
+// failed. The command told you the answer in a form it then refused to accept, and
+// the list wasn't even a code span, so on a phone you were hand-selecting hex out of
+// a paragraph. Both halves are fixed: the list is tappable, and the typed form now
+// resolves a prefix (see /resume).
+//
+// A tappable LINK cannot do this and it is worth writing down so nobody retries it:
+// text links only open URLs; Telegram auto-linkifies a bare `/command` token but
+// never its arguments, so a printed `/resume <id>` taps as a bare `/resume`, which
+// is NOT a no-op — it swaps in prevSessionId and would rebind the topic to the wrong
+// session. An inline keyboard is the only in-chat tap that carries a payload.
+// ---------------------------------------------------------------------------
+
+const LISTING_PAGE = 8
+// Telegram renders a button label on one line and truncates what does not fit; 64
+// is about what a phone shows before it starts cutting.
+const BUTTON_LABEL_MAX = 64
+type Listing = { dir: string; ids: string[]; labels: string[]; titles: string[] }
+// Bounded, and lost on restart — a tap on a stale listing is told to run /sessions
+// again rather than silently doing nothing. Keyed by a short token because
+// callback_data caps at 64 bytes and an absolute path does not fit in one.
+const listings = new Map<string, Listing>()
+function newListing(dir: string, list: SessionInfo[]): string {
+  const token = Math.random().toString(36).slice(2, 8)
+  listings.set(token, {
+    dir,
+    ids: list.map(s => s.id),
+    labels: list.map(s => `${s.id.slice(0, 8)} · ${s.turns} turns · ${ago(s.mtimeMs)}`),
+    // What the session was ABOUT: its transcript summary, or failing that the first
+    // thing you said in it. An id, a turn count and an age identify a session to the
+    // filesystem and to nobody else — you cannot recognise your own conversation
+    // from `d2b39072`, which made the picker as unusable as the listing it replaced.
+    titles: list.map(s => s.title),
+  })
+  // Oldest out first; Map preserves insertion order.
+  while (listings.size > 40) listings.delete(listings.keys().next().value as string)
+  return token
+}
+const pageCount = (n: number) => Math.max(1, Math.ceil(n / LISTING_PAGE))
+
+function listingText(token: string, offset: number): string {
+  const L = listings.get(token)
+  if (!L) return 'That listing has expired — run /sessions again.'
+  const pages = pageCount(L.ids.length)
+  const page = Math.floor(offset / LISTING_PAGE) + 1
+  // Title first, because that is the line you actually read; the id, turn count and
+  // age go underneath as the supporting detail. The number ties each entry to the
+  // button below it.
+  const body = L.labels.slice(offset, offset + LISTING_PAGE)
+    .map((l, i) => `${offset + i + 1}. ${L.titles[offset + i]}\n   ${l}`).join('\n\n')
+  return `Sessions in ${L.dir} (${L.ids.length}) — page ${page}/${pages}\n\n${body}\n\nTap one to bind this topic to it.`
+}
+
+function listingKb(token: string, offset: number): any {
+  const L = listings.get(token)
+  if (!L) return { inline_keyboard: [] }
+  // One session per row, and the row says what the session was ABOUT. The number
+  // matches the numbered entry above, which carries the id and the age; repeating
+  // those here would spend the whole label on the part you cannot recognise.
+  const rows: any[][] = L.titles.slice(offset, offset + LISTING_PAGE)
+    .map((title, i) => {
+      const n = offset + i + 1
+      const room = BUTTON_LABEL_MAX - `${n}. `.length
+      const t = title.length > room ? title.slice(0, room - 1).trimEnd() + '…' : title
+      return [{ text: `${n}. ${t}`, callback_data: `res:${token}:${offset + i}` }]
+    })
+  const pages = pageCount(L.ids.length)
+  if (pages > 1) {
+    const page = Math.floor(offset / LISTING_PAGE) + 1
+    const nav: any[] = []
+    if (offset > 0) nav.push({ text: '‹ Prev', callback_data: `spg:${token}:${offset - LISTING_PAGE}` })
+    nav.push({ text: `${page}/${pages}`, callback_data: 'spg:noop' })
+    if (offset + LISTING_PAGE < L.ids.length) nav.push({ text: 'Next ›', callback_data: `spg:${token}:${offset + LISTING_PAGE}` })
+    rows.push(nav)
+  }
+  return { inline_keyboard: rows }
+}
+
+// Bind a topic to a past session, with the validation /resume performs — the button
+// is a shortcut to that command, not a way around its checks. Returns the line to
+// show the user. Naming what it moved FROM as well as TO is deliberate: a silent
+// rebind is indistinguishable from nothing having happened.
+function bindPastSession(key: string, id: string, ctx: Context, threadId: number | undefined): string {
+  const e = sessions[key] ?? (sessions[key] = { cwd: resolveCwd(ctx, threadId) })
+  if (!existsSync(join(projectDir(e.cwd), `${id}.jsonl`))) {
+    return `That session no longer exists in this topic's directory:\n${e.cwd}`
+  }
+  if (e.sessionId === id) return `Already on session ${id.slice(0, 8)} — nothing changed.`
+  const from = e.sessionId
+  e.prevSessionId = e.sessionId; e.sessionId = id; saveState()
+  // prevSessionId holds exactly ONE step, so a second switch overwrites the original
+  // binding and a bare /resume will not get it back. Say so rather than let it
+  // surprise someone two switches later.
+  return from
+    ? `↩️ Switched from ${from.slice(0, 8)} to ${id.slice(0, 8)} — message to continue it.\nA bare /resume undoes this once; a second switch overwrites that.`
+    : `↩️ Bound this topic to session ${id.slice(0, 8)} — message to continue it.`
+}
+
 // List the sessions stored for a directory, newest first.
 function listSessions(dir: string): SessionInfo[] {
   const pd = projectDir(dir)
@@ -2093,12 +2383,19 @@ function listSessions(dir: string): SessionInfo[] {
           const t = blockText(o.message?.content)
           if (!t) continue
           turns++
-          if (o.type === 'user' && !firstUser && !t.startsWith('⚙️')) firstUser = t
+          // transcriptSpeech strips OUR framing and the harness's injected blocks and
+          // returns '' when a turn is nothing but scaffolding — so the label falls
+          // through to the next turn rather than naming the session after a caveat
+          // banner or a preamble about outbox directories.
+          if (o.type === 'user' && !firstUser && !t.startsWith('⚙️')) firstUser = transcriptSpeech(t)
         }
       }
       out.push({
         id: f.replace(/\.jsonl$/, ''), file, mtimeMs: st.mtimeMs,
-        title: (title || firstUser || '(untitled)').replace(/\s+/g, ' ').slice(0, 80), turns,
+        // 200, not 80: the picker's MESSAGE has room for a real sentence and that is
+        // what makes a session recognisable. The button truncates separately, since
+        // it has one line to work with.
+        title: (title || firstUser || '(untitled)').replace(/\s+/g, ' ').slice(0, 200), turns,
       })
     } catch {}
   }
@@ -2445,11 +2742,23 @@ bot.on('message', async ctx => {
     const arg = text.split(/\s+/)[1]?.trim()
     const e = sessions[key] ?? (sessions[key] = { cwd: resolveCwd(ctx, threadId) })
     if (arg) {
+      // A PREFIX is accepted, not just the full uuid. /sessions prints 8 characters
+      // and this command used to demand all 36, so pasting back exactly what the
+      // bridge had just shown you failed — the two commands contradicted each other.
+      // Ambiguity fails loudly: silently picking one of two matching sessions is how
+      // you end up continuing the wrong conversation without noticing.
+      let id = arg
       if (!existsSync(join(projectDir(e.cwd), `${arg}.jsonl`))) {
-        await send(ctx, threadId, `No session ${arg} found for this topic's directory:\n${e.cwd}`); return
+        const hits = listSessions(e.cwd).filter(s => s.id.startsWith(arg))
+        if (hits.length === 0) {
+          await send(ctx, threadId, `No session ${arg} found for this topic's directory:\n${e.cwd}\n\nRun /sessions to pick one.`); return
+        }
+        if (hits.length > 1) {
+          await send(ctx, threadId, `${arg} matches ${hits.length} sessions here:\n${hits.map(h => `  ${h.id}`).join('\n')}\n\nGive more characters, or run /sessions to pick one.`); return
+        }
+        id = hits[0].id
       }
-      e.prevSessionId = e.sessionId; e.sessionId = arg; saveState()
-      await send(ctx, threadId, `↩️ Bound this topic to session ${arg.slice(0, 8)} — message to continue it.`)
+      await send(ctx, threadId, bindPastSession(key, id, ctx, threadId))
     } else if (e.prevSessionId) {
       const restore = e.prevSessionId
       e.prevSessionId = e.sessionId; e.sessionId = restore; saveState()
@@ -2613,8 +2922,11 @@ bot.on('message', async ctx => {
       if (!isAbsolute(dir) || !existsSync(dir)) { await send(ctx, threadId, `skipped (not an absolute existing path): ${dir}`); continue }
       const list = listSessions(dir)
       if (!list.length) { await send(ctx, threadId, `${dir}\n  no sessions (looked in ${projectDir(dir)})`); continue }
-      const body = list.slice(0, 30).map((s, i) => `${i + 1}. ${s.id.slice(0, 8)} · ${s.turns} turns · ${ago(s.mtimeMs)}\n   ${s.title}`).join('\n\n')
-      await send(ctx, threadId, `Sessions in ${dir} (${list.length}):\n\n${body}`)
+      const token = newListing(dir, list)
+      await ctx.api.sendMessage(chatId, listingText(token, 0), {
+        ...destOpts({ threadId }), reply_markup: listingKb(token, 0),
+      }).catch(e => console.error(`[warn] /sessions: ${e}`))
+      noteBotMessage(key)
     }
     await send(ctx, threadId, `Run /import <dir> [dir2 …] to make a topic per session.`, true)
     return
@@ -2726,7 +3038,7 @@ bot.on('message', async ctx => {
   // Client-side CLI commands (/usage, /cost, …) — forward them rather than
   // rejecting: `claude -p "/usage"` answers them for free, without a turn.
   if (PASSTHROUGH.has(cmd)) {
-    enqueue(key, () => handlePassthrough(ctx, threadId, key, text))
+    enqueue(passthroughQueueKey(key), () => handlePassthrough(ctx, threadId, key, text))
       .catch(e => console.error(`[error] passthrough ${key}: ${e}`))
     return
   }
@@ -2876,6 +3188,73 @@ bot.on('callback_query:data', async ctx => {
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})   // one tap only
     void enqueue(rec.key, () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, rec.replyTo, true))
       .catch(e => console.error(`[error] retry ${rec.key}: ${e}`))
+    return
+  }
+  if (data === 'spg:noop') { await ctx.answerCallbackQuery().catch(() => {}); return }
+  if (data.startsWith('spg:')) {
+    const [token, off] = data.slice(4).split(':')
+    if (!listings.has(token)) { await ctx.answerCallbackQuery({ text: 'That listing has expired — run /sessions again.', show_alert: true }).catch(() => {}); return }
+    const offset = Math.max(0, Number(off) || 0)
+    await ctx.answerCallbackQuery().catch(() => {})
+    // Edit in place. A listing that reposts itself per page buries the topic, which
+    // is the thing /sessions is supposed to help you dig out of.
+    await ctx.editMessageText(listingText(token, offset), { reply_markup: listingKb(token, offset) }).catch(() => {})
+    return
+  }
+  if (data.startsWith('res:')) {
+    const [token, idxRaw] = data.slice(4).split(':')
+    const L = listings.get(token)
+    if (!L) { await ctx.answerCallbackQuery({ text: 'That listing has expired — run /sessions again.', show_alert: true }).catch(() => {}); return }
+    const id = L.ids[Number(idxRaw)]
+    if (!id) { await ctx.answerCallbackQuery({ text: 'That entry is gone.', show_alert: true }).catch(() => {}); return }
+    const threadId = ctx.callbackQuery.message?.message_thread_id
+    // /resume only ever looks in THIS topic's cwd, so a session listed from another
+    // directory cannot be bound from here. Saying so is the whole fix — the old
+    // listing offered those ids with nothing to indicate they were unusable.
+    const cwd = sessions[key]?.cwd ?? resolveCwd(ctx, threadId)
+    if (resolve(L.dir) !== resolve(cwd)) {
+      await ctx.answerCallbackQuery({
+        text: `That session lives in ${L.dir}, not this topic's directory. Run /cwd ${L.dir} first — note that resets this topic's history.`,
+        show_alert: true,
+      }).catch(() => {})
+      return
+    }
+    const line = bindPastSession(key, id, ctx, threadId)
+    await ctx.answerCallbackQuery({ text: line.slice(0, 200) }).catch(() => {})
+    // The picker is dropped once a choice is made: a stale keyboard sitting above a
+    // switched topic invites a second, accidental tap.
+    await ctx.editMessageText(line, { reply_markup: { inline_keyboard: [] } }).catch(() => {})
+    return
+  }
+  if (data.startsWith('psx:')) {
+    const cmd = `/${data.slice(4)}`
+    if (!PASSTHROUGH.has(cmd)) { await ctx.answerCallbackQuery({ text: 'Unknown report.' }).catch(() => {}); return }
+    const msgId = ctx.callbackQuery.message?.message_id
+    const guard = `${ctx.chat!.id}:${msgId}`
+    if (refreshing.has(guard)) { await ctx.answerCallbackQuery({ text: 'Already refreshing…' }).catch(() => {}); return }
+    refreshing.add(guard)
+    // Answered before the run, not after: Telegram wants a reply within 10s and this
+    // takes at least a CLI start, so the spinner must be cleared up front.
+    await ctx.answerCallbackQuery({ text: 'Refreshing…' }).catch(() => {})
+    const threadId = ctx.callbackQuery.message?.message_thread_id
+    try {
+      await enqueue(passthroughQueueKey(key), async () => {
+        const out = await runPassthrough(ctx, threadId, key, cmd)
+        const body = stamped(out.trim())
+        if (chunk(body).length !== 1) {
+          await ctx.answerCallbackQuery({ text: 'Too long to edit in place — sending it below.' }).catch(() => {})
+          await deliver(ctx, threadId, out)
+          return
+        }
+        // Edited in the modality it was sent in, or the message changes font mid-life.
+        const markup = refreshKb(cmd)
+        await ctx.editMessageText(telegramify(sanitizeProse(mdTablesToCode(body), 'markdownv2'), 'escape'),
+          { parse_mode: 'MarkdownV2', reply_markup: markup })
+          .catch(() => ctx.editMessageText(stripMd(body), { reply_markup: markup }))
+      })
+    } catch (e) {
+      await ctx.answerCallbackQuery({ text: `Refresh failed: ${e}`, show_alert: true }).catch(() => {})
+    } finally { refreshing.delete(guard) }
     return
   }
   if (data.startsWith('effort:')) {
@@ -3107,6 +3486,9 @@ export const _fanouts = fanouts
 export const _sessions = () => sessions
 export const _projectDir = projectDir
 export const _boxDir = boxDir
+export const _answerCaption = answerCaption
+export const _listing = { make: newListing, text: listingText, kb: listingKb }
+export const _listSessions = listSessions
 export const _maybeSynthesise = maybeSynthesise
 
 export function _drainQueue(key: string): Promise<unknown> { return queues.get(key) ?? Promise.resolve() }
