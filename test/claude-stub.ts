@@ -122,6 +122,20 @@ async function main() {
     result({ result: signoff })
     return
   }
+  if (scenario === 'SHORTHEADINGS') {
+    // Two headings but few enough units that the stub makes ONE chunk, which is the
+    // case with no full file to hang an index or a read-along off.
+    result({ result: '## One\n\nA sentence.' })
+    return
+  }
+  if (scenario === 'HEADINGS') {
+    // A structured answer, for the speech path: the section index on the full voice
+    // file and the read-along page both key off headings, and an answer without any
+    // correctly produces neither.
+    result({ result: '## Alpha\n\nThe first section says a thing.\n\n## Beta\n\n' +
+      'The second section says another thing.\n\n## Gamma\n\nAnd the third wraps up.' })
+    return
+  }
   if (scenario === 'LONG') {
     const table = '| item | value |\n|---|---|\n' + Array.from({ length: 40 }, (_, i) => `| row ${i} | ${i * 7} |`).join('\n')
     result({ result: `# Report\n\n${table}\n\n` + 'Body text that pushes this past the file threshold. '.repeat(200) })

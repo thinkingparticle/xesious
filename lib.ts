@@ -598,6 +598,126 @@ export function speechText(b: SpeechBlock): string {
 // only thing left to choose is how long you wait for note ONE, and that is why the
 // first two are short: ~30s to the first audio instead of minutes, and then the
 // chunks grow so a long answer is a handful of notes rather than nineteen.
+export function fmtDuration(sec: number): string {
+  const s = Math.max(0, Math.round(sec))
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+}
+
+// Where each unit starts in the finished audio. speak.py measures this exactly —
+// it holds every unit's samples — so this is only the shape the offsets travel in.
+export type UnitTiming = { start: number; end: number }
+
+// A table of contents for the full file: one entry per heading, at the second it is
+// spoken. Telegram turns `M:SS` in an audio caption into a tappable seek, so these
+// become navigation rather than decoration.
+//
+// Returns [] when the answer has no headings. That is deliberate: marks every two
+// minutes would be navigation to arbitrary places, which is worse than none.
+export function speechToc(units: SpeechUnit[], timings: UnitTiming[]): { at: number; title: string }[] {
+  const out: { at: number; title: string }[] = []
+  units.forEach((u, i) => {
+    const t = timings[i]
+    if (u.kind !== 'heading' || !t) return
+    // The trailing full stop speechText added for phrasing is not part of the title.
+    out.push({ at: t.start, title: u.text.replace(/\.$/, '') })
+  })
+  return out
+}
+
+// The caption for the full file. The whole point is that the timestamps point at
+// SECTIONS; before this the only number was the total duration, so the single seek
+// link Telegram made of it jumped to the end of the audio.
+//
+// Trimmed from the END with an ellipsis rather than truncated mid-entry, because a
+// half-written heading is worse than a shorter list.
+export function fullAudioCaption(totalSec: number, toc: { at: number; title: string }[], cap = 1024): string {
+  const head = `🎧 Full answer (${fmtDuration(totalSec)})`
+  if (!toc.length) return head
+  const lines: string[] = []
+  for (const e of toc) {
+    const line = `${fmtDuration(e.at)}  ${e.title}`
+    const next = [head, '', ...lines, line].join('\n')
+    if (next.length > cap - 2) { lines.push('…'); break }
+    lines.push(line)
+  }
+  return [head, '', ...lines].join('\n')
+}
+
+// A read-along page: the answer, the audio, and the block being spoken highlighted
+// as it plays.
+//
+// The timing is EXACT, not estimated — speak.py synthesised each unit and knows how
+// long it turned out to be, so there is no alignment model and nothing to drift.
+//
+// Self-contained on purpose, like the plain answer.html: the audio is a data: URI
+// and the script is inline, so the file works with no network and no CDN. That is
+// also the constraint — a data URI is base64, so it costs about a third more than
+// the .ogg, which is why the caller caps how long an answer gets one of these.
+export function readAlongHtml(title: string, units: SpeechUnit[], timings: UnitTiming[], audioDataUri: string): string {
+  const esc = escapeHtml
+  const body = units.map((u, i) => {
+    const t = timings[i]
+    if (!t) return ''
+    const tag = u.kind === 'heading' ? 'h3' : 'p'
+    // data-start/-end drive the highlight; the seconds are also what makes each
+    // block clickable to seek, which is the same affordance the caption's
+    // timestamps give in Telegram.
+    return `<${tag} class="u" data-start="${t.start.toFixed(2)}" data-end="${t.end.toFixed(2)}" dir="auto">${esc(u.text)}</${tag}>`
+  }).filter(Boolean).join('\n')
+  return [
+    '<!doctype html>',
+    '<html dir="auto"><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    '<title>' + esc(title) + '</title>',
+    '<style>',
+    ':root { color-scheme: light dark; }',
+    'body { max-width: 46rem; margin: 0 auto 6rem; padding: 0 1rem;',
+    '  font: 17px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }',
+    // The player is sticky because the whole point is to follow along while scrolling.
+    'header { position: sticky; top: 0; padding: .75rem 0; backdrop-filter: blur(8px);',
+    '  background: color-mix(in srgb, Canvas 88%, transparent); border-bottom: 1px solid rgba(127,127,127,.25); }',
+    'audio { width: 100%; }',
+    'h3 { line-height: 1.3; margin: 1.6em 0 .4em; }',
+    '.u { cursor: pointer; padding: .15em .35em; margin-inline: -.35em; border-radius: 5px;',
+    '  transition: background-color .15s ease; }',
+    // Not a colour on the text: an RTL answer and a code identifier both have to stay
+    // readable, so the mark is a background and a start-edge rule.
+    '.u.on { background: rgba(255,214,0,.28); box-shadow: inset 3px 0 0 rgba(255,193,7,.9); }',
+    '@media (prefers-color-scheme: dark) { .u.on { background: rgba(255,214,0,.16); } }',
+    '.hint { color: rgba(127,127,127,.9); font-size: .85em; margin: .4rem 0 1.2rem; }',
+    '</style></head><body>',
+    '<header><audio id="a" controls preload="metadata" src="' + audioDataUri + '"></audio></header>',
+    '<p class="hint">Tap any line to jump there.</p>',
+    body,
+    '<script>',
+    '(function(){',
+    'var a=document.getElementById("a");',
+    'var us=[].slice.call(document.querySelectorAll(".u"));',
+    'us.forEach(function(u){u.addEventListener("click",function(){a.currentTime=parseFloat(u.dataset.start)||0;a.play();});});',
+    'var cur=null;',
+    // Linear scan from the last match rather than a search: the list is short and the
+    // playhead only ever moves a little between timeupdate events.
+    'function tick(){',
+    ' var t=a.currentTime, hit=null;',
+    ' for(var i=0;i<us.length;i++){ var u=us[i];',
+    '  if(t>=parseFloat(u.dataset.start)&&t<parseFloat(u.dataset.end)){hit=u;break;} }',
+    ' if(hit===cur)return;',
+    ' if(cur)cur.classList.remove("on");',
+    ' cur=hit;',
+    ' if(cur){cur.classList.add("on");',
+    // Only scroll when the highlight has left the viewport, or reading is impossible.
+    '  var r=cur.getBoundingClientRect();',
+    '  if(r.top<80||r.bottom>innerHeight-40)cur.scrollIntoView({block:"center",behavior:"smooth"});}',
+    '}',
+    'a.addEventListener("timeupdate",tick);',
+    'a.addEventListener("seeked",tick);',
+    '})();',
+    '</script>',
+    '</body></html>',
+    '',
+  ].join('\n')
+}
+
 export function speechChunkSeconds(index: number): number {
   if (index === 0) return 45
   if (index === 1) return 90
@@ -608,7 +728,12 @@ export function speechChunkSeconds(index: number): number {
 // The gap is decided HERE rather than from the kind alone, because a sentence in
 // the middle of a paragraph and the sentence that ends it want different pauses
 // while both being 'para'.
-export type SpeechUnit = { text: string; gap: number }
+// `kind` is carried through deliberately. It used to be dropped here, and that one
+// omission is what made a table of contents impossible: by the time anything reached
+// the synthesiser nothing knew which utterance had been a heading, so the only
+// timestamp the full file could print was its own total duration — a seek link
+// pointing at the last second of the audio.
+export type SpeechUnit = { text: string; gap: number; kind: SpeechBlock['kind'] }
 
 // Sentence-granular units, which is what makes progressive delivery work at all.
 // Chunks can only be closed on a unit boundary, so a block-granular list means one
@@ -648,7 +773,7 @@ export function speechUnits(md: string): SpeechUnit[] {
     const gap = SPEECH_GAPS[b.kind]
     // A heading or a placeholder is one utterance by definition — never split, and
     // it keeps the longest pause because it is what introduces everything after it.
-    if (b.kind === 'heading' || b.kind === 'skip') { out.push({ text: spoken, gap }); continue }
+    if (b.kind === 'heading' || b.kind === 'skip') { out.push({ text: spoken, gap, kind: b.kind }); continue }
     const runs: string[] = []
     for (const sentence of sentences(spoken)) {
       const last = runs[runs.length - 1]
@@ -660,7 +785,7 @@ export function speechUnits(md: string): SpeechUnit[] {
     runs.forEach((text, i) => {
       // Only the LAST run carries the block's pause; a break inside a block gets a
       // short breath, which is what a full stop already sounds like in speech.
-      out.push({ text, gap: i === runs.length - 1 ? gap : 0.18 })
+      out.push({ text, gap: i === runs.length - 1 ? gap : 0.18, kind: b.kind })
     })
   }
   return out

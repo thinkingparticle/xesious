@@ -15,6 +15,7 @@ import {
   needsRich, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
   markdownToHtml, htmlDocument, previewCut, transcriptSpeech, lastEffortFrom, needsReplyLink,
   speechBlocks, speechify, speechText, speechUnits, speechChunkSeconds, SPEECH_GAPS,
+  speechToc, fullAudioCaption, readAlongHtml, fmtDuration,
   parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble, fanoutPlanPrompt,
   FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName, filesPreamble,
   sanitizeProse, PROSE_RULES, isNonAnswer,
@@ -254,6 +255,99 @@ describe('speechChunkSeconds — the ramp', () => {
   test('the ramp only ever grows', () => {
     const r = [0, 1, 2, 3, 4].map(speechChunkSeconds)
     expect(r).toEqual([...r].sort((a, b) => a - b))
+  })
+})
+
+// The full file used to be captioned with one number — its own total duration — so
+// the single seek link Telegram made of it jumped to the last second of the audio.
+describe('speechToc — timestamps that point at sections', () => {
+  const t = (n: number) => ({ start: n, end: n + 1 })
+  test('one entry per heading, at the second it is spoken', () => {
+    const u = speechUnits('## First\n\nBody here.\n\n## Second\n\nMore body.')
+    const toc = speechToc(u, [t(0), t(10), t(20), t(30)])
+    expect(toc).toEqual([{ at: 0, title: 'First' }, { at: 20, title: 'Second' }])
+  })
+  test('the full stop added for phrasing is not part of the title', () => {
+    const u = speechUnits('## Results')
+    expect(speechToc(u, [t(5)])[0].title).toBe('Results')
+  })
+  test('an answer with no headings gets NO index', () => {
+    // Marks every two minutes would be navigation to arbitrary places, which is
+    // worse than none at all.
+    expect(speechToc(speechUnits('Just prose. And more of it.'), [t(0)])).toEqual([])
+  })
+  test('a unit with no timing is skipped rather than timed at zero', () => {
+    const u = speechUnits('## A\n\nbody\n\n## B')
+    expect(speechToc(u, [t(0)]).map(x => x.title)).toEqual(['A'])
+  })
+})
+
+describe('fullAudioCaption', () => {
+  test('with no headings it is just the duration', () => {
+    expect(fullAudioCaption(128, [])).toBe('🎧 Full answer (2:08)')
+  })
+  test('headings become tappable timestamps', () => {
+    const c = fullAudioCaption(600, [{ at: 0, title: 'Why' }, { at: 132, title: 'What next' }])
+    expect(c).toContain('0:00  Why')
+    expect(c).toContain('2:12  What next')
+  })
+  test('a long index is trimmed from the END with an ellipsis, never mid-entry', () => {
+    // The caption caps at 1024; half a heading is worse than a shorter list.
+    const many = Array.from({ length: 60 }, (_, i) => ({ at: i * 20, title: `Section number ${i}` }))
+    const c = fullAudioCaption(1200, many, 300)
+    expect(c.length).toBeLessThanOrEqual(300)
+    expect(c.endsWith('…')).toBe(true)
+    expect(c.split('\n').filter(l => l.trim() && !l.startsWith('🎧') && l !== '…')
+      .every(l => /^\d+:\d\d {2}Section number \d+$/.test(l))).toBe(true)
+  })
+})
+
+describe('fmtDuration', () => {
+  test('minutes and padded seconds', () => {
+    expect(fmtDuration(0)).toBe('0:00')
+    expect(fmtDuration(7)).toBe('0:07')
+    expect(fmtDuration(632)).toBe('10:32')
+  })
+})
+
+describe('readAlongHtml', () => {
+  const u = speechUnits('## Heading\n\nSome body text.')
+  const timings = [{ start: 0, end: 1.2 }, { start: 1.7, end: 4.9 }]
+  const html = readAlongHtml('Answer', u, timings, 'data:audio/ogg;base64,AAA')
+
+  test('every block carries the exact offsets it was synthesised at', () => {
+    expect(html).toContain('data-start="0.00" data-end="1.20"')
+    expect(html).toContain('data-start="1.70" data-end="4.90"')
+  })
+  test('headings render as headings, prose as paragraphs', () => {
+    expect(html).toContain('<h3 class="u"')
+    expect(html).toContain('<p class="u"')
+  })
+  test('self-contained: the audio is embedded and nothing is fetched', () => {
+    // Same promise the plain answer.html makes — it has to work with no network.
+    expect(html).toContain('src="data:audio/ogg;base64,')
+    expect(html).not.toMatch(/https?:\/\//)
+  })
+  test('direction-agnostic, like the other generated page', () => {
+    expect(html).toContain('<html dir="auto">')
+    expect(html).toContain('dir="auto"')
+  })
+  test('content is escaped, not injected', () => {
+    const bad = readAlongHtml('x', [{ text: '<img src=x onerror=alert(1)>', gap: 0, kind: 'para' }],
+      [{ start: 0, end: 1 }], 'data:,')
+    expect(bad).not.toContain('<img src=x')
+    expect(bad).toContain('&lt;img')
+  })
+  test('a unit with no timing is dropped rather than rendered untimed', () => {
+    expect(readAlongHtml('x', u, [{ start: 0, end: 1 }], 'data:,')).not.toContain('Some body text')
+  })
+})
+
+describe('speechUnits carries the block kind', () => {
+  test('a heading unit is still identifiable downstream', () => {
+    // Dropping this is what made a table of contents impossible: nothing past the
+    // splitter knew which utterance had been a heading.
+    expect(speechUnits('## A\n\nb').map(u => u.kind)).toEqual(['heading', 'para'])
   })
 })
 

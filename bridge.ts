@@ -34,6 +34,7 @@ import {
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
   markdownToHtml, htmlDocument, previewCut, transcriptSpeech, lastEffortFrom, needsReplyLink,
   speechUnits, speechChunkSeconds, SPEAKERS, SPEAKER_PAGE, SPEAKER_DEFAULT, kokoroLang, isSpeakerId, speakerLabel,
+  speechToc, fullAudioCaption, readAlongHtml, fmtDuration, type SpeechUnit, type UnitTiming,
   fanoutPlanPrompt, parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble,
   FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName, filesPreamble,
   type FanoutPlanItem,
@@ -243,10 +244,22 @@ const VOICE_SPEAK_MAX = Math.max(200, Number(process.env.TG_VOICE_MAX_CHARS || 1
 // rather than after the whole answer, so the first audio lands in ~40s instead of
 // after everything. Kokoro only — it needs the raw-samples API to insert real
 // silence and to concatenate the full file at the end.
-const SPEAK_PY = join(HERE, 'voice', 'speak.py')
+// Overridable like TG_STT_CMD and TG_TTS_CMD, and for the same reason: tier 2 has to
+// reach the progressive path without paying for real synthesis, which runs at about
+// realtime and would make the suite minutes long.
+const SPEAK_PY = process.env.TG_SPEAK_CMD || join(HERE, 'voice', 'speak.py')
 const KOKORO_MODEL = process.env.TG_KOKORO_MODEL || join(HERE, 'voice', 'kokoro', 'kokoro-v1.0.onnx')
 // The single knob for people who want one note however long it takes.
 const VOICE_CHUNKED = !/^(0|false|no)$/i.test(process.env.TG_VOICE_CHUNKED || '')
+// Tidy the chunk notes away once the full file lands. OFF by default and it must
+// stay that way: the chunks exist to be listened to WHILE the rest is still being
+// made, and the full file arrives exactly when a listener is most likely mid-chunk,
+// so deleting what is playing stops playback dead. The button is the safe form.
+const VOICE_TIDY = /^(1|true|yes)$/i.test(process.env.TG_VOICE_TIDY || '')
+// A read-along page embeds its audio as a data: URI to stay self-contained, so its
+// size grows with the answer. Past this it is skipped rather than silently producing
+// a page tens of megabytes wide.
+const READALONG_MAX_MIN = Math.max(0, Number(process.env.TG_VOICE_READALONG_MAX_MIN || 20))
 
 // Importing existing Claude Code sessions (the ones the IDE/CLI session picker
 // shows) as topics. A directory's sessions live at CLAUDE_PROJECTS/<encoded>/<id>.jsonl.
@@ -1791,13 +1804,52 @@ async function warnNoVoice(ctx: Context, threadId: number | undefined, key: stri
   await offerVoiceInstall(ctx, threadId)
 }
 
-// Is the progressive path available?// Is the progressive path available? It needs Kokoro's raw-samples API, so it is
+// A speech task, so it can be cancelled and tidied.
+//
+// Before this there was no handle on synthesis anywhere: speakChunked spawned the
+// child and forgot it, /stop only ended tracked model jobs, and a ten-minute answer
+// kept delivering notes with no way to stop short of killing the bridge.
+type SpeechTask = {
+  id: string
+  key: string
+  child?: ChildProcess
+  dir: string
+  chunkIds: number[]     // the notes sent so far, for tidying
+  cancelled: boolean
+}
+// Kept AFTER the run finishes, deliberately. The tidy button rides on the full file,
+// which is the last thing sent, so a task discarded when the child closed could never
+// honour its own button — the tap arrived a moment too late, every time. Only the
+// message ids are retained; the child reference is dropped.
+const SPEECH_KEEP = 40
+const speechTasks = new Map<string, SpeechTask>()
+const speechByTopic = new Map<string, string>()   // topic key -> its current task
+
+function cancelSpeech(key: string, reason = 'cancelled'): boolean {
+  const id = speechByTopic.get(key)
+  const t = id ? speechTasks.get(id) : undefined
+  // speechByTopic is cleared when a run ends, so a finished task is not cancellable
+  // even though its record is kept for tidying.
+  if (!t || t.cancelled || !t.child) return false
+  t.cancelled = true
+  try { t.child?.kill('SIGTERM') } catch {}
+  console.log(`[voice] ${reason} speech ${t.id} in ${key}`)
+  return true
+}
+
+// Is the progressive path available? It needs Kokoro's raw-samples API, so it is
 // gated on the model actually being on disk — the same test tts.sh makes when it
 // picks an engine. Piper and espeak keep the single-note path.
 function canChunk(): boolean {
   const forced = (process.env.TG_TTS_ENGINE || '').toLowerCase()
   if (forced && forced !== 'kokoro') return false
-  return VOICE_CHUNKED && existsSync(SPEAK_PY) && existsSync(KOKORO_MODEL)
+  if (!VOICE_CHUNKED || !existsSync(SPEAK_PY)) return false
+  // The model check is about the DEFAULT implementation. An explicit TG_SPEAK_CMD
+  // means the caller has supplied their own synthesiser, so requiring Kokoro's model
+  // on disk would be checking a file that implementation may not use — and would
+  // make the test suite pass or fail on whether this box happens to have a 311MB
+  // download.
+  return !!process.env.TG_SPEAK_CMD || existsSync(KOKORO_MODEL)
 }
 
 // Speak an answer as a SEQUENCE of voice notes, sending each as it is ready.
@@ -1813,68 +1865,185 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
   const units = speechUnits(text)
   if (!units.length) return true
   const dir = mkdtempSync(join(tmpdir(), 'tg-tts-'))
+  const task: SpeechTask = { id: newJobId(), key, dir, chunkIds: [], cancelled: false }
+  speechTasks.set(task.id, task)
+  speechByTopic.set(key, task.id)
   const req = JSON.stringify({ units, outdir: dir, chunks: [0, 1, 2].map(speechChunkSeconds) })
   return new Promise<boolean>(resolve => {
     const child = spawn('python3', [SPEAK_PY], { env: voiceEnv(key), stdio: ['pipe', 'pipe', 'pipe'] })
+    task.child = child
     let err = '', buf = ''
     let n = 0
+    let timings: UnitTiming[] = []
+    // A single-chunk answer never produces a `full` line — the one note IS the whole
+    // thing — so the index and the read-along would silently never appear for short
+    // answers. Remembering the first chunk lets both happen anyway, without sending a
+    // duplicate audio file of content already in the note above it.
+    let onlyPath: string | undefined
+    let fullSent = false
     // Sends are chained rather than awaited inline: stdout must keep being read or
     // the child blocks on a full pipe, and the notes still have to arrive in order.
     let queue: Promise<void> = Promise.resolve()
-    const send = (fn: () => Promise<void>) => { queue = queue.then(fn).catch(e => console.error(`[voice] send: ${e}`)) }
+    // Named so it cannot shadow the module-level send(ctx, threadId, text): this one
+    // serialises Telegram sends, and the two are one keystroke apart.
+    const later = (fn: () => Promise<void>) => { queue = queue.then(fn).catch(e => console.error(`[voice] send: ${e}`)) }
 
     child.stderr.on('data', d => (err += d))
     child.stdout.on('data', d => {
       buf += d
       const lines = buf.split('\n'); buf = lines.pop() ?? ''
       for (const line of lines) {
-        if (!line.trim()) continue
+        if (!line.trim() || task.cancelled) continue
         let o: any; try { o = JSON.parse(line) } catch { continue }
         if (o.path) {
           n++
           const part = n
-          send(async () => {
+          const at = o.at ?? 0
+          if (part === 1) onlyPath = o.path
+          later(async () => {
+            if (task.cancelled) return
             const opts: any = destOpts({ threadId, replyTo })
             // No caption on the first note: a short answer is one note and a "part 1"
-            // label on a thing with no part 2 is noise. Later ones say where they are.
-            if (part > 1) opts.caption = `🎙 part ${part}`
-            // Told, not inferred: speak.py already knows the length, and without it
-            // a client can show a voice note as 0:00.
+            // label on a thing with no part 2 is noise. Later ones say where they are
+            // in the whole, which a bare "part 3" never did.
+            if (part > 1) opts.caption = `🎙 part ${part} — from ${fmtDuration(at)}`
             if (o.seconds) opts.duration = Math.round(o.seconds)
-            await ctx.api.sendVoice(ctx.chat!.id, new InputFile(o.path), opts)
+            // The stop button rides on the FIRST note, which is the one that exists
+            // while there is still something worth stopping.
+            if (part === 1) opts.reply_markup = { inline_keyboard: [[{ text: '🛑 Stop speaking', callback_data: `vstop:${task.id}` }]] }
+            const m: any = await ctx.api.sendVoice(ctx.chat!.id, new InputFile(o.path), opts)
+            if (m?.message_id) task.chunkIds.push(m.message_id)
             noteBotMessage(key)
           })
         } else if (o.full) {
-          send(async () => {
+          // Taken here as well as from `done`, because the section index is built the
+          // moment the full file is sent and `done` arrives after it.
+          if (o.timings) timings = o.timings.map((t: number[]) => ({ start: t[0], end: t[1] }))
+          later(async () => {
+            if (task.cancelled) return
             // sendAudio, not sendVoice: a real player with seeking and a title, and
             // visibly a different thing from the chunk bubbles above it.
-            await ctx.api.sendAudio(ctx.chat!.id, new InputFile(o.full), {
+            const toc = speechToc(units, timings)
+            const rows: any[][] = []
+            if (task.chunkIds.length > 1) rows.push([{ text: '🧹 Remove the parts', callback_data: `vtidy:${task.id}` }])
+            const m: any = await ctx.api.sendAudio(ctx.chat!.id, new InputFile(o.full), {
               ...destOpts({ threadId, replyTo }),
               title: `Full answer — ${fmtDuration(o.seconds)}`,
               performer: 'xesious',
               duration: Math.round(o.seconds || 0),
-              caption: `🎧 The whole answer as one file (${fmtDuration(o.seconds)}).`,
+              // Timestamps that point at SECTIONS. Telegram makes each one a tappable
+              // seek, so the old caption — whose only number was the total duration —
+              // offered exactly one link, aimed at the last second of the audio.
+              caption: fullAudioCaption(o.seconds, toc, CAPTION_MAX),
+              ...(rows.length ? { reply_markup: { inline_keyboard: rows } } : {}),
             } as any)
             noteBotMessage(key)
+            fullSent = true
+            // The first note's stop button is stale now: nothing is left to stop.
+            await dropStopButton(ctx, task)
+            if (VOICE_TIDY) await tidySpeech(ctx, task)
+            await sendReadAlong(ctx, threadId, key, task, units, timings, o.full, o.seconds, m?.message_id ?? replyTo)
           })
+        } else if (o.done) {
+          // Always last, and separate from `full`: a one-note answer has no full file
+          // but still has timings, and the read-along wants them just the same.
+          timings = (o.timings || []).map((t: number[]) => ({ start: t[0], end: t[1] }))
+          const seconds = o.seconds ?? 0
+          const single = onlyPath
+          if (!fullSent && single) {
+            later(async () => {
+              if (task.cancelled) return
+              await dropStopButton(ctx, task)
+              // The index goes onto the note itself: there is no second message to
+              // put it on, and a lone note with no way to navigate it is the same
+              // complaint one chunk smaller.
+              const toc = speechToc(units, timings)
+              const first = task.chunkIds[0]
+              if (first && toc.length) {
+                await ctx.api.editMessageCaption(ctx.chat!.id, first,
+                  { caption: fullAudioCaption(seconds, toc, CAPTION_MAX) } as any).catch(() => {})
+              }
+              await sendReadAlong(ctx, threadId, key, task, units, timings, single, seconds, first ?? replyTo)
+            })
+          }
         }
       }
     })
     child.on('error', e => { console.error(`[voice] speak spawn: ${e}`); resolve(false) })
     child.on('close', code => {
-      queue.finally(() => {
+      queue.finally(async () => {
+        if (task.cancelled) {
+          await dropStopButton(ctx, task)
+          await send(ctx, threadId, `🛑 Stopped speaking. ${task.chunkIds.length} note(s) already sent stay; the text answer is complete above.`)
+        }
         rmSync(dir, { recursive: true, force: true })
-        if (code !== 0) console.error(`[voice] speak exit ${code}: ${err.slice(-300)}`)
-        resolve(code === 0 && n > 0)
+        task.child = undefined
+        if (speechByTopic.get(key) === task.id) speechByTopic.delete(key)
+        // Oldest out first; Map preserves insertion order. A tap on one evicted this
+        // way is told the notes are no longer tracked rather than doing nothing.
+        while (speechTasks.size > SPEECH_KEEP) {
+          const oldest = speechTasks.keys().next().value as string
+          if (oldest === task.id) break
+          speechTasks.delete(oldest)
+        }
+        if (code !== 0 && !task.cancelled) console.error(`[voice] speak exit ${code}: ${err.slice(-300)}`)
+        // A cancelled run is not a failure: the user asked for it, and reporting it
+        // as one would trigger the "voice could not speak" warning.
+        resolve(task.cancelled || (code === 0 && n > 0))
       })
     })
     child.stdin.write(req); child.stdin.end()
   })
 }
 
-function fmtDuration(sec: number): string {
-  const s = Math.max(0, Math.round(sec))
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+// Quietly remove the stop button once there is nothing left to stop. Editing only
+// the markup keeps the note itself — and its audio — exactly as it was.
+async function dropStopButton(ctx: Context, task: SpeechTask): Promise<void> {
+  const first = task.chunkIds[0]
+  if (!first) return
+  await ctx.api.editMessageReplyMarkup(ctx.chat!.id, first, { reply_markup: { inline_keyboard: [] } }).catch(() => {})
+}
+
+// Delete the chunk notes, leaving the full file. Never automatic unless asked for:
+// the chunks exist to be listened to WHILE the rest is made, and deleting the one
+// that is playing stops playback dead.
+async function tidySpeech(ctx: Context, task: SpeechTask): Promise<number> {
+  let gone = 0
+  for (const id of task.chunkIds) {
+    // A bot may only delete its own messages, and only within 48 hours. Both hold
+    // for a note minutes old, but a failure here is not worth reporting.
+    if (await ctx.api.deleteMessage(ctx.chat!.id, id).then(() => true).catch(() => false)) gone++
+  }
+  task.chunkIds = []
+  return gone
+}
+
+// A page that plays the answer and highlights each block as it is spoken.
+//
+// AWAITED by its caller, not fired and forgotten: it reads the .ogg out of the temp
+// directory that the close handler removes, and the send queue is the only thing
+// holding that directory open. The timing
+// is exact — every unit was synthesised, so its length is known — and the audio is
+// embedded so the file works with no network, like the plain answer.html.
+async function sendReadAlong(ctx: Context, threadId: number | undefined, key: string, task: SpeechTask,
+                             units: SpeechUnit[], timings: UnitTiming[], oggPath: string,
+                             seconds: number, replyTo?: number): Promise<void> {
+  if (task.cancelled || !timings.length || !READALONG_MAX_MIN) return
+  if (seconds > READALONG_MAX_MIN * 60) {
+    console.log(`[voice] read-along skipped: ${Math.round(seconds)}s over the ${READALONG_MAX_MIN}min cap`)
+    return
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'tg-read-'))
+  try {
+    // base64 costs about a third over the .ogg; the cap above is what keeps that
+    // from becoming a page tens of megabytes wide.
+    const uri = `data:audio/ogg;base64,${readFileSync(oggPath).toString('base64')}`
+    const file = join(dir, 'answer-readalong.html')
+    writeFileSync(file, readAlongHtml('Answer', units, timings, uri))
+    await sendFile(ctx, threadId, file, '📖 Read along — plays the answer and highlights each part as it is spoken.', replyTo)
+    noteBotMessage(key)
+  } catch (e) { console.error(`[voice] read-along: ${e}`) }
+  finally { rmSync(dir, { recursive: true, force: true }) }
 }
 
 // Speak an answer back as Telegram voice. Returns false when nothing could be
@@ -2885,13 +3054,23 @@ bot.on('message', async ctx => {
   // which happened, because the difference matters and used to be invisible.
   if (cmd === '/stop' || cmd === '/cancel') {
     const running = jobsFor(key)
-    if (!running.length) { await send(ctx, threadId, 'Nothing is running in this topic right now.', true); return }
+    // Speech is not a job — it runs on its own queue key, which is exactly why it did
+    // not block the topic — so it has to be cancelled explicitly. Someone typing
+    // /stop wants everything to stop; ending the model turn while ten minutes of
+    // audio keeps arriving is the surprise this exists to remove.
+    const spoke = cancelSpeech(key, '/stop')
+    if (!running.length) {
+      await send(ctx, threadId, spoke
+        ? '⏹ Stopped speaking. Nothing else was running in this topic.'
+        : 'Nothing is running in this topic right now.', true)
+      return
+    }
     stopped.add(key)
     for (const j of running) void endJob(j, 'discard')
     // Quote the question being cancelled. By the time you cancel, that message is
     // far up the topic, and "cancelled" on its own does not say cancelled WHAT.
     await send(ctx, threadId,
-      `⏹ Cancelled — the run and everything it started are being stopped, and its answer is discarded.\nUse /interrupt instead to stop but keep the partial answer.`,
+      `⏹ Cancelled — the run and everything it started are being stopped, and its answer is discarded.${spoke ? ' Speaking stopped too.' : ''}\nUse /interrupt instead to stop but keep the partial answer.`,
       false, running.length === 1 ? running[0].askedBy : undefined)
     return
   }
@@ -3529,6 +3708,28 @@ bot.on('callback_query:data', async ctx => {
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})   // one tap only
     void enqueue(rec.key, () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, rec.replyTo, true))
       .catch(e => console.error(`[error] retry ${rec.key}: ${e}`))
+    return
+  }
+  if (data.startsWith('vstop:')) {
+    const t = speechTasks.get(data.slice(6))
+    if (!t || t.cancelled || !t.child) { await ctx.answerCallbackQuery({ text: 'That answer has already finished speaking.' }).catch(() => {}); return }
+    // Answered before the kill: Telegram wants a reply within ten seconds and the
+    // child may take a moment to die. Idempotent by the guard above, because this
+    // button WILL be tapped twice.
+    await ctx.answerCallbackQuery({ text: 'Stopping…' }).catch(() => {})
+    cancelSpeech(t.key, 'user')
+    await ctx.editMessageReplyMarkup(undefined).catch(() => {})
+    return
+  }
+  if (data.startsWith('vtidy:')) {
+    const t = speechTasks.get(data.slice(6))
+    if (!t) { await ctx.answerCallbackQuery({ text: 'Those notes are no longer tracked.' }).catch(() => {}); return }
+    await ctx.answerCallbackQuery({ text: 'Removing the parts…' }).catch(() => {})
+    const gone = await tidySpeech(ctx, t)
+    // The button retires with the notes it removed; leaving it invites a tap that
+    // can do nothing.
+    await ctx.editMessageReplyMarkup(undefined).catch(() => {})
+    console.log(`[voice] tidied ${gone} note(s) for ${t.id}`)
     return
   }
   if (data.startsWith('voice:')) {

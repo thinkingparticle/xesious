@@ -43,9 +43,15 @@ process.env.CLAUDE_CONFIG_DIR = join(TMP, 'claude')
 // that the note is threaded, and that a slow note does not block the topic. The
 // progressive/chunked path is inherently about real timing and is covered in tier 3.
 process.env.TG_TTS_CMD = join(import.meta.dir, 'tts-stub.sh')
-process.env.TG_VOICE_CHUNKED = '0'
+process.env.TG_VOICE_CHUNKED = '1'
 const SLOW_TTS = join(TMP, 'slow-tts')
 process.env.XESIOUS_TTS_STUB_SLOW = SLOW_TTS
+// The progressive path gets its own stub, speaking the same protocol as speak.py.
+// Without it, reaching that path in tier 2 would mean real synthesis at about
+// realtime — minutes per test.
+process.env.TG_SPEAK_CMD = join(import.meta.dir, 'speak-stub.py')
+const SLOW_SPEAK = join(TMP, 'slow-speak')
+process.env.XESIOUS_SPEAK_STUB_SLOW = SLOW_SPEAK
 
 // Dynamic import so the assignments above land first.
 const bridge: any = await import('../bridge')
@@ -92,6 +98,11 @@ bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
   }
   if (method === 'sendDocument' && failParsedCaption && payload.parse_mode) {
     return { ok: false, error_code: 400, description: "Bad Request: can't parse entities" }
+  }
+  if (method === 'sendVoice' || method === 'sendAudio') {
+    // A real Message, not `true`: the bridge records each note's id so it can offer
+    // to remove them later, and a bare `true` left that list silently empty.
+    return { ok: true, result: { message_id: nextMessageId++, date: 0, chat: { id: payload.chat_id, type: 'private' } } }
   }
   if (method === 'sendMediaGroup') {
     if (failMediaGroup) return { ok: false, error_code: 400, description: 'Bad Request: group send failed' }
@@ -2067,7 +2078,7 @@ describe('the voice note is threaded, and never blocks the topic', () => {
   test('a slow note does NOT hold up the next message', async () => {
     // Measured on the real engine: 65s of synthesis sat INSIDE the turn, so the next
     // message you sent waited on audio for an answer you already had in your hand.
-    writeFileSync(SLOW_TTS, 'x')            // make the stub take ~4s
+    writeFileSync(SLOW_SPEAK, 'x')          // make the synthesiser take ~3s per chunk
     try {
       await incoming(1421, '/voice on')
       const t0 = Date.now()
@@ -2084,7 +2095,7 @@ describe('the voice note is threaded, and never blocks the topic', () => {
       const voiceMs = Date.now() - t1
       expect(voiceMs).toBeGreaterThan(2000)
       expect(calls.slice(before).filter(c => c.method === 'sendVoice').length).toBeGreaterThan(0)
-    } finally { rmSync(SLOW_TTS, { force: true }) }
+    } finally { rmSync(SLOW_SPEAK, { force: true }) }
   }, 30000)
 
   test('speech runs on its own queue key, not the topic\'s', async () => {
@@ -2095,5 +2106,188 @@ describe('the voice note is threaded, and never blocks the topic', () => {
     await incoming(1422, 'hello there')
     await bridge._drainQueue('1422:main#voice')     // resolves => the key exists
     expect(true).toBe(true)
+  }, 25000)
+})
+
+// ---------------------------------------------------------------------------
+// The progressive path: cancelling, tidying, the section index, the read-along.
+// TG_VOICE_CHUNKED is '0' for the suite, so these turn it on per test.
+// ---------------------------------------------------------------------------
+describe('a long spoken answer can be stopped, indexed and tidied', () => {
+  // No per-test toggle: VOICE_CHUNKED is read once at import, so it is set for the
+  // whole suite. An earlier version flipped process.env inside the test and silently
+  // did nothing at all.
+  const withChunking = async (fn: () => Promise<void>) => fn()
+  const kbOf = (c: any) => c.payload?.reply_markup?.inline_keyboard
+
+  test('the first note carries a Stop button and later notes say where they start', async () => {
+    // Reported: "if a very long voice is being generated… I have no way to cancel
+    // that shit". Nothing had a handle on synthesis at all.
+    await withChunking(async () => {
+      await incoming(1430, '/voice on')
+      const before = calls.length
+      await incoming(1430, 'HEADINGS')
+      await bridge._drainQueue('1430:main#voice')
+      const notes = calls.slice(before).filter(c => c.method === 'sendVoice')
+      expect(notes.length).toBeGreaterThan(1)
+      const btn = kbOf(notes[0])?.[0]?.[0]
+      expect(String(btn?.text)).toContain('Stop')
+      expect(String(btn?.callback_data)).toStartWith('vstop:')
+      // …and only the first: a button on every bubble is noise.
+      expect(notes.slice(1).every(c => !kbOf(c))).toBe(true)
+      // A bare "part 2" says nothing about where you are in ten minutes of audio.
+      expect(String(notes[1].payload.caption)).toMatch(/part 2 — from \d+:\d\d/)
+    })
+  }, 25000)
+
+  test('the full file is captioned with SECTION timestamps, not just its duration', async () => {
+    // The old caption's only number was the total, so the one seek link Telegram
+    // made of it jumped to the last second of the audio.
+    await withChunking(async () => {
+      await incoming(1431, '/voice on')
+      const before = calls.length
+      await incoming(1431, 'HEADINGS')
+      await bridge._drainQueue('1431:main#voice')
+      const full = calls.slice(before).find(c => c.method === 'sendAudio')
+      expect(full).toBeTruthy()
+      const cap = String(full!.payload.caption)
+      expect(cap).toContain('🎧 Full answer')
+      // One line per heading in the stub's answer, each a tappable M:SS.
+      expect((cap.match(/^\d+:\d\d {2}\S/gm) || []).length).toBeGreaterThan(1)
+      expect(cap).toContain('Alpha')
+    })
+  }, 25000)
+
+  test('the full file offers to remove the parts, and the tap deletes exactly those', async () => {
+    await withChunking(async () => {
+      await incoming(1432, '/voice on')
+      const before = calls.length
+      await incoming(1432, 'HEADINGS')
+      await bridge._drainQueue('1432:main#voice')
+      const cs = calls.slice(before)
+      const full = cs.find(c => c.method === 'sendAudio')
+      const tidy = kbOf(full)?.[0]?.[0]
+      expect(String(tidy?.callback_data)).toStartWith('vtidy:')
+      const noteIds = cs.filter(c => c.method === 'sendVoice').length
+      expect(noteIds).toBeGreaterThan(1)
+
+      const mark = calls.length
+      await bridge.bot.handleUpdate({
+        update_id: 98800,
+        callback_query: { id: 'vt1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+          data: String(tidy.callback_data),
+          message: { message_id: 98801, date: 0, chat: { id: 1432, type: 'private' } } },
+      })
+      await new Promise(r => setTimeout(r, 300))
+      const after = calls.slice(mark)
+      // One delete per note, and the full file is NOT deleted.
+      expect(after.filter(c => c.method === 'deleteMessage').length).toBe(noteIds)
+      expect(after.some(c => c.method === 'editMessageReplyMarkup')).toBe(true)
+    })
+  }, 25000)
+
+  test('a read-along page follows the full file, self-contained', async () => {
+    await withChunking(async () => {
+      await incoming(1433, '/voice on')
+      const before = calls.length
+      await incoming(1433, 'HEADINGS')
+      await bridge._drainQueue('1433:main#voice')
+      await new Promise(r => setTimeout(r, 400))
+      const doc = calls.slice(before).find(c => c.method === 'sendDocument'
+        && String(c.payload?.document?.filename ?? '').includes('readalong'))
+      expect(doc).toBeTruthy()
+      expect(String(doc!.payload.caption)).toContain('Read along')
+    })
+  }, 25000)
+
+  test('tapping Stop kills it, and is idempotent', async () => {
+    // The button WILL be tapped twice.
+    writeFileSync(SLOW_SPEAK, 'x')
+    await withChunking(async () => {
+      try {
+        await incoming(1434, '/voice on')
+        const before = calls.length
+        const run = bridge._drainQueue('1434:main#voice')
+        await incoming(1434, 'HEADINGS')
+        // Poll for the first note rather than guessing: the synthesiser is
+        // deliberately slow here, so a fixed wait taps before anything exists.
+        let note: any
+        for (let i = 0; i < 60 && !note; i++) {
+          await new Promise(r => setTimeout(r, 250))
+          note = calls.slice(before).find(c => c.method === 'sendVoice')
+        }
+        expect(note).toBeTruthy()
+        const stop = kbOf(note)?.[0]?.[0]
+        expect(String(stop?.callback_data)).toStartWith('vstop:')
+
+        const tap = (id: string) => bridge.bot.handleUpdate({
+          update_id: Math.floor(Math.random() * 1e6),
+          callback_query: { id, from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+            data: String(stop.callback_data),
+            message: { message_id: 98901, date: 0, chat: { id: 1434, type: 'private' } } },
+        })
+        await tap('s1')
+        await tap('s2')            // second tap must not throw or double-report
+        await run
+        await bridge._drainQueue('1434:main#voice')
+        const said = calls.slice(before).filter(c => c.method === 'sendMessage')
+          .map(c => String(c.payload.text ?? '')).join('\n')
+        expect(said).toContain('Stopped speaking')
+        expect((said.match(/Stopped speaking/g) || []).length).toBe(1)
+        // Nothing further was delivered after the kill.
+        expect(calls.slice(before).some(c => c.method === 'sendAudio')).toBe(false)
+      } finally { rmSync(SLOW_SPEAK, { force: true }) }
+    })
+  }, 30000)
+
+  test('/stop cancels speech as well as the run', async () => {
+    // Someone typing /stop wants everything to stop; ending the model turn while ten
+    // minutes of audio keeps arriving is the surprise this removes.
+    writeFileSync(SLOW_SPEAK, 'x')
+    await withChunking(async () => {
+      try {
+        await incoming(1435, '/voice on')
+        const run = bridge._drainQueue('1435:main#voice')
+        await incoming(1435, 'HEADINGS')
+        // Wait until speech is genuinely in flight, or /stop has nothing to cancel.
+        for (let i = 0; i < 60 && !calls.some(c => c.method === 'sendVoice'); i++) {
+          await new Promise(r => setTimeout(r, 250))
+        }
+        const cs = await incoming(1435, '/stop')
+        expect(finalReply(cs)).toMatch(/Stopped speaking|Speaking stopped/i)
+        await run
+      } finally { rmSync(SLOW_SPEAK, { force: true }) }
+    })
+  }, 30000)
+})
+
+describe('a SHORT spoken answer still gets an index and a read-along', () => {
+  // One chunk means no full file — the single note is the whole thing — so both
+  // features used to be silently absent for short answers. Caught in tier 3 as
+  // "no full-length audio arrived", which read like a timeout and was a real gap.
+  test('the note itself is captioned with the section index', async () => {
+    await incoming(1440, '/voice on')
+    const before = calls.length
+    await incoming(1440, 'SHORTHEADINGS')
+    await bridge._drainQueue('1440:main#voice')
+    await new Promise(r => setTimeout(r, 400))
+    const cs = calls.slice(before)
+    expect(cs.filter(c => c.method === 'sendVoice')).toHaveLength(1)
+    expect(cs.some(c => c.method === 'sendAudio')).toBe(false)   // no duplicate file
+    const edit = cs.find(c => c.method === 'editMessageCaption')
+    expect(edit).toBeTruthy()
+    expect(String(edit!.payload.caption)).toContain('🎧 Full answer')
+    expect(String(edit!.payload.caption)).toMatch(/^\d+:\d\d {2}\S/m)
+  }, 25000)
+
+  test('and a read-along page still follows', async () => {
+    await incoming(1441, '/voice on')
+    const before = calls.length
+    await incoming(1441, 'SHORTHEADINGS')
+    await bridge._drainQueue('1441:main#voice')
+    await new Promise(r => setTimeout(r, 400))
+    const doc = calls.slice(before).find(c => c.method === 'sendDocument'
+      && String(c.payload?.document?.filename ?? '').includes('readalong'))
+    expect(doc).toBeTruthy()
   }, 25000)
 })

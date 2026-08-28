@@ -156,6 +156,21 @@ listening, and neither costs you the install.
 No configuration follows: `voice/tts.sh` selects Kokoro whenever its model is on
 disk. `TG_TTS_ENGINE` (`kokoro|piper|espeak`) and `TG_KOKORO_VOICE` are overrides.
 
+A long answer is **spoken as it is made** rather than after it: notes arrive at 45s,
+90s, then every 3 minutes, each one a reply to the answer, so you start listening in
+about a minute instead of waiting out the whole thing. Synthesis runs off the topic's
+queue, so the next message you send is answered immediately.
+
+- **🛑 Stop speaking** on the first note ends the whole thing; so does `/stop`.
+- The **full file** follows as one audio message, captioned with a timestamp per
+  section — tap one to jump there.
+- **🧹 Remove the parts** on that file clears the chunk notes and keeps the file.
+  `TG_VOICE_TIDY=1` does it without asking.
+- A **read-along page** comes with it: the answer, the audio, and each block
+  highlighted as it is spoken. Self-contained, so it works offline.
+  `TG_VOICE_READALONG_MAX_MIN` (default 20) caps how long an answer gets one;
+  `TG_VOICE_CHUNKED=0` turns the whole progressive path off.
+
 Then per topic send `/voice on` (or set `TG_VOICE=1` for all topics). With voice on:
 
 - **Send a voice note** → it's transcribed and run as your message. The bridge first

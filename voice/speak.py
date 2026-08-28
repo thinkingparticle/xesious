@@ -5,9 +5,15 @@ Reads one JSON object on stdin and writes one JSON object per line to stdout:
 
     in : {"units":[{"text":"Results.","gap":0.55}, ...],
           "outdir":"/tmp/x", "chunks":[45,90,180]}
-    out: {"chunk":1,"path":"/tmp/x/part-1.ogg","seconds":47.2}
-         {"chunk":2,"path":"/tmp/x/part-2.ogg","seconds":91.0}
-         {"full":"/tmp/x/full.ogg","seconds":138.2,"chunks":2}
+    out: {"chunk":1,"path":"/tmp/x/part-1.ogg","seconds":47.2,"at":0.0}
+         {"chunk":2,"path":"/tmp/x/part-2.ogg","seconds":91.0,"at":47.2}
+         {"full":"/tmp/x/full.ogg","seconds":138.2,"chunks":2,
+          "timings":[[0.0,4.1],[4.6,12.3], ...]}
+
+`timings` is one [start, end] per unit, in the finished audio. It is exact rather
+than estimated — every unit was synthesised here, so its length is known — and it is
+what the caller turns into a section index for the caption and into the highlighting
+of the read-along page. Computing it costs nothing; it used to be thrown away.
 
 Pass {"out":"/path/one.ogg"} instead of "outdir" for the single-file case — one
 utterance, one file, no chunking. That mode exists so this is the ONLY place in the
@@ -101,15 +107,18 @@ def main() -> int:
         os.remove(wav)
 
     sr = None
+    sent = 0.0         # seconds already emitted, so a chunk can say where it starts
     pending = []       # samples for the chunk being built
     everything = []    # every sample, for the full file at the end
+    timings = []       # [start, end] per unit, in the full file
+    elapsed = 0.0      # running position, so a unit's start is known as it is made
     n = 0
 
     def target_for(i):
         return float(targets[i]) if i < len(targets) else float(targets[-1])
 
     def flush():
-        nonlocal pending, n
+        nonlocal pending, n, sent
         if not pending:
             return
         n += 1
@@ -121,7 +130,11 @@ def main() -> int:
             sys.stderr.write(f"speak.py: encode chunk {n} failed ({e})\n")
             pending = []
             return
-        emit({"chunk": n, "path": path, "seconds": round(len(audio) / sr, 1)})
+        dur = len(audio) / sr
+        # `at` is where this chunk begins in the whole answer. A note captioned
+        # "part 3" says nothing about where you are in ten minutes of audio.
+        emit({"chunk": n, "path": path, "seconds": round(dur, 1), "at": round(sent, 1)})
+        sent += dur
         pending = []
 
     for b in units:
@@ -136,6 +149,11 @@ def main() -> int:
             continue
         gap = float(b.get("gap", 0.35))
         silence = np.zeros(int(sr * gap), dtype=samples.dtype)
+        spoken = len(samples) / sr
+        # The unit ENDS where the speech stops, not where its trailing pause does:
+        # highlighting a block through its own silence reads as a stall.
+        timings.append([round(elapsed, 3), round(elapsed + spoken, 3)])
+        elapsed += spoken + gap
         pending.append(samples)
         pending.append(silence)
         everything.append(samples)
@@ -155,9 +173,18 @@ def main() -> int:
         audio = np.concatenate(everything)
         try:
             encode(audio, sr, full)
-            emit({"full": full, "seconds": round(len(audio) / sr, 1), "chunks": n})
+            # timings ride along with `full` as well as with `done`: the caller builds
+            # the section index the moment the full file arrives, and `done` comes
+            # after it. Without them here the caption was captioned with no index at
+            # all — silently, because an answer with no headings correctly has none.
+            emit({"full": full, "seconds": round(len(audio) / sr, 1), "chunks": n, "timings": timings})
         except Exception as e:                                  # noqa: BLE001
             sys.stderr.write(f"speak.py: encode full failed ({e})\n")
+    # ALWAYS last, and separate from "full": a short answer produces one note and no
+    # full file, but the read-along page and the section index want the timings just
+    # the same. Tying them to the full file meant a one-note answer silently got
+    # neither.
+    emit({"done": True, "seconds": round(elapsed, 3), "chunks": n, "timings": timings})
     return 0
 
 

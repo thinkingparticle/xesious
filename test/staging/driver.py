@@ -20,6 +20,7 @@ Env (set by run-staging.sh from .env.staging):
 """
 import asyncio
 import os
+import re
 import subprocess
 import sys
 
@@ -2216,6 +2217,192 @@ async def feature_voice_progressive(client, bot):
 
 
 
+async def feature_voice_index_and_readalong(client, bot):
+    """The full file must carry SECTION timestamps, and a read-along page must follow.
+
+    Two reports. *"the last full voice has simple text… in the latest test it writes
+    (9:48) and clicking the number jumps to the 9:48 time which is the end of the
+    sound"* — the only number in the caption was the total duration, so the single
+    seek link Telegram makes of it pointed at the last second. And *"is it possible
+    to also generate an html … the voice plays for each paragraph and the paragraph
+    gets highlighted"*.
+
+    Only this tier settles either. Whether Telegram turns `M:SS` into a seek is a
+    client behaviour, and the read-along page has to be downloaded off the wire and
+    read to know its audio really is embedded and its offsets really match.
+    """
+    problems = []
+    seen = []
+
+    @client.on(events.NewMessage(from_users=bot, chats=bot))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    await send_and_wait(client, bot, "/voice on")
+    mark = len(seen)
+    print("  → asking for an answer with real sections")
+    await client.send_message(bot,
+        "Reply with ONLY the following, no preamble and no commentary. Three markdown "
+        "level-2 headings — 'Why it moved', 'What to watch', 'What to do' — each "
+        "followed by TWELVE sentences of ordinary prose about market liquidity. "
+        "The length matters: it has to be several minutes when read aloud.")
+
+    full = await _until(lambda: next((m for m in seen[mark:] if m.audio), None), 900)
+    if not full:
+        client.remove_event_handler(handler)
+        return ("the full voice file is indexed and a read-along page follows", False,
+                "no full-length audio arrived within 900s")
+
+    cap = full.message or ""
+    print(f"    caption:\n      " + cap.replace("\n", "\n      "))
+    stamps = re.findall(r"^(\d+):(\d\d)\s{2}(\S.*)$", cap, re.M)
+    if len(stamps) < 2:
+        problems.append(f"fewer than two section timestamps in the caption: {cap!r}")
+    else:
+        secs = [int(m) * 60 + int(sec) for m, sec, _ in stamps]
+        # The whole complaint: the timestamps must point INTO the audio, not at its end.
+        dur = audio_seconds(full)
+        if secs and secs[0] != 0:
+            problems.append(f"the first section is at {secs[0]}s rather than the start")
+        if any(x >= dur for x in secs):
+            problems.append(f"a timestamp ({max(secs)}s) is at or past the end of the audio ({dur}s)")
+        if secs != sorted(secs):
+            problems.append(f"timestamps are not in order: {secs}")
+        print(f"    {len(secs)} sections at {secs}s within {dur}s of audio")
+
+    # --- the read-along page ------------------------------------------------------
+    page = await _until(lambda: next((m for m in seen[mark:] if m.document and any(
+        "readalong" in (getattr(a, "file_name", "") or "") for a in m.document.attributes)), None), 300)
+    if not page:
+        problems.append("no read-along page followed the full file")
+    else:
+        path = os.path.join(os.environ.get("TG_SESSIONS_BASE", "/tmp"), "readalong.html")
+        await client.download_media(page, file=path)
+        with open(path, encoding="utf-8") as fh:
+            doc = fh.read()
+        print(f"    read-along page: {len(doc)//1024}KB")
+        # Self-contained, like the plain answer.html: it has to work with no network.
+        if "src=\"data:audio/ogg;base64," not in doc:
+            problems.append("the page does not embed its audio — it would be silent offline")
+        if re.search(r"https?://", doc):
+            problems.append("the page fetches something over the network")
+        offsets = re.findall(r'data-start="([\d.]+)" data-end="([\d.]+)"', doc)
+        if len(offsets) < 4:
+            problems.append(f"only {len(offsets)} timed blocks in the page")
+        else:
+            starts = [float(a) for a, _ in offsets]
+            if starts != sorted(starts):
+                problems.append("the page's blocks are not in playback order")
+            if float(offsets[-1][1]) > audio_seconds(full) + 2:
+                problems.append("a block ends after the audio does — the offsets do not match the file")
+            print(f"    {len(offsets)} timed blocks, last ends at {offsets[-1][1]}s")
+        try: os.remove(path)
+        except OSError: pass
+
+    client.remove_event_handler(handler)
+    await send_and_wait(client, bot, "/voice off")
+    return ("the full voice file is indexed and a read-along page follows", not problems,
+            "; ".join(problems) if problems else
+            f"{len(stamps)} section timestamps pointing into the audio, and a self-contained "
+            f"read-along page with {len(offsets) if page else 0} timed blocks")
+
+
+async def feature_voice_cancel_and_tidy(client, bot):
+    """A long answer must be stoppable mid-flight, and its parts removable afterwards.
+
+    *"if a very long voice is being generated, it sends messages every few minutes,
+    and if I have decided that I don't want it, I have no way to cancel that shit!"*
+    and *"the voices are left in the chat, and it makes the chat a bit messy."*
+
+    Real Telegram is the only place the buttons can be tapped, and the only place
+    deletion can be observed — a bot may delete only its own messages, within 48
+    hours, and whether the note actually disappears is a server-side fact.
+    """
+    problems = []
+    seen = []
+
+    @client.on(events.NewMessage(from_users=bot, chats=bot))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    await send_and_wait(client, bot, "/voice on")
+
+    # --- cancel -------------------------------------------------------------------
+    mark = len(seen)
+    print("  → a long answer, to be cancelled part-way")
+    await client.send_message(bot,
+        "Reply with ONLY a numbered list of 120 lines, no preamble and no commentary, "
+        "each line exactly 'N. The quick brown fox jumps over the lazy dog.' with N "
+        "counting up from 1.")
+    first = await _until(lambda: next((m for m in seen[mark:] if m.voice), None), 600)
+    if not first:
+        client.remove_event_handler(handler)
+        return ("a long spoken answer can be cancelled and its parts removed", False,
+                "no voice note arrived within 600s")
+    btns = [b for row in (first.reply_markup.rows if first.reply_markup else []) for b in row.buttons]
+    print(f"    first note carries: {[b.text for b in btns]}")
+    if not any("Stop" in b.text for b in btns):
+        problems.append("the first note carries no Stop button")
+    else:
+        await first.click(0)
+        await asyncio.sleep(10)
+        n_at_cancel = len([m for m in seen[mark:] if m.voice])
+        said = " ".join((reply_text(m) or "") for m in seen[mark:])
+        if "Stopped speaking" not in said:
+            problems.append(f"cancelling said nothing: {said[:120]!r}")
+        # The real test of a cancel: nothing more arrives afterwards.
+        await asyncio.sleep(45)
+        n_after = len([m for m in seen[mark:] if m.voice])
+        print(f"    notes at cancel: {n_at_cancel}; 45s later: {n_after}")
+        if n_after > n_at_cancel:
+            problems.append(f"{n_after - n_at_cancel} more notes arrived after cancelling")
+        if any(m.audio for m in seen[mark:]):
+            problems.append("the full file was still sent after cancelling")
+
+    # --- tidy ---------------------------------------------------------------------
+    mark2 = len(seen)
+    print("  → a shorter answer, to be tidied once complete")
+    # Long enough to be split across MORE THAN ONE note, which is the only case with
+    # parts to remove: a single-chunk answer correctly sends no duplicate audio file
+    # and therefore offers no tidy button.
+    await client.send_message(bot,
+        "Reply with ONLY the following, no preamble: two markdown level-2 headings, "
+        "'One' and 'Two', each followed by TEN sentences of ordinary prose about "
+        "shipping logistics. The length matters: several minutes when read aloud.")
+    full = await _until(lambda: next((m for m in seen[mark2:] if m.audio), None), 900)
+    if not full:
+        problems.append("no full file arrived for the tidy case")
+    else:
+        notes = [m for m in seen[mark2:] if m.voice]
+        tbtn = [b for row in (full.reply_markup.rows if full.reply_markup else []) for b in row.buttons]
+        print(f"    {len(notes)} note(s); full file offers: {[b.text for b in tbtn]}")
+        if len(notes) < 2:
+            problems.append(f"the answer produced {len(notes)} note(s) — too short to exercise tidying")
+        elif not any("Remove" in b.text for b in tbtn):
+            problems.append("the full file offers no way to remove the parts")
+        else:
+            ids = [m.id for m in notes]
+            await full.click(0)
+            await asyncio.sleep(8)
+            still = await client.get_messages(bot, ids=ids)
+            alive = [m for m in still if m is not None and not isinstance(m, type(None)) and getattr(m, "id", None)]
+            print(f"    of {len(ids)} notes, {len(alive)} still exist after tidying")
+            if alive:
+                problems.append(f"{len(alive)} of {len(ids)} notes survived the tidy")
+            # …and the full file itself must NOT have been removed.
+            again = await client.get_messages(bot, ids=[full.id])
+            if not again or again[0] is None:
+                problems.append("tidying deleted the full file as well")
+
+    client.remove_event_handler(handler)
+    await send_and_wait(client, bot, "/voice off")
+    return ("a long spoken answer can be cancelled and its parts removed", not problems,
+            "; ".join(problems) if problems else
+            "the Stop button ended it and nothing further arrived, and the full file's "
+            "button removed the parts while keeping itself")
+
+
+
 FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
                  feature_rtl_answer_stays_rich,
                  feature_midturn_text, feature_attribution, feature_reply_threading,
@@ -2231,6 +2418,10 @@ FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_pro
                  # Slow by nature: it waits on real synthesis of a long answer. Last
                  # of the DM cases so nothing else is queued behind it.
                  feature_voice_progressive,
+                 feature_voice_index_and_readalong,
+                 # Slowest of the lot: it deliberately starts a long answer in order
+                 # to cancel it part-way.
+                 feature_voice_cancel_and_tidy,
                  feature_fanout_guard,
                  # Needs a real forum group and creates five topics of its own.
                  feature_unicode_topic_directories,
