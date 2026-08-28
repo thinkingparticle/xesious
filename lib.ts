@@ -422,6 +422,258 @@ export function previewCut(text: string, budget: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// speech — turning an answer into something that SOUNDS like prose
+//
+// stripMd is not usable for this and must not be changed to be: it is shared with
+// the text path (the sendMessage fallback, captions, the file preview), where
+// inserting pauses or rewriting headings would corrupt messages that have nothing to
+// do with voice. So speech gets its own pass, applied only on the TTS path.
+//
+// The reported symptom was "the speech is like a continuous text without much wait
+// or difference for titles". The cause is mechanical: stripMd removes a heading's
+// `##` and keeps its words, and a heading has no terminal punctuation, so
+// `## Results` + `The tests pass` reaches the engine as one sentence — every TTS
+// engine phrases on punctuation, not on newlines. Bullets are the mirror image:
+// stripMd has no rule for `- ` at all, so the marker is read out or swallowed and
+// the beat it stands for is never produced.
+// ---------------------------------------------------------------------------
+
+// The speakers offered on the keyboard.
+//
+// ALL 28 English voices in the v1.0 pack, not a hand-picked eight. The first ten are
+// the ones from Kokoro's original v0.19 release — the list most people have seen
+// published — so a name you recognise is on the first page; the rest follow.
+// (The pack also carries 26 voices across Spanish, French, Hindi, Italian, Japanese,
+// Portuguese and Chinese, reachable with `/voice speaker <id>`. There is no Persian.)
+//
+// Labelled by flag, name and gender ONLY. An earlier version of this list described
+// each one as "warm", "bright", "steady" and so on — descriptions of audio nobody
+// had listened to. A label that invents a fact is worse than a plain one.
+export type Speaker = { id: string; label: string; lang: string }
+const EN = (id: string, name: string, female: boolean): Speaker => ({
+  id,
+  label: `${id.startsWith('a') ? '🇺🇸' : '🇬🇧'} ${name} (${female ? 'f' : 'm'})`,
+  lang: id.startsWith('a') ? 'en-us' : 'en-gb',
+})
+export const SPEAKERS: Speaker[] = [
+  // The published ten, first.
+  EN('af_bella', 'Bella', true), EN('af_sarah', 'Sarah', true),
+  EN('af_nicole', 'Nicole', true), EN('af_sky', 'Sky', true),
+  EN('am_adam', 'Adam', false), EN('am_michael', 'Michael', false),
+  EN('bf_emma', 'Emma', true), EN('bf_isabella', 'Isabella', true),
+  EN('bm_george', 'George', false), EN('bm_lewis', 'Lewis', false),
+  // Then the rest of v1.0. af_heart is the default and deliberately not buried.
+  EN('af_heart', 'Heart', true), EN('af_alloy', 'Alloy', true),
+  EN('af_aoede', 'Aoede', true), EN('af_jessica', 'Jessica', true),
+  EN('af_kore', 'Kore', true), EN('af_nova', 'Nova', true),
+  EN('af_river', 'River', true),
+  EN('am_echo', 'Echo', false), EN('am_eric', 'Eric', false),
+  EN('am_fenrir', 'Fenrir', false), EN('am_liam', 'Liam', false),
+  EN('am_onyx', 'Onyx', false), EN('am_puck', 'Puck', false),
+  EN('am_santa', 'Santa', false),
+  EN('bf_alice', 'Alice', true), EN('bf_lily', 'Lily', true),
+  EN('bm_daniel', 'Daniel', false), EN('bm_fable', 'Fable', false),
+]
+export const SPEAKER_PAGE = 8
+export const SPEAKER_DEFAULT = 'af_heart'
+
+// Kokoro voice ids are `<language><gender>_<name>`, so the language is the first
+// character. Derived rather than tabulated, so a voice typed with
+// `/voice speaker <id>` that is not on the shortlist still gets the right language.
+const KOKORO_LANGS: Record<string, string> = {
+  a: 'en-us', b: 'en-gb', e: 'es', f: 'fr-fr', h: 'hi', i: 'it', j: 'ja', p: 'pt-br', z: 'cmn',
+}
+export function kokoroLang(voiceId: string): string {
+  return KOKORO_LANGS[voiceId.slice(0, 1).toLowerCase()] || 'en-us'
+}
+// A speaker id is only ever used as an env var and a filename-free lookup, but it
+// comes from user text via `/voice speaker <id>`, so it is constrained here rather
+// than trusted.
+export const isSpeakerId = (v: string) => /^[a-z]{2}_[a-z]{2,20}$/.test(v)
+export function speakerLabel(id: string): string {
+  return SPEAKERS.find(s => s.id === id)?.label || id
+}
+
+export type SpeechBlock = { kind: 'heading' | 'para' | 'item' | 'skip'; text: string }
+
+// A short spoken stand-in for something that should not be read aloud. Reading a
+// punctuation-dense code block to someone is worse than telling them it is there.
+function placeholder(kind: string, lines: number): string {
+  const n = Math.max(1, lines)
+  return `${kind === 'table' ? 'A table' : `A ${n}-line code block`}.`
+}
+
+// Split an answer into typed blocks for speech. The types are what drive both the
+// pauses and the phrasing, so this is the one splitter and the truncation work and
+// the prosody work share it.
+export function speechBlocks(md: string): SpeechBlock[] {
+  const out: SpeechBlock[] = []
+  const lines = md.split('\n')
+  let i = 0
+  const push = (kind: SpeechBlock['kind'], text: string) => {
+    const t = text.replace(/\s+/g, ' ').trim()
+    if (t) out.push({ kind, text: t })
+  }
+  while (i < lines.length) {
+    const line = lines[i]
+    if (/^\s*```/.test(line)) {                       // fenced code: not read out
+      const start = i; i++
+      while (i < lines.length && !/^\s*```/.test(lines[i])) i++
+      i++
+      push('skip', placeholder('code', i - start - 2))
+      continue
+    }
+    if (line.includes('|') && i + 1 < lines.length && /^[\s|:-]*-[\s|:-]*$/.test(lines[i + 1]) && lines[i + 1].includes('|')) {
+      i += 2
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) i++
+      push('skip', placeholder('table', 0))
+      continue
+    }
+    const h = line.match(/^\s*(#{1,6})\s+(.*)$/)
+    if (h) { push('heading', h[2]); i++; continue }
+    // A setext-style rule or an <hr> is a section break, not something to say.
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { i++; continue }
+    const li = line.match(/^\s*(?:[-*+]|(\d+)[.)])\s+(.*)$/)
+    if (li) {
+      // The digit of an ordered list carries information the marker does not, so it
+      // is spoken; a bullet's dash carries none and is dropped.
+      const body: string[] = [li[2]]
+      i++
+      while (i < lines.length && lines[i].trim() && !/^\s*(?:[-*+]|\d+[.)])\s+/.test(lines[i]) && !/^\s*#{1,6}\s/.test(lines[i]) && !/^\s*```/.test(lines[i])) body.push(lines[i++])
+      push('item', (li[1] ? `${li[1]}. ` : '') + body.join(' '))
+      continue
+    }
+    if (!line.trim()) { i++; continue }
+    const para: string[] = []
+    while (i < lines.length && lines[i].trim() && !/^\s*(?:```|#{1,6}\s|[-*+]\s|\d+[.)]\s)/.test(lines[i])) para.push(lines[i++])
+    push('para', para.join(' '))
+  }
+  return out
+}
+
+// Make ONE block speakable: strip the markup stripMd handles, then fix the things
+// that matter to an ear rather than an eye.
+export function speechify(text: string): string {
+  let t = text
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*\n]+)\*/g, '$1')
+    .replace(/(^|[\s(])_([^_\n]+)_/g, '$1$2')
+    .replace(/~~([^~]+)~~/g, '$1')
+    .replace(/^\s*>\s?/gm, '')
+  // A link's TARGET is for reading, never for listening: stripMd expands
+  // [text](url) to "text (url)", which is right on the text path and unbearable on
+  // this one. Keep the words, drop the address.
+  t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1')
+  // A bare URL becomes its host: "see docs.example.com" rather than forty
+  // characters of query string read one at a time.
+  t = t.replace(/\bhttps?:\/\/([^\s)]+)/gi, (_m, rest) => String(rest).split('/')[0])
+  // Symbols that are punctuation to the eye and silence to the ear.
+  t = t.replace(/\s*->\s*/g, ' to ')
+       .replace(/\s*=>\s*/g, ' becomes ')
+       .replace(/\s+&\s+/g, ' and ')
+       .replace(/\s*\|\s*/g, ', ')
+       .replace(/…/g, '.')
+  return t.replace(/\s+/g, ' ').trim()
+}
+
+// A block, spoken, with terminal punctuation guaranteed. A heading is the whole
+// point of this: it has none of its own, so without one added it is read as the
+// opening words of the paragraph beneath it.
+export function speechText(b: SpeechBlock): string {
+  const t = speechify(b.text)
+  if (!t) return ''
+  return /[.!?:;]$/.test(t) ? t : t + '.'
+}
+
+// How long a pause FOLLOWS each kind of block, in seconds. Kokoro honours
+// punctuation only weakly and has no SSML, so the dependable lever is real silence
+// appended between separately-synthesised blocks.
+// How many SECONDS of audio the nth chunk should hold before it is sent.
+//
+// Synthesis measured at 0.65-0.68x realtime on this class of box, which is the
+// fact the whole design rests on: it is FASTER than listening, so once the first
+// note has landed every later one is ready before the previous finishes — with
+// equal chunks the inequality holds for every n>=1, so playback never gaps. The
+// only thing left to choose is how long you wait for note ONE, and that is why the
+// first two are short: ~30s to the first audio instead of minutes, and then the
+// chunks grow so a long answer is a handful of notes rather than nineteen.
+export function speechChunkSeconds(index: number): number {
+  if (index === 0) return 45
+  if (index === 1) return 90
+  return 180
+}
+
+// One unit of synthesis: the text to speak and the silence to append after it.
+// The gap is decided HERE rather than from the kind alone, because a sentence in
+// the middle of a paragraph and the sentence that ends it want different pauses
+// while both being 'para'.
+export type SpeechUnit = { text: string; gap: number }
+
+// Sentence-granular units, which is what makes progressive delivery work at all.
+// Chunks can only be closed on a unit boundary, so a block-granular list means one
+// long paragraph overshoots the target wildly — measured: a first chunk of 90s
+// against a 45s target, which doubles the wait for the first note. Splitting inside
+// paragraphs lets a chunk end roughly where it was asked to.
+const SENTENCE_MAX = 400
+function sentences(t: string): string[] {
+  const out: string[] = []
+  for (const raw of t.split(/(?<=[.!?])\s+/)) {
+    let s = raw.trim()
+    if (!s) continue
+    // A sentence longer than this is usually a list glued together with commas or
+    // semicolons; splitting it keeps a single unit from blowing past a chunk target.
+    while (s.length > SENTENCE_MAX) {
+      const cut = s.lastIndexOf(', ', SENTENCE_MAX)
+      if (cut < SENTENCE_MAX * 0.4) break
+      out.push(s.slice(0, cut + 1)); s = s.slice(cut + 2)
+    }
+    out.push(s)
+  }
+  return out.filter(Boolean)
+}
+
+// Sentences are BATCHED into runs before they become units, and the reason is
+// measured. One synthesis call per sentence ran at 1.05x realtime — slower than
+// listening — because each call pays a fixed phonemisation and ONNX-session cost
+// that a two-second sentence cannot amortise. The same text in one call ran at
+// 0.65x. So a run is made as long as it can be while still letting a chunk close
+// near its target: long enough to be efficient, short enough to steer.
+const RUN_MAX = 700
+export function speechUnits(md: string): SpeechUnit[] {
+  const out: SpeechUnit[] = []
+  for (const b of speechBlocks(md)) {
+    const spoken = speechText(b)
+    if (!spoken) continue
+    const gap = SPEECH_GAPS[b.kind]
+    // A heading or a placeholder is one utterance by definition — never split, and
+    // it keeps the longest pause because it is what introduces everything after it.
+    if (b.kind === 'heading' || b.kind === 'skip') { out.push({ text: spoken, gap }); continue }
+    const runs: string[] = []
+    for (const sentence of sentences(spoken)) {
+      const last = runs[runs.length - 1]
+      // Sentence punctuation carries the phrasing INSIDE a run, so no explicit
+      // silence is lost by joining them — only the pauses between blocks matter.
+      if (last && last.length + sentence.length + 1 <= RUN_MAX) runs[runs.length - 1] = `${last} ${sentence}`
+      else runs.push(sentence)
+    }
+    runs.forEach((text, i) => {
+      // Only the LAST run carries the block's pause; a break inside a block gets a
+      // short breath, which is what a full stop already sounds like in speech.
+      out.push({ text, gap: i === runs.length - 1 ? gap : 0.18 })
+    })
+  }
+  return out
+}
+
+export const SPEECH_GAPS: Record<SpeechBlock['kind'], number> = {
+  heading: 0.55,   // longest: a heading introduces what follows
+  para: 0.40,
+  item: 0.25,      // shortest: items are a list, not separate thoughts
+  skip: 0.40,
+}
+
+// ---------------------------------------------------------------------------
 // prose sanitisation — ONE stage per output dialect
 // ---------------------------------------------------------------------------
 //

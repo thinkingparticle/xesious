@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Speak an answer as a SEQUENCE of voice notes, emitted as each one is ready.
+
+Reads one JSON object on stdin and writes one JSON object per line to stdout:
+
+    in : {"units":[{"text":"Results.","gap":0.55}, ...],
+          "outdir":"/tmp/x", "chunks":[45,90,180]}
+    out: {"chunk":1,"path":"/tmp/x/part-1.ogg","seconds":47.2}
+         {"chunk":2,"path":"/tmp/x/part-2.ogg","seconds":91.0}
+         {"full":"/tmp/x/full.ogg","seconds":138.2,"chunks":2}
+
+Pass {"out":"/path/one.ogg"} instead of "outdir" for the single-file case — one
+utterance, one file, no chunking. That mode exists so this is the ONLY place in the
+tree that loads Kokoro: voice/tts.sh delegates to it rather than carrying a second
+implementation that reads the same nine environment variables.
+
+Why this exists rather than another call to tts.sh:
+
+  * The topic used to be BLOCKED for the whole synthesis — measured at 65s for a
+    note at the old 1400-character cap. Emitting chunks as they finish is what lets
+    the first audio arrive in ~30 seconds instead of after everything.
+  * The model is loaded ONCE for the whole answer. tts.sh spawns a fresh process
+    per note, so the 311MB ONNX model was reconstructed every time: 2 of those 65
+    seconds were model load, per note.
+  * Pauses have to be real silence. Kokoro honours punctuation only weakly and has
+    no SSML, so a heading is followed by appending zeros to the sample array — which
+    is only possible when synthesis and joining happen in the same process.
+  * The full file at the end costs nothing here: the samples are already in hand,
+    so it is a concatenate and one encode, not a second synthesis.
+
+Env: TG_KOKORO_MODEL / TG_KOKORO_VOICES / TG_KOKORO_VOICE / TG_KOKORO_SPEED /
+     TG_KOKORO_LANG, and TG_FFMPEG to override the encoder.
+"""
+import json
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def emit(obj):
+    """One JSON object per line, flushed. The bridge reads this as it arrives — if
+    it were buffered the progressive delivery would collapse back into one lump."""
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def find_ffmpeg():
+    """Same order as tts.sh: an explicit override, the private copy setup.sh may
+    have installed without root, then the system one."""
+    cand = os.environ.get("TG_FFMPEG", "")
+    if cand and os.access(cand, os.X_OK):
+        return cand
+    local = os.path.join(HERE, "bin", "ffmpeg")
+    if os.access(local, os.X_OK):
+        return local
+    from shutil import which
+    return which("ffmpeg")
+
+
+def main() -> int:
+    try:
+        req = json.loads(sys.stdin.read())
+    except Exception as e:
+        sys.stderr.write(f"speak.py: bad request ({e})\n")
+        return 2
+    units = req.get("units") or []
+    single = req.get("out")                      # one utterance, one file
+    outdir = req.get("outdir") or (os.path.dirname(single) if single else ".")
+    targets = req.get("chunks") or [45, 90, 180]
+    if not units:
+        sys.stderr.write("speak.py: nothing to speak\n")
+        return 2
+
+    ff = find_ffmpeg()
+    if not ff:
+        sys.stderr.write("speak.py: no ffmpeg — cannot encode Opus. Run voice/setup.sh.\n")
+        return 4
+    try:
+        import numpy as np
+        import soundfile as sf
+        from kokoro_onnx import Kokoro
+    except Exception as e:
+        sys.stderr.write(f"speak.py: kokoro not installed ({e}); run voice/setup.sh\n")
+        return 3
+
+    model = os.environ.get("TG_KOKORO_MODEL", os.path.join(HERE, "kokoro", "kokoro-v1.0.onnx"))
+    voices = os.environ.get("TG_KOKORO_VOICES", os.path.join(HERE, "kokoro", "voices-v1.0.bin"))
+    voice = os.environ.get("TG_KOKORO_VOICE", "af_heart").strip() or "af_heart"
+    speed = float(os.environ.get("TG_KOKORO_SPEED", "1.0") or "1.0")
+    lang = os.environ.get("TG_KOKORO_LANG", "en-us").strip() or "en-us"
+
+    k = Kokoro(model, voices)          # once, for the whole answer
+
+    def encode(samples, sr, path):
+        wav = path + ".wav"
+        sf.write(wav, samples, sr)
+        subprocess.run([ff, "-y", "-i", wav, "-ac", "1", "-c:a", "libopus", "-b:a", "32k", path],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        os.remove(wav)
+
+    sr = None
+    pending = []       # samples for the chunk being built
+    everything = []    # every sample, for the full file at the end
+    n = 0
+
+    def target_for(i):
+        return float(targets[i]) if i < len(targets) else float(targets[-1])
+
+    def flush():
+        nonlocal pending, n
+        if not pending:
+            return
+        n += 1
+        audio = np.concatenate(pending)
+        path = single if single else os.path.join(outdir, f"part-{n}.ogg")
+        try:
+            encode(audio, sr, path)
+        except Exception as e:                                  # noqa: BLE001
+            sys.stderr.write(f"speak.py: encode chunk {n} failed ({e})\n")
+            pending = []
+            return
+        emit({"chunk": n, "path": path, "seconds": round(len(audio) / sr, 1)})
+        pending = []
+
+    for b in units:
+        text = (b.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            samples, sr = k.create(text, voice=voice, speed=speed, lang=lang)
+        except Exception as e:                                  # noqa: BLE001
+            # One unspeakable unit must not lose the whole answer.
+            sys.stderr.write(f"speak.py: unit failed ({e})\n")
+            continue
+        gap = float(b.get("gap", 0.35))
+        silence = np.zeros(int(sr * gap), dtype=samples.dtype)
+        pending.append(samples)
+        pending.append(silence)
+        everything.append(samples)
+        everything.append(silence)
+        # Single-file mode never flushes early: the caller asked for one file.
+        if not single and sum(len(x) for x in pending) / sr >= target_for(n):
+            flush()
+    flush()
+
+    if not everything:
+        sys.stderr.write("speak.py: nothing was synthesised\n")
+        return 5
+    # The whole thing, for someone who wants one file rather than a list. Already
+    # synthesised, so this is a concatenate and a single encode.
+    if n > 1 and not single:
+        full = os.path.join(outdir, "full.ogg")
+        audio = np.concatenate(everything)
+        try:
+            encode(audio, sr, full)
+            emit({"full": full, "seconds": round(len(audio) / sr, 1), "chunks": n})
+        except Exception as e:                                  # noqa: BLE001
+            sys.stderr.write(f"speak.py: encode full failed ({e})\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

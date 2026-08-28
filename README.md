@@ -133,15 +133,28 @@ Send and receive files through the same topic.
 ## Voice (eyes-free, turn-based)
 
 Talk to a topic and hear the answer — no reading or typing. It runs **locally, no
-API key**: `faster-whisper` for speech→text, `piper`/`espeak-ng` for text→speech,
-and a fast model (Haiku) to summarize long answers into a few spoken sentences.
+API key**: `faster-whisper` for speech→text, **Kokoro** for text→speech, and a fast
+model (Haiku) to summarize long answers into a few spoken sentences.
 
-Setup once:
+Setup once — **no root required**:
 
 ```bash
-voice/setup.sh            # ffmpeg + faster-whisper + espeak-ng (robotic voice)
-voice/setup.sh --piper    # also a natural neural voice (recommended)
+voice/setup.sh            # faster-whisper + Kokoro (the good voice). ~340 MB of models.
+voice/setup.sh --check    # report what's installed, change nothing
+voice/setup.sh --espeak   # also the robotic espeak-ng fallback (this one needs apt)
+voice/setup.sh --piper    # also Piper + a neural voice
 ```
+
+Nothing in the voice path needs a system package. Python packages install with
+`python3 -m pip --user` (adding `--break-system-packages` only if the distro refuses,
+and never dropping `--user`), and the one native tool — `ffmpeg`, used solely to
+transcode the outgoing WAV to Opus — is taken from the system if present and
+otherwise installed privately into `voice/bin/` from pip. If a step fails the script
+**keeps going and tells you what works**: a missing `ffmpeg` costs you speaking, not
+listening, and neither costs you the install.
+
+No configuration follows: `voice/tts.sh` selects Kokoro whenever its model is on
+disk. `TG_TTS_ENGINE` (`kokoro|piper|espeak`) and `TG_KOKORO_VOICE` are overrides.
 
 Then per topic send `/voice on` (or set `TG_VOICE=1` for all topics). With voice on:
 
@@ -245,6 +258,6 @@ holding a conversation.
   API) — only text is sent, so it's fast; the page shows your words live plus
   Claude's thinking, tool use, and answer. Default permission mode `plan` (read-only).
 
-Setup: `voice/setup.sh --kokoro`, set `LIVE_PASSCODE` in `.env`, `live/start-live.sh`,
+Setup: `voice/setup.sh`, set `LIVE_PASSCODE` in `.env`, `live/start-live.sh`,
 point the subdomain at `:3060`. Latency floor is Kokoro (~1x realtime on CPU); a GPU
 or a lighter voice makes it snappier.

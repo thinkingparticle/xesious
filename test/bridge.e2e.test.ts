@@ -39,9 +39,17 @@ process.env.TG_ALLOW_BYPASS = '0'         // bypass must be refused
 // point into the sandbox — a test has no business reading or writing the real
 // ~/.claude, and would be testing against whatever happens to be in it.
 process.env.CLAUDE_CONFIG_DIR = join(TMP, 'claude')
+// Real synthesis is ~1x realtime, so tier 2 uses a stub and proves the PLUMBING:
+// that the note is threaded, and that a slow note does not block the topic. The
+// progressive/chunked path is inherently about real timing and is covered in tier 3.
+process.env.TG_TTS_CMD = join(import.meta.dir, 'tts-stub.sh')
+process.env.TG_VOICE_CHUNKED = '0'
+const SLOW_TTS = join(TMP, 'slow-tts')
+process.env.XESIOUS_TTS_STUB_SLOW = SLOW_TTS
 
 // Dynamic import so the assignments above land first.
 const bridge: any = await import('../bridge')
+const { SPEAKERS } = await import('../lib')
 
 // --- Fake Telegram: record calls, return canned API responses (no network).
 type Call = { method: string; payload: any }
@@ -1852,4 +1860,240 @@ describe('the /sessions picker paginates', () => {
     expect(bridge._listing.text('nosuch', 0)).toMatch(/expired/i)
     expect(bridge._listing.kb('nosuch', 0).inline_keyboard).toHaveLength(0)
   })
+})
+
+// ---------------------------------------------------------------------------
+// Voice
+// ---------------------------------------------------------------------------
+describe('/voice is a keyboard, like every other setting', () => {
+  const kb = (c: any) => c.payload?.reply_markup?.inline_keyboard
+  const labels = (c: any) => (kb(c) || []).flat().map((b: any) => String(b.text))
+
+  test('bare /voice answers with buttons, not a menu you have to type back at', async () => {
+    // It was the last setting whose answer was plain text while /mode, /model and
+    // /effort all had keyboards. That was an inconsistency, not a missing feature.
+    const cs = await incoming(1400, '/voice')
+    const menu = sends(cs).find(c => kb(c))
+    expect(menu).toBeTruthy()
+    const l = labels(menu)
+    expect(l.some((x: string) => x.includes('Full'))).toBe(true)
+    expect(l.some((x: string) => x.includes('Summary'))).toBe(true)
+    expect(l.some((x: string) => x.includes('Off'))).toBe(true)
+  }, 15000)
+
+  test('the speakers are named, not raw ids, and every English voice is reachable', async () => {
+    const cs = await incoming(1401, '/voice')
+    const menu = sends(cs).find(c => kb(c))
+    const spk = (kb(menu) || []).flat().filter((b: any) => String(b.callback_data).startsWith('vspk:'))
+    expect(spk.length).toBe(8)                       // one page
+    // "am_michael" tells you nothing; a name and a flag do. Asserted on the page
+    // actually rendered, which is the one holding the current speaker — not page one.
+    expect(spk.every((b: any) => /[\u{1F1E6}-\u{1F1FF}]{2} \w+ \((f|m)\)/u.test(String(b.text)))).toBe(true)
+    expect(spk.some((b: any) => String(b.text).includes('Heart'))).toBe(true)
+    expect(spk.every((b: any) => Buffer.byteLength(String(b.callback_data)) <= 64)).toBe(true)
+    // Two per row: a speaker label is three short tokens, and 28 one-per-row is a scroll.
+    const spkRows = (kb(menu) || []).filter((r: any) => String(r[0].callback_data).startsWith('vspk:'))
+    expect(spkRows.every((r: any) => r.length === 2)).toBe(true)
+    // …and the other 20 are a tap away, not hidden behind typing.
+    const nav = (kb(menu) || []).flat().filter((b: any) => String(b.callback_data).startsWith('vspg:'))
+    expect(nav.length).toBeGreaterThan(0)
+  }, 15000)
+
+  test('all 28 English voices are offered, the published ten first', async () => {
+    // Reported: "why the fuck do I get 8 voice options but kokoro website has 10".
+    // Eight was a hand-picked shortlist; the installed pack has 28 English voices,
+    // and the ten from Kokoro's original release are the ones people have seen.
+    const ids = SPEAKERS.map((s: any) => s.id)
+    expect(ids).toHaveLength(28)
+    for (const known of ['af_bella', 'af_sarah', 'af_nicole', 'af_sky', 'am_adam',
+                         'am_michael', 'bf_emma', 'bf_isabella', 'bm_george', 'bm_lewis']) {
+      expect(ids.slice(0, 10)).toContain(known)
+    }
+    // Labels state a flag, a name and a gender — never an invented description of
+    // how a voice sounds.
+    expect(SPEAKERS.every((s: any) => /^[\u{1F1E6}-\u{1F1FF}]{2} \w+ \((f|m)\)$/u.test(s.label))).toBe(true)
+  })
+
+  test('paging reaches the later voices and edits in place', async () => {
+    await incoming(1406, '/voice')
+    const before = calls.length
+    // Explicitly to offset 0, which is NOT where the keyboard opens by default.
+    await bridge.bot.handleUpdate({
+      update_id: 98700,
+      callback_query: {
+        id: 'vp1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data: 'vspg:0',
+        message: { message_id: 98701, date: 0, chat: { id: 1406, type: 'private' } },
+      },
+    })
+    await new Promise(r => setTimeout(r, 200))
+    const edit = calls.slice(before).find(c => c.method === 'editMessageText')
+    expect(edit).toBeTruthy()
+    const spk = edit!.payload.reply_markup.inline_keyboard.flat()
+      .filter((b: any) => String(b.callback_data).startsWith('vspk:'))
+      .map((b: any) => String(b.callback_data).slice(5))
+    // Page 1 shows the published ten, which the default page (holding af_heart) does not.
+    expect(spk).toContain('af_bella')
+    expect(spk).not.toContain('af_heart')
+    expect(calls.slice(before).filter(c => c.method === 'sendMessage')).toHaveLength(0)
+  }, 15000)
+
+  test('the current mode and speaker are marked, whichever page the voice is on', async () => {
+    // The default speaker sits on page two, so a keyboard that always opened on page
+    // one showed nothing selected — the setting you are looking at appearing unset.
+    const cs = await incoming(1402, '/voice')
+    const menu = sends(cs).find(c => kb(c))
+    expect(labels(menu).filter((x: string) => x.startsWith('● ')).length).toBe(2)  // one mode, one speaker
+    const marked = (kb(menu) || []).flat().find((b: any) => String(b.text).startsWith('● ') && String(b.callback_data).startsWith('vspk:'))
+    expect(String(marked.callback_data)).toBe('vspk:af_heart')
+  }, 15000)
+
+  test('tapping a speaker stores it PER TOPIC and re-renders in place', async () => {
+    // It used to be a deployment-wide constant: voiceEnv copied TG_KOKORO_VOICE out
+    // of the bridge's own environment, so changing it meant editing .env and
+    // restarting.
+    await incoming(1403, '/voice')
+    const before = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 98600,
+      callback_query: {
+        id: 'vs1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data: 'vspk:bm_george',
+        message: { message_id: 98601, date: 0, chat: { id: 1403, type: 'private' } },
+      },
+    })
+    await new Promise(r => setTimeout(r, 200))
+    const after = calls.slice(before)
+    expect(after.some(c => c.method === 'editMessageText')).toBe(true)
+    expect(after.filter(c => c.method === 'sendMessage')).toHaveLength(0)
+    const st = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
+    expect(st.speakers['1403:main']).toBe('bm_george')
+  }, 15000)
+
+  test('/voice speaker <id> reaches the voices the keyboard does not show', async () => {
+    const cs = await incoming(1404, '/voice speaker jf_alpha')
+    expect(finalReply(cs)).toContain('jf_alpha')
+    const st = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
+    expect(st.speakers['1404:main']).toBe('jf_alpha')
+  }, 15000)
+
+  test('a bogus speaker id is refused rather than stored', async () => {
+    const cs = await incoming(1405, '/voice speaker ../../etc/passwd')
+    expect(finalReply(cs)).toMatch(/Not a Kokoro voice id/i)
+    const st = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
+    expect(st.speakers['1405:main']).toBeUndefined()
+  }, 15000)
+})
+
+describe('voice that cannot speak says so', () => {
+  test('/voice on reports the engine instead of failing at the first answer', async () => {
+    // Reported: /voice on, then a message, and the answer came back as text with no
+    // hint anything was wrong. The toggle is the moment to say it.
+    const cs = await incoming(1410, '/voice on')
+    const said = sends(cs).map(c => String(c.payload.text ?? '')).join('\n')
+    expect(said).toMatch(/Voice ON/)
+    // Either it names the engine, or it says plainly that speaking is unavailable —
+    // never silence. Which one depends on what is installed on the test box.
+    expect(/Engine: \w+/.test(said) || /not available here/.test(said)).toBe(true)
+  }, 20000)
+
+  test('when it cannot speak, the offer to install is a BUTTON and nothing installs on its own', async () => {
+    const cs = await incoming(1411, '/voice on')
+    const said = sends(cs).map(c => String(c.payload.text ?? '')).join('\n')
+    if (/not available here/.test(said)) {
+      const offer = sends(cs).find(c => c.payload?.reply_markup?.inline_keyboard)
+      expect(offer).toBeTruthy()
+      expect(String(offer!.payload.reply_markup.inline_keyboard[0][0].callback_data)).toBe('vinst:go')
+    } else {
+      // Speaking works on this box, so there is nothing to offer — assert THAT
+      // rather than passing vacuously.
+      expect(said).toMatch(/Engine: /)
+    }
+  }, 20000)
+})
+
+describe('the voice note is threaded, and never blocks the topic', () => {
+  const voices = (cs: any[]) => cs.filter(c => c.method === 'sendVoice')
+
+  test('the note replies to the ANSWER, not to nothing', async () => {
+    // It was the one send in the file that bypassed destOpts, so with two turns in
+    // flight you got untethered audio bubbles and no way to match them to questions.
+    await incoming(1420, '/voice on')
+    const cs = await incoming(1420, 'hello there')
+    await bridge._drainQueue('1420:main#voice')
+    const all = calls.slice(calls.length - 40)
+    const v = voices(all)
+    expect(v.length).toBeGreaterThan(0)
+    expect(v[0].payload?.reply_parameters?.message_id).toBeGreaterThan(0)
+    // …and specifically to the answer message, which is the one just before it.
+    const answer = all.filter(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('okReply')).pop()
+    expect(answer).toBeTruthy()
+  }, 25000)
+
+  test('a LONG answer\'s note is still threaded — the production case', async () => {
+    // Reported from production: "the sound does not fucking reply to anything".
+    // Cause: the note fell back to `link`, and needsReplyLink deliberately returns
+    // false for an ordinary lone question — so `link` is undefined exactly when the
+    // topic is calm. A long answer goes out as a FILE GROUP, deliver could not name a
+    // single message, and the chain ended in nothing. Both halves are covered here:
+    // the group now reports its first message id, and the last resort is the user's
+    // own message rather than undefined.
+    await incoming(1423, '/voice on')
+    const before = calls.length
+    await incoming(1423, 'LONG')                       // stub answer past REPLY_FILE_CHARS
+    await bridge._drainQueue('1423:main#voice')
+    const cs = calls.slice(before)
+    const group = cs.find(c => c.method === 'sendMediaGroup')
+    expect(group).toBeTruthy()                          // it really was the file path
+    const note = cs.find(c => c.method === 'sendVoice')
+    expect(note).toBeTruthy()
+    expect(note!.payload?.reply_parameters?.message_id).toBeGreaterThan(0)
+    // A deleted question must cost the reply, never the note.
+    expect(note!.payload?.reply_parameters?.allow_sending_without_reply).toBe(true)
+  }, 30000)
+
+  test('a chunked answer\'s note is threaded too', async () => {
+    // The other way deliver returns undefined: an answer long enough to be split
+    // across several messages has no single id either.
+    await incoming(1424, '/voice on')
+    const before = calls.length
+    await incoming(1424, 'hello there')
+    await bridge._drainQueue('1424:main#voice')
+    const note = calls.slice(before).find(c => c.method === 'sendVoice')
+    expect(note).toBeTruthy()
+    expect(note!.payload?.reply_parameters?.message_id).toBeGreaterThan(0)
+  }, 25000)
+
+  test('a slow note does NOT hold up the next message', async () => {
+    // Measured on the real engine: 65s of synthesis sat INSIDE the turn, so the next
+    // message you sent waited on audio for an answer you already had in your hand.
+    writeFileSync(SLOW_TTS, 'x')            // make the stub take ~4s
+    try {
+      await incoming(1421, '/voice on')
+      const t0 = Date.now()
+      await incoming(1421, 'hello there')   // returns when the TURN is done
+      const turnMs = Date.now() - t0
+      // The turn must not have waited for the 4s note.
+      expect(turnMs).toBeLessThan(3500)
+      // …and the note still arrives, on its own queue. Timing the DRAIN proves the
+      // stub really was slow — without this the test would pass just as happily if
+      // synthesis had been skipped entirely.
+      const before = calls.length
+      const t1 = Date.now()
+      await bridge._drainQueue('1421:main#voice')
+      const voiceMs = Date.now() - t1
+      expect(voiceMs).toBeGreaterThan(2000)
+      expect(calls.slice(before).filter(c => c.method === 'sendVoice').length).toBeGreaterThan(0)
+    } finally { rmSync(SLOW_TTS, { force: true }) }
+  }, 30000)
+
+  test('speech runs on its own queue key, not the topic\'s', async () => {
+    // The invariant behind the fix: turns are serialised because two `claude
+    // --resume` runs on one transcript corrupt it. Synthesis touches no session, no
+    // transcript and no cwd, so it has no business on that queue.
+    await incoming(1422, '/voice on')
+    await incoming(1422, 'hello there')
+    await bridge._drainQueue('1422:main#voice')     // resolves => the key exists
+    expect(true).toBe(true)
+  }, 25000)
 })

@@ -33,6 +33,7 @@ import {
   EFFORT_LEVELS, EFFORT_DEFAULT, normalizeEffort,
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
   markdownToHtml, htmlDocument, previewCut, transcriptSpeech, lastEffortFrom, needsReplyLink,
+  speechUnits, speechChunkSeconds, SPEAKERS, SPEAKER_PAGE, SPEAKER_DEFAULT, kokoroLang, isSpeakerId, speakerLabel,
   fanoutPlanPrompt, parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble,
   FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName, filesPreamble,
   type FanoutPlanItem,
@@ -234,7 +235,18 @@ const TTS_CMD = process.env.TG_TTS_CMD || join(HERE, 'voice', 'tts.sh')
 // A short answer is spoken verbatim; a long one is first summarized to a couple
 // of sentences by a fast model so the voice note stays seconds, not minutes.
 const VOICE_SUMMARY_MODEL = process.env.TG_VOICE_SUMMARY_MODEL || 'haiku'
+// The old 1400-character cap is gone: a long answer was cut off around a fifth of
+// the way in, mid-sentence, with nothing said about it. It survives only as the
+// SUMMARY-mode safety net, where a couple of sentences is the point.
 const VOICE_SPEAK_MAX = Math.max(200, Number(process.env.TG_VOICE_MAX_CHARS || 1400))
+// Progressive delivery: speak.py emits a voice note as soon as each chunk is ready
+// rather than after the whole answer, so the first audio lands in ~40s instead of
+// after everything. Kokoro only — it needs the raw-samples API to insert real
+// silence and to concatenate the full file at the end.
+const SPEAK_PY = join(HERE, 'voice', 'speak.py')
+const KOKORO_MODEL = process.env.TG_KOKORO_MODEL || join(HERE, 'voice', 'kokoro', 'kokoro-v1.0.onnx')
+// The single knob for people who want one note however long it takes.
+const VOICE_CHUNKED = !/^(0|false|no)$/i.test(process.env.TG_VOICE_CHUNKED || '')
 
 // Importing existing Claude Code sessions (the ones the IDE/CLI session picker
 // shows) as topics. A directory's sessions live at CLAUDE_PROJECTS/<encoded>/<id>.jsonl.
@@ -345,6 +357,10 @@ function effortKeyboard(key: string) {
 // Per-topic voice: 'full' (speak the whole answer) or 'summary' (speak a short
 // summary). Absent falls back to TG_VOICE. Text is always the complete answer.
 let voice: Record<string, string> = {}
+// Per topic, like every other thing a user tunes. The speaker used to be a
+// deployment-wide constant: voiceEnv() copied TG_KOKORO_VOICE out of the bridge's
+// OWN environment, so changing it meant editing .env and restarting.
+let speakers: Record<string, string> = {}
 function voiceMode(key: string): 'off' | 'full' | 'summary' {
   const v = voice[key]
   if (v === 'full' || v === 'summary') return v
@@ -364,6 +380,7 @@ function loadState(): void {
       models = o.models ?? {}
       efforts = o.efforts ?? {}
       voice = o.voice ?? {}
+      speakers = o.speakers ?? {}
       // Plans proposed but not yet confirmed. A plan is just text until you tap
       // "run", and losing it to a restart made the button answer "that plan is no
       // longer available" for something the person had only just been offered.
@@ -377,7 +394,7 @@ function loadState(): void {
 function saveState(): void {
   try {
     mkdirSync(dirname(STATE_FILE), { recursive: true })
-    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode, modes, models, efforts, voice,
+    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode, modes, models, efforts, voice, speakers,
       // Only the ones still awaiting a decision. A fan-out that has started cannot be
       // resumed — its parts were child processes and died with the bridge — so
       // persisting it would offer a button that could not honour itself.
@@ -814,11 +831,21 @@ function childEnv(): NodeJS.ProcessEnv {
 // childEnv() scrubs every TG_ var (so the bot token never reaches a subprocess),
 // but the voice helpers legitimately need a few of them — the Piper voice path,
 // the whisper model/lang. Re-add just those for stt.py / tts.sh.
-function voiceEnv(): NodeJS.ProcessEnv {
+// `key` is optional only because the STT side has no topic-specific settings. On
+// the TTS side it is what turns the speaker from a deployment-wide constant into a
+// per-topic choice: the topic's voice OVERRIDES what the bridge inherited.
+function voiceEnv(key?: string): NodeJS.ProcessEnv {
   const e = childEnv()
   for (const k of ['TG_TTS_ENGINE', 'TG_KOKORO_VOICE', 'TG_KOKORO_MODEL', 'TG_KOKORO_VOICES', 'TG_KOKORO_SPEED', 'TG_KOKORO_LANG',
-                   'TG_PIPER_VOICE', 'TG_PIPER_BIN', 'TG_ESPEAK_VOICE', 'TG_ESPEAK_WPM', 'TG_STT_MODEL', 'TG_STT_LANG']) {
+                   'TG_PIPER_VOICE', 'TG_PIPER_BIN', 'TG_ESPEAK_VOICE', 'TG_ESPEAK_WPM', 'TG_STT_MODEL', 'TG_STT_LANG', 'TG_FFMPEG']) {
     if (process.env[k]) e[k] = process.env[k]
+  }
+  const sp = key ? speakers[key] : undefined
+  if (sp) {
+    e.TG_KOKORO_VOICE = sp
+    // Kokoro's lang must match the voice or pronunciation degrades — a British
+    // voice read with en-us is the audible version of this bug.
+    e.TG_KOKORO_LANG = kokoroLang(sp)
   }
   return e
 }
@@ -1148,17 +1175,22 @@ function mdTablesToCode(text: string): string {
 // see the note on needsRich. Tables have no MarkdownV2 equivalent, so they are
 // flattened to aligned code blocks first, and a chunk Telegram still refuses to
 // parse is resent as plain text.
-async function sendLegacyMd(ctx: Context, opts: any, text: string): Promise<void> {
+async function sendLegacyMd(ctx: Context, opts: any, text: string): Promise<number | undefined> {
   // sanitizeProse runs AFTER mdTablesToCode so a flattened table is already inside
   // a fence and counts as protected code, and BEFORE telegramify, which is the
   // thing that mis-handles a lone tilde.
-  for (const part of chunk(mdTablesToCode(text))) {
+  const parts = chunk(mdTablesToCode(text))
+  let last: number | undefined
+  for (const part of parts) {
     try {
-      await ctx.api.sendMessage(ctx.chat!.id, telegramify(sanitizeProse(part, 'markdownv2'), 'escape'), { ...opts, parse_mode: 'MarkdownV2' })
+      const m = await ctx.api.sendMessage(ctx.chat!.id, telegramify(sanitizeProse(part, 'markdownv2'), 'escape'), { ...opts, parse_mode: 'MarkdownV2' })
+      last = m.message_id
     } catch {
-      await ctx.api.sendMessage(ctx.chat!.id, stripMd(part), opts).catch(e => console.error(`[warn] sendMessage: ${e}`))
+      const m = await ctx.api.sendMessage(ctx.chat!.id, stripMd(part), opts).catch(e => { console.error(`[warn] sendMessage: ${e}`); return undefined })
+      last = m?.message_id
     }
   }
+  return parts.length === 1 ? last : undefined
 }
 
 // needsRich (the rich-vs-MarkdownV2 routing rule) and sanitizeProse
@@ -1170,18 +1202,26 @@ async function sendLegacyMd(ctx: Context, opts: any, text: string): Promise<void
 // needs one. Rich markdown is the dialect the agent already writes, so apart from
 // the dollars above no escaping pass is needed. If the call fails we drop to the
 // MarkdownV2 path — formatting is best-effort, delivery is guaranteed.
-async function sendRich(ctx: Context, threadId: number | undefined, text: string, replyTo?: number): Promise<void> {
+// Returns the message id when the answer was exactly ONE message, so the voice note
+// can be threaded to the answer rather than to the question. Several chunks, or a
+// send that fell back to a path whose id we do not see, yields undefined and the
+// caller threads to the question instead.
+async function sendRich(ctx: Context, threadId: number | undefined, text: string, replyTo?: number): Promise<number | undefined> {
   noteBotMessage(keyFor(ctx.chat!.id, threadId))
   const opts: any = destOpts({ threadId, replyTo })
-  for (const part of chunk(text, RICH_MAX)) {
-    if (!needsRich(part)) { await sendLegacyMd(ctx, opts, part); continue }
+  const parts = chunk(text, RICH_MAX)
+  let only: number | undefined
+  for (const part of parts) {
+    if (!needsRich(part)) { only = await sendLegacyMd(ctx, opts, part); continue }
     try {
-      await ctx.api.sendRichMessage(ctx.chat!.id, { markdown: sanitizeProse(part, 'rich') }, opts)
+      const m: any = await ctx.api.sendRichMessage(ctx.chat!.id, { markdown: sanitizeProse(part, 'rich') }, opts)
+      only = m?.message_id
     } catch (e) {
       console.error(`[warn] sendRichMessage, falling back to MarkdownV2: ${e}`)
-      await sendLegacyMd(ctx, opts, part)
+      only = await sendLegacyMd(ctx, opts, part)
     }
   }
+  return parts.length === 1 ? only : undefined
 }
 function startTyping(ctx: Context, threadId: number | undefined): () => void {
   const opts = threadId ? { message_thread_id: threadId } : {}
@@ -1192,6 +1232,58 @@ function startTyping(ctx: Context, threadId: number | undefined): () => void {
 // ---------------------------------------------------------------------------
 // Permission-mode UI (/mode + its inline keyboard)
 // ---------------------------------------------------------------------------
+
+// The /voice keyboard. Deliberately the same three lines as modeKeyboard and the
+// model and effort keyboards, because /voice being a plain-text menu you type back
+// at was an inconsistency rather than a missing feature.
+//
+// Speakers go two per row, which breaks the one-per-row rule those keyboards follow
+// — justified because a speaker label is three words, not a sentence, and eight of
+// them one per row is a scroll.
+function voiceText(key: string): string {
+  const p = probeVoice()
+  const sp = speakers[key] || SPEAKER_DEFAULT
+  return `🎙 Voice — ${voiceMode(key)}\n` +
+    `Engine: ${p.engine}${p.speak ? '' : ' (not available — tap Install below)'}\n` +
+    `Speaker: ${speakerLabel(sp)} (${sp})\n\n` +
+    `The complete answer always comes as text, whatever this is set to.\n` +
+    `${SPEAKERS.length} English voices here; /voice speaker <id> also reaches the ` +
+    `Spanish, French, Hindi, Italian, Japanese, Portuguese and Chinese ones.`
+}
+// Paged, because all 28 English voices are offered rather than a hand-picked few and
+// 14 rows is a scroll. Two per row is a deliberate exception to the one-per-row rule
+// the other keyboards follow: a speaker label is three short tokens, not a sentence.
+function voiceKeyboard(key: string, offset?: number): any {
+  const mode = voiceMode(key)
+  const sp = speakers[key] || SPEAKER_DEFAULT
+  const pages = Math.max(1, Math.ceil(SPEAKERS.length / SPEAKER_PAGE))
+  // Opens on the page holding the CURRENT speaker, not page one. Otherwise a voice
+  // that happens to sit on page two leaves the keyboard with nothing marked, and the
+  // setting you are looking at appears not to be set.
+  const cur = SPEAKERS.findIndex(v => v.id === sp)
+  const dflt = cur < 0 ? 0 : Math.floor(cur / SPEAKER_PAGE) * SPEAKER_PAGE
+  const off = Math.min(Math.max(0, offset ?? dflt), (pages - 1) * SPEAKER_PAGE)
+  const rows: any[][] = [[
+    { text: `${mode === 'full' ? '● ' : ''}Full`, callback_data: 'voice:full' },
+    { text: `${mode === 'summary' ? '● ' : ''}Summary`, callback_data: 'voice:summary' },
+    { text: `${mode === 'off' ? '● ' : ''}Off`, callback_data: 'voice:off' },
+  ]]
+  const page = SPEAKERS.slice(off, off + SPEAKER_PAGE)
+  for (let i = 0; i < page.length; i += 2) {
+    rows.push(page.slice(i, i + 2).map(v => ({
+      text: `${v.id === sp ? '● ' : ''}${v.label}`, callback_data: `vspk:${v.id}`,
+    })))
+  }
+  if (pages > 1) {
+    const nav: any[] = []
+    if (off > 0) nav.push({ text: '‹ Prev', callback_data: `vspg:${off - SPEAKER_PAGE}` })
+    nav.push({ text: `${Math.floor(off / SPEAKER_PAGE) + 1}/${pages}`, callback_data: 'spg:noop' })
+    if (off + SPEAKER_PAGE < SPEAKERS.length) nav.push({ text: 'Next ›', callback_data: `vspg:${off + SPEAKER_PAGE}` })
+    rows.push(nav)
+  }
+  if (!probeVoice().speak) rows.push([{ text: '⬇️ Install voice', callback_data: 'vinst:go' }])
+  return { inline_keyboard: rows }
+}
 
 const MODE_EMOJI: Record<string, string> = { plan: '📋', acceptEdits: '✏️', auto: '🤖', bypass: '⚠️' }
 
@@ -1422,12 +1514,15 @@ async function sendFile(ctx: Context, threadId: number | undefined, path: string
 // one oversized file would otherwise fail the whole group with an opaque error.
 // On any failure it falls back to sending them individually, because two messages
 // is a cosmetic problem and a dropped answer is not.
-async function sendFileGroup(ctx: Context, threadId: number | undefined, paths: string[], caption?: string, replyTo?: number, captionMode?: string, plainCaption?: string): Promise<boolean> {
+// Returns the FIRST message id of the group, so a voice note can be threaded to the
+// answer even when the answer was a file. Undefined when nothing was sent, or when
+// the fallback path sent the files individually.
+async function sendFileGroup(ctx: Context, threadId: number | undefined, paths: string[], caption?: string, replyTo?: number, captionMode?: string, plainCaption?: string): Promise<number | undefined> {
   const usable = paths.filter(p => existsSync(p) && statSync(p).isFile())
-  if (usable.length === 0) return false
+  if (usable.length === 0) return undefined
   const oversized = usable.map(tooBig).filter(Boolean)
-  if (oversized.length) { await send(ctx, threadId, oversized.join('\n\n')); return false }
-  if (usable.length === 1) return sendFile(ctx, threadId, usable[0], caption, replyTo, captionMode, plainCaption)
+  if (oversized.length) { await send(ctx, threadId, oversized.join('\n\n')); return undefined }
+  if (usable.length === 1) { await sendFile(ctx, threadId, usable[0], caption, replyTo, captionMode, plainCaption); return undefined }
 
   const one = (p: string, i: number) => {
     const extra: any = {}
@@ -1440,17 +1535,17 @@ async function sendFileGroup(ctx: Context, threadId: number | undefined, paths: 
   noteBotMessage(keyFor(ctx.chat!.id, threadId))
   const opts: any = destOpts({ threadId, replyTo })
   try {
-    await ctx.api.sendMediaGroup(ctx.chat!.id, usable.map(one), opts)
+    const sent: any = await ctx.api.sendMediaGroup(ctx.chat!.id, usable.map(one), opts)
     console.log(`[file->] group ${usable.map(p => basename(p)).join(' + ')}`)
-    return true
+    return Array.isArray(sent) ? sent[0]?.message_id : undefined
   } catch (e) {
     console.error(`[warn] sendMediaGroup, falling back to individual sends: ${e}`)
-    let ok = false, first = true
+    let first = true
     for (const p of usable) {
-      if (await sendFile(ctx, threadId, p, first ? caption : undefined, replyTo, captionMode, first ? plainCaption : undefined)) ok = true
+      await sendFile(ctx, threadId, p, first ? caption : undefined, replyTo, captionMode, first ? plainCaption : undefined)
       first = false
     }
-    return ok
+    return undefined
   }
 }
 
@@ -1525,7 +1620,7 @@ function answerCaption(text: string): { text: string; mode?: string; plain: stri
 // Run one prompt against a topic's session, post the reply, deliver the outbox.
 // Deliver a Claude answer: inline (markdown) if short, else as an answer.md file
 // with a preview caption — so a huge reply isn't a dozen chunked messages.
-async function deliver(ctx: Context, threadId: number | undefined, text: string, replyTo?: number): Promise<void> {
+async function deliver(ctx: Context, threadId: number | undefined, text: string, replyTo?: number): Promise<number | undefined> {
   if (REPLY_FILE_CHARS && text.length > REPLY_FILE_CHARS) {
     const dir = mkdtempSync(join(tmpdir(), 'tg-'))
     try {
@@ -1544,11 +1639,12 @@ async function deliver(ctx: Context, threadId: number | undefined, text: string,
         files.push(m)
       }
       const cap = answerCaption(text)
-      await sendFileGroup(ctx, threadId, files, cap.text, replyTo, cap.mode, cap.plain)
+      // The group's first message IS a thing to point at, so a long answer's voice
+      // note hangs off the files rather than falling all the way back.
+      return await sendFileGroup(ctx, threadId, files, cap.text, replyTo, cap.mode, cap.plain)
     } finally { rmSync(dir, { recursive: true, force: true }) }
-  } else {
-    await sendRich(ctx, threadId, text, replyTo)
   }
+  return sendRich(ctx, threadId, text, replyTo)
 }
 
 // ---------------------------------------------------------------------------
@@ -1572,9 +1668,9 @@ function transcribe(path: string): Promise<string> {
 }
 
 // TTS_CMD <out.ogg>, text on stdin -> the ogg path, or null on failure.
-function synthesize(text: string, ogg: string): Promise<string | null> {
+function synthesize(text: string, ogg: string, key?: string): Promise<string | null> {
   return new Promise(resolve => {
-    const child = spawn(TTS_CMD, [ogg], { env: voiceEnv(), stdio: ['pipe', 'ignore', 'pipe'] })
+    const child = spawn(TTS_CMD, [ogg], { env: voiceEnv(key), stdio: ['pipe', 'ignore', 'pipe'] })
     let err = ''
     child.stderr.on('data', d => (err += d))
     child.on('error', e => { console.error(`[voice] tts spawn: ${e}`); resolve(null) })
@@ -1605,24 +1701,214 @@ function summarizeForSpeech(answer: string): Promise<string> {
   })
 }
 
-// Speak an answer back as a Telegram voice message. Short answers verbatim; long
-// ones summarized first so the note stays a few seconds.
-async function speakAnswer(ctx: Context, threadId: number | undefined, text: string, mode: 'full' | 'summary'): Promise<void> {
+// What the box can actually do, asked rather than assumed.
+//
+// The reported failure: /voice on, then a message, and the answer came back as text
+// with no hint anything was wrong. The bridge KNEW — synthesize console.errors the
+// exit code — it just never told the person who asked. The log is the one place a
+// phone user never looks.
+type VoiceProbe = { speak: boolean; listen: boolean; engine: string; detail: string }
+let probeCache: VoiceProbe | undefined
+function probeVoice(force = false): VoiceProbe {
+  if (probeCache && !force) return probeCache
+  const kokoro = existsSync(KOKORO_MODEL) && existsSync(join(dirname(KOKORO_MODEL), 'voices-v1.0.bin'))
+  const forced = (process.env.TG_TTS_ENGINE || '').toLowerCase()
+  let engine = forced || (kokoro ? 'kokoro' : (process.env.TG_PIPER_VOICE ? 'piper' : 'espeak'))
+  // ffmpeg is the one native tool, and it is used ONLY to encode the outgoing Opus —
+  // so a box without it can still listen. Reporting the two directions separately is
+  // the difference between "voice is broken" and "speaking is broken".
+  const ff = !!(process.env.TG_FFMPEG && existsSync(process.env.TG_FFMPEG))
+    || existsSync(join(HERE, 'voice', 'bin', 'ffmpeg'))
+    || hasOnPath('ffmpeg')
+  const enginePresent = engine === 'kokoro' ? kokoro
+    : engine === 'piper' ? !!process.env.TG_PIPER_VOICE
+    : hasOnPath('espeak-ng')
+  const listen = pyHas('faster_whisper')
+  const speak = ff && enginePresent && (engine !== 'kokoro' || pyHas('kokoro_onnx'))
+  const missing: string[] = []
+  if (!ff) missing.push('ffmpeg')
+  if (!enginePresent) missing.push(`the ${engine} engine`)
+  if (engine === 'kokoro' && !pyHas('kokoro_onnx')) missing.push('kokoro-onnx')
+  if (!listen) missing.push('faster-whisper')
+  probeCache = { speak, listen, engine, detail: missing.join(', ') }
+  return probeCache
+}
+function hasOnPath(bin: string): boolean {
+  try { execFileSync('sh', ['-c', `command -v ${bin}`], { stdio: 'ignore' }); return true } catch { return false }
+}
+function pyHas(mod: string): boolean {
+  try { execFileSync('python3', ['-c', `import ${mod}`], { stdio: 'ignore', timeout: 15000 }); return true } catch { return false }
+}
+
+// Installing is OFFERED, never done on its own. A bot that downloads 340MB because
+// you tapped a toggle is a surprise; a button you chose to press is not.
+let voiceSetupRunning = false
+let voiceSetupFailed = false
+async function offerVoiceInstall(ctx: Context, threadId: number | undefined): Promise<void> {
+  if (voiceSetupRunning) { await send(ctx, threadId, '⏳ Voice setup is already running — I will say when it is ready.', true); return }
+  if (voiceSetupFailed) {
+    await send(ctx, threadId, '⚠️ Voice setup failed last time — see bridge.log, or run voice/setup.sh by hand.', true); return
+  }
+  await ctx.api.sendMessage(ctx.chat!.id, '🎙 Install the voice engine now? About 340 MB, a few minutes. The topic stays usable as text while it runs.', {
+    ...destOpts({ threadId }), disable_notification: true,
+    reply_markup: { inline_keyboard: [[{ text: '⬇️ Install voice', callback_data: 'vinst:go' }]] },
+  }).catch(e => console.error(`[voice] offer: ${e}`))
+}
+
+// Runs voice/setup.sh detached. Never blocks a turn, and only ever one at a time.
+async function runVoiceSetup(ctx: Context, threadId: number | undefined): Promise<void> {
+  if (voiceSetupRunning) return
+  voiceSetupRunning = true
+  await send(ctx, threadId, '🎙 Setting up voice — a few minutes, ~340 MB. I will tell you when it is ready.', true)
+  const child = spawn(join(HERE, 'voice', 'setup.sh'), [], { cwd: HERE, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+  let tail = ''
+  const keep = (d: any) => { tail = (tail + d).slice(-800) }
+  child.stdout.on('data', keep); child.stderr.on('data', keep)
+  child.on('error', e => { voiceSetupRunning = false; voiceSetupFailed = true; console.error(`[voice] setup spawn: ${e}`) })
+  child.on('close', async code => {
+    voiceSetupRunning = false
+    const p = probeVoice(true)     // forced: the whole point is that disk changed
+    if (code === 0 && p.speak) {
+      await send(ctx, threadId, `🎙 Voice ready (${p.engine} · ${speakerLabel(SPEAKER_DEFAULT)}). Say something.`)
+    } else {
+      voiceSetupFailed = true
+      await send(ctx, threadId, `⚠️ Voice setup did not finish${p.detail ? ` — still missing ${p.detail}` : ''}.\n${tail.split('\n').slice(-4).join('\n')}`)
+    }
+  })
+}
+
+// Said once per topic per bridge run.// Said once per topic per bridge run. The answer itself already arrived, so
+// repeating this after every turn would turn a setup problem into a nag.
+const warnedNoVoice = new Set<string>()
+async function warnNoVoice(ctx: Context, threadId: number | undefined, key: string): Promise<void> {
+  if (warnedNoVoice.has(key)) return
+  warnedNoVoice.add(key)
+  const p = probeVoice(true)
+  await send(ctx, threadId,
+    `⚠️ Voice is on, but I could not speak that answer${p.detail ? ` — missing ${p.detail}` : ''}. ` +
+    `The text above is complete. Tap below to install what's needed, or run voice/setup.sh yourself.`,
+    true)
+  await offerVoiceInstall(ctx, threadId)
+}
+
+// Is the progressive path available?// Is the progressive path available? It needs Kokoro's raw-samples API, so it is
+// gated on the model actually being on disk — the same test tts.sh makes when it
+// picks an engine. Piper and espeak keep the single-note path.
+function canChunk(): boolean {
+  const forced = (process.env.TG_TTS_ENGINE || '').toLowerCase()
+  if (forced && forced !== 'kokoro') return false
+  return VOICE_CHUNKED && existsSync(SPEAK_PY) && existsSync(KOKORO_MODEL)
+}
+
+// Speak an answer as a SEQUENCE of voice notes, sending each as it is ready.
+//
+// Two things changed here and they are the point of the whole exercise. The answer
+// is no longer truncated — a 1400-character cap cut a long reply off around a fifth
+// of the way in, mid-sentence, saying nothing. And the notes arrive progressively:
+// measured on this box, the first lands in ~43s where the whole thing takes 83s, and
+// because synthesis runs at ~0.79x realtime every later note is ready before you
+// finish the previous one. The complete file follows at the end for anyone who wants
+// one file rather than a list.
+async function speakChunked(ctx: Context, threadId: number | undefined, key: string, text: string, replyTo?: number): Promise<boolean> {
+  const units = speechUnits(text)
+  if (!units.length) return true
+  const dir = mkdtempSync(join(tmpdir(), 'tg-tts-'))
+  const req = JSON.stringify({ units, outdir: dir, chunks: [0, 1, 2].map(speechChunkSeconds) })
+  return new Promise<boolean>(resolve => {
+    const child = spawn('python3', [SPEAK_PY], { env: voiceEnv(key), stdio: ['pipe', 'pipe', 'pipe'] })
+    let err = '', buf = ''
+    let n = 0
+    // Sends are chained rather than awaited inline: stdout must keep being read or
+    // the child blocks on a full pipe, and the notes still have to arrive in order.
+    let queue: Promise<void> = Promise.resolve()
+    const send = (fn: () => Promise<void>) => { queue = queue.then(fn).catch(e => console.error(`[voice] send: ${e}`)) }
+
+    child.stderr.on('data', d => (err += d))
+    child.stdout.on('data', d => {
+      buf += d
+      const lines = buf.split('\n'); buf = lines.pop() ?? ''
+      for (const line of lines) {
+        if (!line.trim()) continue
+        let o: any; try { o = JSON.parse(line) } catch { continue }
+        if (o.path) {
+          n++
+          const part = n
+          send(async () => {
+            const opts: any = destOpts({ threadId, replyTo })
+            // No caption on the first note: a short answer is one note and a "part 1"
+            // label on a thing with no part 2 is noise. Later ones say where they are.
+            if (part > 1) opts.caption = `🎙 part ${part}`
+            // Told, not inferred: speak.py already knows the length, and without it
+            // a client can show a voice note as 0:00.
+            if (o.seconds) opts.duration = Math.round(o.seconds)
+            await ctx.api.sendVoice(ctx.chat!.id, new InputFile(o.path), opts)
+            noteBotMessage(key)
+          })
+        } else if (o.full) {
+          send(async () => {
+            // sendAudio, not sendVoice: a real player with seeking and a title, and
+            // visibly a different thing from the chunk bubbles above it.
+            await ctx.api.sendAudio(ctx.chat!.id, new InputFile(o.full), {
+              ...destOpts({ threadId, replyTo }),
+              title: `Full answer — ${fmtDuration(o.seconds)}`,
+              performer: 'xesious',
+              duration: Math.round(o.seconds || 0),
+              caption: `🎧 The whole answer as one file (${fmtDuration(o.seconds)}).`,
+            } as any)
+            noteBotMessage(key)
+          })
+        }
+      }
+    })
+    child.on('error', e => { console.error(`[voice] speak spawn: ${e}`); resolve(false) })
+    child.on('close', code => {
+      queue.finally(() => {
+        rmSync(dir, { recursive: true, force: true })
+        if (code !== 0) console.error(`[voice] speak exit ${code}: ${err.slice(-300)}`)
+        resolve(code === 0 && n > 0)
+      })
+    })
+    child.stdin.write(req); child.stdin.end()
+  })
+}
+
+function fmtDuration(sec: number): string {
+  const s = Math.max(0, Math.round(sec))
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+}
+
+// Speak an answer back as Telegram voice. Returns false when nothing could be
+// spoken, so the caller can say so once rather than dropping to text in silence.
+async function speakAnswer(ctx: Context, threadId: number | undefined, key: string, text: string, mode: 'full' | 'summary', replyTo?: number): Promise<boolean> {
   const clean = stripMd(text).trim()
-  if (!clean) return
-  // 'summary' → a short spoken summary; 'full' → the whole answer read out (capped
-  // by VOICE_SPEAK_MAX so a very long answer doesn't become a multi-minute note —
-  // the complete answer is always available as text regardless).
-  let speak = mode === 'summary' ? ((await summarizeForSpeech(text)) || clean) : clean
-  speak = stripMd(speak).trim().slice(0, VOICE_SPEAK_MAX)
-  if (!speak) return
+  if (!clean) return true
+  if (mode === 'summary') {
+    // A couple of sentences by design, so it neither needs chunking nor the cap
+    // lifted — the cap is the safety net for a summary that came back long.
+    const speak = stripMd((await summarizeForSpeech(text)) || clean).trim().slice(0, VOICE_SPEAK_MAX)
+    if (!speak) return true
+    const dir = mkdtempSync(join(tmpdir(), 'tg-tts-'))
+    try {
+      const ogg = await synthesize(speak, join(dir, 'reply.ogg'), key)
+      if (!ogg) return false
+      await ctx.api.sendVoice(ctx.chat!.id, new InputFile(ogg), destOpts({ threadId, replyTo }))
+        .catch(e => console.error(`[voice] sendVoice: ${e}`))
+      noteBotMessage(key)
+      return true
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  }
+  if (canChunk()) return speakChunked(ctx, threadId, key, text, replyTo)
+  // Piper/espeak: one note, and the cap still applies because there is no way to
+  // stream them. Said plainly rather than cut in silence — see the caller.
+  const speak = stripMd(text).trim().slice(0, VOICE_SPEAK_MAX)
   const dir = mkdtempSync(join(tmpdir(), 'tg-tts-'))
   try {
-    const ogg = await synthesize(speak, join(dir, 'reply.ogg'))
-    if (ogg) {
-      const opts: any = threadId ? { message_thread_id: threadId } : {}
-      await ctx.api.sendVoice(ctx.chat!.id, new InputFile(ogg), opts).catch(e => console.error(`[voice] sendVoice: ${e}`))
-    }
+    const ogg = await synthesize(speak, join(dir, 'reply.ogg'), key)
+    if (!ogg) return false
+    await ctx.api.sendVoice(ctx.chat!.id, new InputFile(ogg), destOpts({ threadId, replyTo }))
+      .catch(e => console.error(`[voice] sendVoice: ${e}`))
+    noteBotMessage(key)
+    return true
   } finally { rmSync(dir, { recursive: true, force: true }) }
 }
 
@@ -2120,10 +2406,36 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
       noteBgResult(key, res.text)
       await send(ctx, threadId, `🌿 Background task finished.`, true, link)
     }
-    await deliver(ctx, threadId, res.text, link)
+    const answerId = await deliver(ctx, threadId, res.text, link)
     await flushOutbox(ctx, threadId, cwd, key, link)
     // Speak the answer too when this topic is in voice mode.
-    const vm = voiceMode(key); if (vm !== 'off' && !res.isError) await speakAnswer(ctx, threadId, res.text, vm)
+    //
+    // NOT awaited here, and not on this topic's queue. Synthesis was measured at 65s
+    // for a note at the old cap, and it sat INSIDE the turn — so the next message you
+    // sent waited on audio for an answer you already had in your hand, and the bridge
+    // told you it was "still working on an earlier message" when that message was
+    // finished. Turns are serialised because two `claude --resume` runs on one
+    // transcript corrupt it; synthesis touches no session, no transcript and no cwd,
+    // so it has no business on that queue. Its own key keeps notes for one topic in
+    // order without holding up the topic itself.
+    //
+    // Threaded to the ANSWER when there was a single one, falling back to the
+    // question: the note is another rendering of the answer, and it was the one send
+    // in the file that bypassed destOpts entirely, so two turns in flight gave you
+    // untethered audio bubbles with nothing to match them to.
+    const vm = voiceMode(key)
+    if (vm !== 'off' && !res.isError) {
+      // `link` is NOT a usable fallback on its own: needsReplyLink deliberately
+      // returns false for an ordinary lone question, so `link` is undefined exactly
+      // when the topic is calm. Chaining to it meant that whenever deliver could not
+      // name a single message — a long answer sent as a file group, or a reply long
+      // enough to be chunked — the note replied to NOTHING. Reported from production
+      // on a YouTube summary, which is precisely the long-answer case. The user's own
+      // message is always there, and destOpts sets allow_sending_without_reply, so a
+      // deleted question costs the reply and never the note.
+      void enqueue(`${key}#voice`, () => speakAnswer(ctx, threadId, key, res.text, vm, answerId ?? link ?? replyTo)
+        .then(ok => { if (!ok) void warnNoVoice(ctx, threadId, key) }))
+    }
   } catch (e) {
     await send(ctx, threadId, `⚠️ ${e}`, false, replyLink())
   }
@@ -2605,26 +2917,55 @@ bot.on('message', async ctx => {
     return
   }
   if (cmd === '/voice') {
-    const arg = text.split(/\s+/)[1]?.toLowerCase()
+    const parts = text.split(/\s+/)
+    const arg = parts[1]?.toLowerCase()
+    // /voice speaker <id> is the escape hatch for the 46 voices the keyboard does
+    // not show. Kokoro ships 54 and eight is what fits a phone.
+    if (arg === 'speaker' || arg === 'voice') {
+      const id = (parts[2] || '').toLowerCase()
+      if (!id) {
+        await send(ctx, threadId, `🎙 Speaker here: ${speakerLabel(speakers[key] || SPEAKER_DEFAULT)} (${speakers[key] || SPEAKER_DEFAULT})\n\nUsage: /voice speaker <id>, e.g. bm_george. Tap /voice for the shortlist.`)
+        return
+      }
+      if (!isSpeakerId(id)) { await send(ctx, threadId, `Not a Kokoro voice id: ${id}. They look like af_heart or bm_george.`); return }
+      speakers[key] = id; saveState()
+      await send(ctx, threadId, `🎙 Speaker set to ${speakerLabel(id)} (${id}, ${kokoroLang(id)}).`)
+      return
+    }
     let next: 'off' | 'full' | 'summary' | undefined
     if (arg === 'off') next = 'off'
     else if (arg === 'on' || arg === 'full') next = 'full'
     else if (arg === 'summary' || arg === 'short' || arg === 'summarized') next = 'summary'
     else if (!arg) {
-      await send(ctx, threadId,
-        `🎙 Voice here: ${voiceMode(key)}\n\n` +
-        `/voice on — speak the full answer\n` +
-        `/voice summary — speak a short summary\n` +
-        `/voice off — text only\n\n` +
-        `Either way, the complete answer always comes as text.`)
+      // A keyboard, like /mode and /model and /effort. /voice was the last setting
+      // that answered with a plain-text menu you had to type back at.
+      await ctx.api.sendMessage(chatId, voiceText(key), { ...destOpts({ threadId }), reply_markup: voiceKeyboard(key) })
+        .catch(e => console.error(`[warn] /voice: ${e}`))
+      noteBotMessage(key)
       return
-    } else { await send(ctx, threadId, 'Usage: /voice on | summary | off'); return }
+    } else { await send(ctx, threadId, 'Usage: /voice on | summary | off | speaker <id>'); return }
     if (next === 'off') delete voice[key]; else voice[key] = next
     saveState()
     await send(ctx, threadId,
-      next === 'full' ? '🎙 Voice ON (full) — I speak the whole answer, and the complete answer also comes as text.'
+      next === 'full' ? `🎙 Voice ON (full) — I speak the whole answer, and the complete answer also comes as text.`
       : next === 'summary' ? '🎙 Voice ON (summary) — I speak a short summary; the complete answer still comes as text.'
       : '🔇 Voice OFF — replies are text only.')
+    // Probe HERE, not at the first answer. This is the moment you asked for voice
+    // and are waiting to hear about it — the only moment where "this will not work"
+    // is useful rather than annoying. Naming the engine on success matters as much:
+    // it is the only way to learn you are on robotic espeak instead of Kokoro
+    // without listening to a note and guessing.
+    if (next !== 'off') {
+      const p = probeVoice(true)
+      if (!p.speak) {
+        await send(ctx, threadId, `⚠️ …but text-to-speech is not available here${p.detail ? ` — missing ${p.detail}` : ''}.`, true)
+        await offerVoiceInstall(ctx, threadId)
+      } else {
+        await send(ctx, threadId,
+          `Engine: ${p.engine} · ${speakerLabel(speakers[key] || SPEAKER_DEFAULT)}` +
+          (p.listen ? '' : '\n⚠️ Listening is unavailable (faster-whisper missing) — voice notes you send will not be transcribed.'), true)
+      }
+    }
     return
   }
   if (cmd === '/live') {
@@ -3190,6 +3531,36 @@ bot.on('callback_query:data', async ctx => {
       .catch(e => console.error(`[error] retry ${rec.key}: ${e}`))
     return
   }
+  if (data.startsWith('voice:')) {
+    const v = data.slice(6)
+    if (v !== 'full' && v !== 'summary' && v !== 'off') { await ctx.answerCallbackQuery({ text: 'Unknown voice mode.' }).catch(() => {}); return }
+    if (v === 'off') delete voice[key]; else voice[key] = v
+    saveState()
+    await ctx.answerCallbackQuery({ text: `Voice: ${v}` }).catch(() => {})
+    await ctx.editMessageText(voiceText(key), { reply_markup: voiceKeyboard(key) }).catch(() => {})
+    return
+  }
+  if (data.startsWith('vspg:')) {
+    await ctx.answerCallbackQuery().catch(() => {})
+    await ctx.editMessageText(voiceText(key), { reply_markup: voiceKeyboard(key, Number(data.slice(5)) || 0) }).catch(() => {})
+    return
+  }
+  if (data.startsWith('vspk:')) {
+    const id = data.slice(5)
+    if (!isSpeakerId(id)) { await ctx.answerCallbackQuery({ text: 'Unknown speaker.' }).catch(() => {}); return }
+    speakers[key] = id; saveState()
+    await ctx.answerCallbackQuery({ text: `Speaker: ${speakerLabel(id)}` }).catch(() => {})
+    await ctx.editMessageText(voiceText(key), { reply_markup: voiceKeyboard(key) }).catch(() => {})
+    return
+  }
+  if (data === 'vinst:go') {
+    // Only ever on an explicit tap. Answered immediately because setup takes minutes
+    // and Telegram wants a callback answered within ten seconds.
+    await ctx.answerCallbackQuery({ text: 'Starting voice setup…' }).catch(() => {})
+    await ctx.editMessageReplyMarkup(undefined).catch(() => {})
+    void runVoiceSetup(ctx, ctx.callbackQuery.message?.message_thread_id)
+    return
+  }
   if (data === 'spg:noop') { await ctx.answerCallbackQuery().catch(() => {}); return }
   if (data.startsWith('spg:')) {
     const [token, off] = data.slice(4).split(':')
@@ -3335,6 +3706,13 @@ async function main() {
   console.log(`     allowed users  : ${[...ALLOWED_USERS].join(', ') || '(none — set TG_ALLOWED_USERS!)'}`)
   console.log(`     allowed chats  : ${[...ALLOWED_CHATS].join(', ') || '(none)'}`)
   console.log(`     trust chat mem : ${TRUST_CHAT_MEMBERS ? 'yes (any member of an allowed chat)' : 'no'}`)
+  // Checked once at boot, beside permission and api, so a deployment with TG_VOICE=1
+  // learns its engine is missing here rather than after the first message.
+  if (VOICE_DEFAULT) {
+    const p = probeVoice(true)
+    console.log(`     voice          : speak ${p.speak ? `yes (${p.engine})` : 'NO'} · listen ${p.listen ? 'yes' : 'NO'}` +
+      (p.detail ? ` — missing ${p.detail}; run voice/setup.sh` : ''))
+  }
   // With no users AND no chat-member trust, isAllowed() rejects everyone: the bot
   // polls happily while silently dropping every message. That looked like "the bot
   // died" once already, so make it unmistakable rather than a passing warning.
@@ -3487,6 +3865,8 @@ export const _sessions = () => sessions
 export const _projectDir = projectDir
 export const _boxDir = boxDir
 export const _answerCaption = answerCaption
+export const _probeVoice = probeVoice
+export const _speakers = () => speakers
 export const _listing = { make: newListing, text: listingText, kb: listingKb }
 export const _listSessions = listSessions
 export const _maybeSynthesise = maybeSynthesise

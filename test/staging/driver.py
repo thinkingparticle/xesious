@@ -1982,6 +1982,240 @@ async def feature_sessions_picker(client, bot):
             f"and /resume accepted the printed prefix {prefix!r}")
 
 
+async def feature_voice_keyboard_and_speaker(client, bot):
+    """/voice must be a keyboard, and the speaker must be changeable from the phone.
+
+    Reported: *"For voice, I want to be able to choose the speaker, currently by
+    default it is the woman. If possible, give me glass buttons to select the voice,
+    and maybe the on off and summary modes should become glass buttons?"* The speaker
+    was `af_heart`, hard-coded two layers below the chat, and the only way to change
+    it was editing .env and RESTARTING the bridge — voiceEnv() copied TG_KOKORO_VOICE
+    out of the bridge's own environment, making it a deployment-wide constant.
+
+    Only this tier can prove the tap works end to end: a callback button is the sole
+    in-chat affordance that carries a payload back to the bot, and the setting has to
+    survive into the state file the bridge actually reads.
+    """
+    import json
+    state_file = os.environ.get("TG_STATE_FILE", "")
+    key = f"{(await client.get_me()).id}:main"
+
+    def speaker():
+        try:
+            with open(state_file, encoding="utf-8") as fh:
+                return (json.load(fh).get("speakers") or {}).get(key)
+        except (OSError, ValueError):
+            return None
+
+    print("  → /voice")
+    msgs, _ = await send_and_collect(client, bot, "/voice", settle=6.0)
+    menu = next((m for m in msgs if m.reply_markup), None)
+    if not menu:
+        return ("/voice is a keyboard and the speaker is per topic", False,
+                f"no keyboard: {[ (reply_text(m) or '')[:60] for m in msgs ]}")
+
+    problems = []
+    buttons = [b for row in menu.reply_markup.rows for b in row.buttons]
+    labels = [b.text for b in buttons]
+    print(f"    buttons: {labels}")
+    for want in ("Full", "Summary", "Off"):
+        if not any(want in l for l in labels):
+            problems.append(f"no {want!r} button — /voice is still a menu you type back at")
+    spk = [b for b in buttons if (getattr(b, "data", b"") or b"").startswith(b"vspk:")]
+    if len(spk) < 4:
+        problems.append(f"only {len(spk)} speaker buttons")
+    # Named, not raw ids: "am_michael" tells you nothing. A flag, a name and a
+    # gender — and deliberately NOT a description of how the voice sounds, which an
+    # earlier version invented for voices nobody had listened to.
+    import re as _re
+    named = _re.compile(r"[\U0001F1E6-\U0001F1FF]{2} \w+ \((f|m)\)")
+    if not all(named.search(b.text) for b in spk):
+        problems.append(f"speaker buttons are not named: {[b.text for b in spk]}")
+    if any("—" in b.text for b in spk):
+        problems.append("a speaker button carries an invented description of how it sounds")
+    # All 28 English voices must be reachable by tapping, not only by typing.
+    pager = [b for row in menu.reply_markup.rows for b in row.buttons
+             if (getattr(b, "data", b"") or b"").startswith(b"vspg:")]
+    if not pager:
+        problems.append("no pager — the voices past the first page are unreachable by tap")
+    if not any(l.startswith("● ") for l in labels):
+        problems.append("nothing marks the current selection")
+
+    # --- tapping a speaker changes it, per topic, without a restart ---------------
+    before = speaker()
+    target = next((b for b in spk if not (b.data or b"").decode().endswith(before or "af_heart")), None)
+    if not target:
+        problems.append("no speaker to switch TO")
+    else:
+        want = (target.data or b"").decode().split(":", 1)[1]
+        print(f"    tapping {target.text!r} -> {want}")
+        idx = buttons.index(target)
+        await menu.click(idx)
+        await asyncio.sleep(5)
+        got = speaker()
+        print(f"    speaker before={before} after={got}")
+        if got != want:
+            problems.append(f"the tap did not store the speaker ({got!r} != {want!r})")
+        fresh = await client.get_messages(bot, ids=menu.id)
+        if fresh and want not in (reply_text(fresh) or ""):
+            problems.append("the keyboard message did not re-render with the new speaker")
+
+    # --- and the typed escape hatch reaches the other 46 -------------------------
+    print("  → /voice speaker bm_george")
+    replies = await send_and_wait(client, bot, "/voice speaker bm_george")
+    print(f"    ← {[r[:70] for r in replies]}")
+    if speaker() != "bm_george":
+        problems.append("/voice speaker <id> did not take effect")
+    # A speaker id is user text; it must be constrained, not trusted.
+    bad = await send_and_wait(client, bot, "/voice speaker ../../etc/passwd")
+    if not any("Not a Kokoro voice id" in r for r in bad):
+        problems.append(f"a bogus speaker id was not refused: {bad}")
+
+    await send_and_wait(client, bot, "/voice off")
+    return ("/voice is a keyboard and the speaker is per topic", not problems,
+            "; ".join(problems) if problems else
+            f"{len(spk)} named speaker buttons with a pager to the rest, the tap stored it "
+            "per topic without a restart, and /voice speaker reached one off the page")
+
+
+def audio_seconds(msg):
+    """Seconds of audio in a voice note or audio file.
+
+    NOT msg.voice.duration: Telethon's .voice is the Document, and the duration
+    lives on its DocumentAttributeAudio. Reading the Document gave 0 for every note
+    and made a working feature look like the truncation bug was still alive."""
+    doc = getattr(msg, "voice", None) or getattr(msg, "audio", None)
+    for a in getattr(doc, "attributes", []) or []:
+        d = getattr(a, "duration", None)
+        if d:
+            return d
+    return 0
+
+
+async def feature_voice_progressive(client, bot):
+    """A long answer must arrive as voice notes AS THEY ARE READY, and the topic must
+    stay usable the whole time.
+
+    Two reports, one piece of work. *"Currently for long text I get a short voice,
+    but I want the full voice"* — the answer was sliced at 1400 characters, cutting a
+    long reply off around a fifth of the way in, mid-sentence, saying nothing. And
+    *"my next messages in Telegram will be ignored until the voice is generated"* —
+    synthesis sat inside the turn, measured at 65 seconds of dead topic for a note at
+    that very cap.
+
+    This is the case that CANNOT be faked: it is about real synthesis taking real
+    time. Tier 2 stubs the engine and proves the plumbing; only here do the notes
+    actually arrive one after another while the topic keeps answering.
+    """
+    problems = []
+    seen = []
+
+    @client.on(events.NewMessage(from_users=bot, chats=bot))
+    async def handler(ev):
+        seen.append((asyncio.get_event_loop().time(), ev.message))
+
+    await send_and_wait(client, bot, "/voice on")
+    t0 = asyncio.get_event_loop().time()
+    mark = len(seen)
+    print("  → asking for a long answer with voice on")
+    # 150 lines, not 60, so the answer is past TG_REPLY_FILE_CHARS and goes out as a
+    # FILE GROUP. That is the exact production shape of the "the sound does not reply
+    # to anything" report: deliver could not name a single message, the fallback chain
+    # ended in undefined, and the note floated loose. A shorter answer arrives as one
+    # message and never exercises it.
+    await client.send_message(bot,
+        "Reply with ONLY a numbered list of 150 lines, no preamble and no commentary, "
+        "each line exactly 'N. The quick brown fox jumps over the lazy dog.' with N "
+        "counting up from 1.")
+
+    # --- the first note must arrive long before the whole thing is synthesised ----
+    first = await _until(lambda: next(((t, m) for t, m in seen[mark:] if m.voice), None), 300)
+    if not first:
+        client.remove_event_handler(handler)
+        return ("a long answer is spoken progressively without blocking the topic", False,
+                "no voice note arrived within 300s")
+    print(f"    first note at +{first[0] - t0:.0f}s, {audio_seconds(first[1])}s of audio")
+
+    # --- the topic must answer a NEW message while the rest is still synthesising --
+    mark2 = len(seen)
+    t1 = asyncio.get_event_loop().time()
+    await client.send_message(bot, "Reply with the single word PING and nothing else.")
+    ping = await _until(lambda: next((m for _, m in seen[mark2:]
+                                      if not m.voice and "PING" in (reply_text(m) or "")), None), 120)
+    waited = asyncio.get_event_loop().time() - t1
+    print(f"    PING answered in {waited:.0f}s while speech was still running")
+    if not ping:
+        problems.append("a new message was not answered while the voice was still being generated — "
+                        "synthesis is still blocking the topic")
+
+    # --- every note, then the full file -----------------------------------------
+    # Generous on purpose. Synthesis of a file-length answer is minutes, and measured
+    # on a loaded box it can run SLOWER than realtime (1.9-2.2x here against 0.79x
+    # when nothing else was running), so a fixed short window times out before the
+    # last chunk and reports a working feature as broken.
+    await _until(lambda: next((m for _, m in seen[mark:] if m.audio), None), 1500)
+    await asyncio.sleep(8)
+    client.remove_event_handler(handler)
+    notes = [m for _, m in seen[mark:] if m.voice]
+    full = [m for _, m in seen[mark:] if m.audio]
+    durations = [audio_seconds(m) for m in notes]
+    print(f"    {len(notes)} voice note(s): {durations}s   full file: {[audio_seconds(f) for f in full]}s")
+
+    # The old cap was 1400 characters, about 79 seconds. A 60-line answer is well past
+    # it, so a single short note means the truncation is back.
+    if sum(d for d in durations if d > 5) < 100:
+        problems.append(f"only {sum(durations)}s of audio for a long answer — the 1400-char cap looks alive")
+    # The PING turn is spoken too — voice is still on, which is the correct
+    # behaviour — so its one-second note is not one of this answer's chunks and must
+    # not be counted as one. Measured: [47, 93, 78, 1] where 47+93+78 is exactly the
+    # full file and the 1 is PING.
+    chunks = [d for d in durations if d > 5]
+    tiny = [d for d in durations if d <= 5]
+    print(f"    chunks of the long answer: {chunks}s; short notes (PING's own answer): {tiny}s")
+    # PING's own note is NOT asserted: notes for one topic are serialised on the
+    # #voice queue, so it correctly waits behind minutes of the long answer's audio
+    # and may fall outside this window. That PING was ANSWERED quickly is the thing
+    # that proves the topic was not blocked, and it is checked above.
+    if len(chunks) > 1:
+        # Progressive delivery: note 2 must not arrive at the same instant as note 1.
+        times = [t - t0 for t, m in seen[mark:] if m.voice]
+        print(f"    note arrival times: {[f'{x:.0f}s' for x in times]}")
+        if times[-1] - times[0] < 5:
+            problems.append("all notes arrived at once — they were not sent as they became ready")
+        if not full:
+            problems.append("no full-length file followed the chunks")
+        else:
+            # The full file must be the chunks joined, not a re-synthesis and not a
+            # truncation: it is built from samples already in hand.
+            got, want = audio_seconds(full[0]), sum(chunks)
+            print(f"    full file {got}s vs chunks {want}s")
+            if abs(got - want) > max(5, want * 0.05):
+                problems.append(f"the full file ({got}s) does not match its chunks ({want}s)")
+    else:
+        problems.append(f"the answer produced only {len(chunks)} chunk(s) — progressive delivery did not happen")
+    # Threading: EVERY note must hang off something, never float loose. Reported from
+    # production as "the sound does not fucking reply to anything" on a long answer.
+    loose = [i for i, m in enumerate(notes) if not getattr(m, "reply_to", None)]
+    if loose:
+        problems.append(f"{len(loose)} of {len(notes)} voice notes reply to nothing — "
+                        "you cannot tell which note answers which question")
+    else:
+        print(f"    all {len(notes)} notes threaded; first replies to "
+              f"{getattr(notes[0].reply_to, 'reply_to_msg_id', '?')}")
+    # …and the answer really did go out as files, or this case proved nothing.
+    docs = [m for _, m in seen[mark:] if m.document and not m.voice and not m.audio]
+    if not docs:
+        problems.append("the answer was not long enough to become a file — the production case was not exercised")
+
+    await send_and_wait(client, bot, "/voice off")
+    return ("a long answer is spoken progressively without blocking the topic", not problems,
+            "; ".join(problems) if problems else
+            f"first note at +{first[0] - t0:.0f}s, {len(chunks)} chunk(s) totalling {sum(chunks)}s, "
+            f"a full file of {audio_seconds(full[0]) if full else 0}s, "
+            f"and a new message answered in {waited:.0f}s while speech was still running")
+
+
+
 FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
                  feature_rtl_answer_stays_rich,
                  feature_midturn_text, feature_attribution, feature_reply_threading,
@@ -1993,6 +2227,10 @@ FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_pro
                  # and puts it back afterwards, so anything running between the two would
                  # be talking to the wrong conversation.
                  feature_sessions_picker,
+                 feature_voice_keyboard_and_speaker,
+                 # Slow by nature: it waits on real synthesis of a long answer. Last
+                 # of the DM cases so nothing else is queued behind it.
+                 feature_voice_progressive,
                  feature_fanout_guard,
                  # Needs a real forum group and creates five topics of its own.
                  feature_unicode_topic_directories,

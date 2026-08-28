@@ -14,6 +14,7 @@ import {
   toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step,
   needsRich, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
   markdownToHtml, htmlDocument, previewCut, transcriptSpeech, lastEffortFrom, needsReplyLink,
+  speechBlocks, speechify, speechText, speechUnits, speechChunkSeconds, SPEECH_GAPS,
   parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble, fanoutPlanPrompt,
   FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName, filesPreamble,
   sanitizeProse, PROSE_RULES, isNonAnswer,
@@ -136,6 +137,123 @@ describe('transcriptSpeech — what the user actually said', () => {
   })
   test('an ordinary message is returned unchanged', () => {
     expect(transcriptSpeech('just a plain message I typed')).toBe('just a plain message I typed')
+  })
+})
+
+// Reported: "the speech is like a continuous text without much wait or difference
+// for titles, wait for bullet points etc." The cause is mechanical — stripMd removes
+// a heading's ## and keeps its words, and a heading has no terminal punctuation, so
+// it is read as the opening of the paragraph below it. Every TTS engine phrases on
+// punctuation, not on newlines.
+describe('speechBlocks — an answer as typed blocks', () => {
+  test('a heading is its own block, not the start of the next paragraph', () => {
+    const b = speechBlocks('## Results\n\nThe tests pass.')
+    expect(b.map(x => x.kind)).toEqual(['heading', 'para'])
+    expect(b[0].text).toBe('Results')
+  })
+  test('bullets and numbered items each become their own block', () => {
+    // stripMd has no rule for "- " at all, so the marker used to be read out or
+    // swallowed, and the beat it stands for was never produced.
+    const b = speechBlocks('- one\n- two\n\n1. first\n2. second')
+    expect(b.map(x => x.kind)).toEqual(['item', 'item', 'item', 'item'])
+  })
+  test('code blocks and tables are replaced by a spoken placeholder, not read out', () => {
+    // Reading punctuation-dense code aloud is worse than saying it is there.
+    const b = speechBlocks('text\n\n```sh\ncd /x\necho hi\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |')
+    const skips = b.filter(x => x.kind === 'skip').map(x => x.text)
+    expect(skips).toEqual(['A 2-line code block.', 'A table.'])
+    expect(b.some(x => x.text.includes('echo hi'))).toBe(false)
+  })
+  test('a horizontal rule is a section break, not something to say', () => {
+    expect(speechBlocks('one\n\n---\n\ntwo').map(x => x.kind)).toEqual(['para', 'para'])
+  })
+})
+
+describe('speechify — what changes for an ear rather than an eye', () => {
+  test("a link's target is dropped, not read out", () => {
+    // stripMd expands [text](url) to "text (url)", which is right on the text path
+    // and unbearable on this one.
+    expect(speechify('See [the report](https://x.test/a?b=1) for detail.')).toBe('See the report for detail.')
+  })
+  test('a bare URL becomes its host', () => {
+    expect(speechify('read https://docs.example.com/a/b?c=1 first')).toBe('read docs.example.com first')
+  })
+  test('symbols that are silent to the ear are spoken', () => {
+    expect(speechify('a -> b & c')).toBe('a to b and c')
+    expect(speechify('x => y')).toBe('x becomes y')
+  })
+  test('emphasis markers are removed but the words stay', () => {
+    expect(speechify('the **tests** pass on `all` ~~most~~ platforms')).toBe('the tests pass on all most platforms')
+  })
+})
+
+describe('speechText — terminal punctuation is the whole point', () => {
+  test('a heading is given a full stop so it is phrased as its own sentence', () => {
+    expect(speechText({ kind: 'heading', text: 'Results' })).toBe('Results.')
+  })
+  test('punctuation that already ends the text is left alone', () => {
+    expect(speechText({ kind: 'para', text: 'Is it done?' })).toBe('Is it done?')
+    expect(speechText({ kind: 'para', text: 'Consider:' })).toBe('Consider:')
+  })
+  test("an ordered item keeps its number, because that is the information the digit carried", () => {
+    expect(speechText({ kind: 'item', text: '1. first' })).toBe('1. first.')
+  })
+})
+
+describe('speechUnits — the granularity progressive delivery actually needs', () => {
+  test('a short paragraph stays ONE unit, so synthesis is not paid per sentence', () => {
+    // Measured: one create() call per sentence ran at 1.05x realtime — slower than
+    // listening — because each call pays a fixed cost a two-second sentence cannot
+    // amortise. The same text in one call ran at 0.65x.
+    const u = speechUnits('One sentence here. Two sentences here. Three sentences here.')
+    expect(u).toHaveLength(1)
+    expect(u[0].text).toContain('One sentence here.')
+    expect(u[0].text).toContain('Three sentences here.')
+  })
+  test('a long paragraph is broken into runs, so a chunk can close near its target', () => {
+    // Chunks only close on a unit boundary. Before splitting existed at all, a
+    // single long paragraph produced a first chunk of 90s against a 45s target,
+    // doubling the wait for the first note.
+    const long = 'This is a sentence of a reasonable length that keeps going. '.repeat(40)
+    const u = speechUnits(long)
+    expect(u.length).toBeGreaterThan(1)
+    expect(u.every(x => x.text.length <= 800)).toBe(true)
+  })
+  test('only the last run of a block carries the block pause', () => {
+    const long = 'This is a sentence of a reasonable length that keeps going. '.repeat(40)
+    const u = speechUnits(long)
+    expect(u[0].gap).toBeLessThan(u[u.length - 1].gap)
+    expect(u[u.length - 1].gap).toBe(SPEECH_GAPS.para)
+  })
+  test('a heading is never split and keeps the longest pause', () => {
+    const u = speechUnits('## A heading. With a stop inside it')
+    expect(u).toHaveLength(1)
+    expect(u[0].gap).toBe(SPEECH_GAPS.heading)
+  })
+  test('a comma-spliced monster is broken up rather than blowing past a chunk', () => {
+    const long = 'alpha, ' .repeat(120) + 'omega.'
+    expect(speechUnits(long).length).toBeGreaterThan(1)
+    expect(speechUnits(long).every(u => u.text.length <= 500)).toBe(true)
+  })
+  test('empty input yields nothing rather than an empty utterance', () => {
+    expect(speechUnits('')).toEqual([])
+    expect(speechUnits('```\n\n```')).toHaveLength(1)   // just the placeholder
+  })
+})
+
+describe('speechChunkSeconds — the ramp', () => {
+  test('the first two chunks are short so the first note arrives fast', () => {
+    // Synthesis measured at 0.65-0.68x realtime, so 45s of audio is ~30s of wait.
+    expect(speechChunkSeconds(0)).toBe(45)
+    expect(speechChunkSeconds(1)).toBe(90)
+  })
+  test('later chunks are long so a long answer is not a wall of bubbles', () => {
+    expect(speechChunkSeconds(2)).toBe(180)
+    expect(speechChunkSeconds(9)).toBe(180)
+  })
+  test('the ramp only ever grows', () => {
+    const r = [0, 1, 2, 3, 4].map(speechChunkSeconds)
+    expect(r).toEqual([...r].sort((a, b) => a - b))
   })
 })
 
