@@ -603,13 +603,29 @@ export function fmtDuration(sec: number): string {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 }
 
+// The same duration in words. Telegram's clients turn `M:SS` inside a media caption
+// into a tappable SEEK, which is what makes the section index work — and what makes
+// any other number in that caption a trap: the total duration became a link to the
+// end of the file (and, reported from a real client, sometimes into a different file
+// entirely). A duration that is not navigation must therefore not LOOK like one, so
+// it is written without a colon and nothing linkifies it.
+export function fmtDurationWords(sec: number): string {
+  const s = Math.max(0, Math.round(sec))
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60), rem = s % 60
+  if (m < 60) return rem ? `${m}m ${rem}s` : `${m}m`
+  const h = Math.floor(m / 60), mr = m % 60
+  return mr ? `${h}h ${mr}m` : `${h}h`
+}
+
 // Where each unit starts in the finished audio. speak.py measures this exactly —
 // it holds every unit's samples — so this is only the shape the offsets travel in.
 export type UnitTiming = { start: number; end: number }
 
 // A table of contents for the full file: one entry per heading, at the second it is
 // spoken. Telegram turns `M:SS` in an audio caption into a tappable seek, so these
-// become navigation rather than decoration.
+// become navigation rather than decoration — and they are the ONLY M:SS the caption
+// is allowed to contain, because every other one would be a link to the wrong place.
 //
 // Returns [] when the answer has no headings. That is deliberate: marks every two
 // minutes would be navigation to arbitrary places, which is worse than none.
@@ -631,7 +647,9 @@ export function speechToc(units: SpeechUnit[], timings: UnitTiming[]): { at: num
 // Trimmed from the END with an ellipsis rather than truncated mid-entry, because a
 // half-written heading is worse than a shorter list.
 export function fullAudioCaption(totalSec: number, toc: { at: number; title: string }[], cap = 1024): string {
-  const head = `🎧 Full answer (${fmtDuration(totalSec)})`
+  // Words, not M:SS: this number is a fact about the file, not a place in it, and
+  // as a seek link it pointed at the end of the audio.
+  const head = `🎧 Full answer (${fmtDurationWords(totalSec)})`
   if (!toc.length) return head
   const lines: string[] = []
   for (const e of toc) {

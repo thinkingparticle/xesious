@@ -15,7 +15,7 @@ import {
   needsRich, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
   markdownToHtml, htmlDocument, previewCut, transcriptSpeech, lastEffortFrom, needsReplyLink,
   speechBlocks, speechify, speechText, speechUnits, speechChunkSeconds, SPEECH_GAPS,
-  speechToc, fullAudioCaption, readAlongHtml, fmtDuration,
+  speechToc, fullAudioCaption, readAlongHtml, fmtDuration, fmtDurationWords,
   parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble, fanoutPlanPrompt,
   FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName, filesPreamble,
   sanitizeProse, PROSE_RULES, isNonAnswer,
@@ -282,9 +282,34 @@ describe('speechToc — timestamps that point at sections', () => {
   })
 })
 
+describe('fmtDurationWords', () => {
+  // Its whole job is to state a length WITHOUT looking like a seek target.
+  test('never produces an M:SS, at any magnitude', () => {
+    for (const n of [0, 1, 9, 59, 60, 61, 128, 599, 600, 3599, 3600, 3661, 86399]) {
+      expect(fmtDurationWords(n)).not.toMatch(/\d+:\d\d/)
+    }
+  })
+  test('reads as a duration', () => {
+    expect(fmtDurationWords(0)).toBe('0s')
+    expect(fmtDurationWords(42)).toBe('42s')
+    expect(fmtDurationWords(60)).toBe('1m')
+    expect(fmtDurationWords(128)).toBe('2m 8s')
+    expect(fmtDurationWords(3600)).toBe('1h')
+    expect(fmtDurationWords(3960)).toBe('1h 6m')
+  })
+  test('rounds and floors like fmtDuration, so the two never disagree', () => {
+    expect(fmtDurationWords(-5)).toBe('0s')
+    expect(fmtDurationWords(59.6)).toBe('1m')
+  })
+})
+
 describe('fullAudioCaption', () => {
-  test('with no headings it is just the duration', () => {
-    expect(fullAudioCaption(128, [])).toBe('🎧 Full answer (2:08)')
+  test('with no headings it is just the duration, written so it cannot be tapped', () => {
+    // NOT "2:08": Telegram makes every M:SS in a media caption a seek, and this one
+    // pointed at the end of the file. The section lines below are the only M:SS the
+    // caption may contain, because they are the only ones that go anywhere useful.
+    expect(fullAudioCaption(128, [])).toBe('🎧 Full answer (2m 8s)')
+    expect(fullAudioCaption(128, [])).not.toMatch(/\d+:\d\d/)
   })
   test('headings become tappable timestamps', () => {
     const c = fullAudioCaption(600, [{ at: 0, title: 'Why' }, { at: 132, title: 'What next' }])

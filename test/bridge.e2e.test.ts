@@ -2135,8 +2135,9 @@ describe('a long spoken answer can be stopped, indexed and tidied', () => {
       expect(String(btn?.callback_data)).toStartWith('vstop:')
       // …and only the first: a button on every bubble is noise.
       expect(notes.slice(1).every(c => !kbOf(c))).toBe(true)
-      // A bare "part 2" says nothing about where you are in ten minutes of audio.
-      expect(String(notes[1].payload.caption)).toMatch(/part 2 — from \d+:\d\d/)
+      // The label says where you are in the answer; it deliberately carries no
+      // timestamp, since a seek inside a 90-second chunk cannot reach 5:42.
+      expect(String(notes[1].payload.caption)).toMatch(/part 2/)
     })
   }, 25000)
 
@@ -2202,6 +2203,75 @@ describe('a long spoken answer can be stopped, indexed and tidied', () => {
         && String(c.payload?.document?.filename ?? '').includes('readalong'))
       expect(doc).toBeTruthy()
       expect(String(doc!.payload.caption)).toContain('Read along')
+    })
+  }, 25000)
+
+  test('the part notes carry NO timestamp, because that seek can never land', async () => {
+    // Reported: "you are timestamping the shorter audio messages as well. But
+    // clicking on those timestamp does not work." Telegram turns M:SS in a media
+    // caption into a seek RELATIVE TO THAT MESSAGE — and "part 3 — from 5:42" sits
+    // on a note holding 90 seconds that begin at 5:42, so it has no 5:42 to seek to.
+    await withChunking(async () => {
+      await incoming(1438, '/voice on')
+      const before = calls.length
+      await incoming(1438, 'HEADINGS')
+      await bridge._drainQueue('1438:main#voice')
+      const notes = calls.slice(before).filter(c => c.method === 'sendVoice')
+      expect(notes.length).toBeGreaterThan(1)
+      for (const c of notes) {
+        const cap = String(c.payload.caption ?? '')
+        expect(cap).not.toMatch(/\d+:\d\d/)
+      }
+      // The label itself stays — it says where you are in the answer.
+      expect(String(notes[1].payload.caption)).toMatch(/part 2/)
+    })
+  }, 25000)
+
+  test('the full file is the ONLY place an M:SS appears, and never for the total', async () => {
+    // Reported: "the message is full answer (timestamp) and the timestamp is
+    // clickable but jumps to the end of file and goes to a random file I had in
+    // telegram." The total duration is a fact about the file, not a place in it.
+    await withChunking(async () => {
+      await incoming(1439, '/voice on')
+      const before = calls.length
+      await incoming(1439, 'LONGHEADINGS')
+      await bridge._drainQueue('1439:main#voice')
+      const full = calls.slice(before).find(c => c.method === 'sendAudio')
+      expect(full).toBeTruthy()
+      const cap = String(full!.payload.caption)
+      const head = cap.split('\n')[0]
+      // The header still reports the length — just not as something tappable.
+      expect(head).toMatch(/🎧 Full answer \((\d+h )?(\d+m ?)?(\d+s)?\)/)
+      expect(head).not.toMatch(/\d+:\d\d/)
+      expect(String(full!.payload.title)).not.toMatch(/\d+:\d\d/)
+      // …while every section line is still a real seek, which is the part that works.
+      const stamps = cap.split('\n').slice(1).filter(l => /^\d+:\d\d {2}\S/.test(l))
+      expect(stamps.length).toBeGreaterThan(1)
+    })
+  }, 25000)
+
+  test('the read-along page is a reply to the full audio, not a loose message', async () => {
+    // Asked for: "the Read Along HTML, can it be sent with the last audio file?"
+    // Telegram will not put an audio and a document in one album — "Documents and
+    // audio files can be only grouped in an album with messages of the same type" —
+    // so replying to the audio is as close as one message gets.
+    await withChunking(async () => {
+      await incoming(1442, '/voice on')
+      const before = calls.length
+      await incoming(1442, 'LONGHEADINGS')
+      await bridge._drainQueue('1442:main#voice')
+      await new Promise(r => setTimeout(r, 600))
+      const cs = calls.slice(before)
+      const full = cs.find(c => c.method === 'sendAudio')
+      const page = cs.find(c => c.method === 'sendDocument'
+        && String(c.payload?.document?.filename ?? '').includes('readalong'))
+      expect(full).toBeTruthy()
+      expect(page).toBeTruthy()
+      // The audio's id is not on the recorded call, so match on order + reply target:
+      // the page must reply to a message sent in this turn, after the audio.
+      expect(cs.indexOf(page!)).toBeGreaterThan(cs.indexOf(full!))
+      expect(page!.payload?.reply_parameters?.message_id).toBeGreaterThan(0)
+      expect(String(page!.payload.caption)).toContain('full answer above')
     })
   }, 25000)
 

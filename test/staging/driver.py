@@ -2255,6 +2255,26 @@ async def feature_voice_index_and_readalong(client, bot):
 
     cap = full.message or ""
     print(f"    caption:\n      " + cap.replace("\n", "\n      "))
+
+    # Reported from a real client: *"the message is full answer (timestamp) and the
+    # timestamp is clickable but jumps to the end of file and goes to a random file I
+    # had in telegram."* Telegram linkifies EVERY M:SS in a media caption, so the
+    # header's total duration became a seek to the end. The header must therefore
+    # carry no M:SS at all — only the section lines below it may.
+    head = cap.split("\n")[0]
+    if re.search(r"\d+:\d\d", head):
+        problems.append(f"the caption header still contains a tappable M:SS: {head!r}")
+    else:
+        print(f"    header carries no seekable timestamp: {head!r}")
+
+    # The part notes are the other half of the same report: their captions used to
+    # read "part 3 — from 5:42", and that seek is relative to a note that begins at
+    # 5:42 and therefore has no 5:42 in it. Every tap was dead.
+    for note in [m for m in seen[mark:] if m.voice]:
+        ncap = note.message or ""
+        if re.search(r"\d+:\d\d", ncap):
+            problems.append(f"a part note still carries a dead seek link: {ncap!r}")
+
     stamps = re.findall(r"^(\d+):(\d\d)\s{2}(\S.*)$", cap, re.M)
     if len(stamps) < 2:
         problems.append(f"fewer than two section timestamps in the caption: {cap!r}")
@@ -2281,6 +2301,14 @@ async def feature_voice_index_and_readalong(client, bot):
         with open(path, encoding="utf-8") as fh:
             doc = fh.read()
         print(f"    read-along page: {len(doc)//1024}KB")
+        # Asked for: "can it be sent with the last audio file?" sendMediaGroup will
+        # not mix an audio with a document, so the page replies to the audio instead.
+        # This checks the thread really is the audio and not the original question.
+        if getattr(page, "reply_to", None) is None or \
+           page.reply_to.reply_to_msg_id != full.id:
+            problems.append("the read-along is not threaded to the full audio message")
+        else:
+            print("    read-along replies to the full audio message")
         # Self-contained, like the plain answer.html: it has to work with no network.
         if "src=\"data:audio/ogg;base64," not in doc:
             problems.append("the page does not embed its audio — it would be silent offline")
@@ -2309,8 +2337,9 @@ async def feature_voice_index_and_readalong(client, bot):
     await send_and_wait(client, bot, "/voice off")
     return ("the full voice file is indexed and a read-along page follows", not problems,
             "; ".join(problems) if problems else
-            f"{len(stamps)} section timestamps pointing into the audio, and a self-contained "
-            f"read-along page with {len(offsets) if page else 0} timed blocks")
+            f"{len(stamps)} section timestamps pointing into the audio, no seekable number "
+            f"anywhere else, and a self-contained read-along page with "
+            f"{len(offsets) if page else 0} timed blocks threaded to the audio")
 
 
 async def feature_voice_readalong_only_for_long_answers(client, bot):

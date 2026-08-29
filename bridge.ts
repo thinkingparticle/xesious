@@ -34,7 +34,7 @@ import {
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
   markdownToHtml, htmlDocument, previewCut, transcriptSpeech, lastEffortFrom, needsReplyLink,
   speechUnits, speechChunkSeconds, SPEAKERS, SPEAKER_PAGE, SPEAKER_DEFAULT, kokoroLang, isSpeakerId, speakerLabel,
-  speechToc, fullAudioCaption, readAlongHtml, fmtDuration, type SpeechUnit, type UnitTiming,
+  speechToc, fullAudioCaption, readAlongHtml, fmtDurationWords, type SpeechUnit, type UnitTiming,
   fanoutPlanPrompt, parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble,
   FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName, filesPreamble,
   type FanoutPlanItem,
@@ -1916,15 +1916,19 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
         if (o.path) {
           n++
           const part = n
-          const at = o.at ?? 0
           if (part === 1) onlyPath = o.path
           later(async () => {
             if (task.cancelled) return
             const opts: any = destOpts({ threadId, replyTo })
             // No caption on the first note: a short answer is one note and a "part 1"
-            // label on a thing with no part 2 is noise. Later ones say where they are
-            // in the whole, which a bare "part 3" never did.
-            if (part > 1) opts.caption = `🎙 part ${part} — from ${fmtDuration(at)}`
+            // label on a thing with no part 2 is noise.
+            //
+            // No TIMESTAMP on any of them either. It used to read "part 3 — from 5:42",
+            // and Telegram turns that M:SS into a seek — but the seek is relative to
+            // THIS note, which holds 90 seconds starting at 5:42 and has no 5:42 in it.
+            // Every tap was a dead link. A note is a position in the answer, not a
+            // place you can jump to; the full file below is what you navigate.
+            if (part > 1) opts.caption = `🎙 part ${part}`
             if (o.seconds) opts.duration = Math.round(o.seconds)
             // The stop button rides on the FIRST note, which is the one that exists
             // while there is still something worth stopping.
@@ -1947,7 +1951,9 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
             if (task.chunkIds.length > 1) rows.push([{ text: '🧹 Remove the parts', callback_data: `vtidy:${task.id}` }])
             const m: any = await ctx.api.sendAudio(ctx.chat!.id, new InputFile(o.full), {
               ...destOpts({ threadId, replyTo }),
-              title: `Full answer — ${fmtDuration(o.seconds)}`,
+              // Words here too, for the same reason and for consistency with the
+              // caption: nothing outside the section index should look tappable.
+              title: `Full answer — ${fmtDurationWords(o.seconds)}`,
               performer: 'xesious',
               duration: Math.round(o.seconds || 0),
               // Timestamps that point at SECTIONS. Telegram makes each one a tappable
@@ -2062,7 +2068,13 @@ async function sendReadAlong(ctx: Context, threadId: number | undefined, key: st
     const uri = `data:audio/ogg;base64,${readFileSync(oggPath).toString('base64')}`
     const file = join(dir, 'answer-readalong.html')
     writeFileSync(file, readAlongHtml('Answer', units, timings, uri))
-    await sendFile(ctx, threadId, file, '📖 Read along — plays the answer and highlights each part as it is spoken.', replyTo)
+    // Threaded to the full audio message, which is the closest Telegram allows to
+    // sending the two together: sendMediaGroup refuses to mix an audio with a
+    // document ("Documents and audio files can be only grouped in an album with
+    // messages of the same type"), so one message holding both cannot be built.
+    // The reply is what keeps them adjacent and visibly one thing.
+    await sendFile(ctx, threadId, file,
+      '📖 Read along with the full answer above — it highlights each part as it is spoken.', replyTo)
     noteBotMessage(key)
   } catch (e) { console.error(`[voice] read-along: ${e}`) }
   finally { rmSync(dir, { recursive: true, force: true }) }
