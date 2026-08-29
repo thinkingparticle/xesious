@@ -167,7 +167,10 @@ queue, so the next message you send is answered immediately.
 - **🧹 Remove the parts** on that file clears the chunk notes and keeps the file.
   `TG_VOICE_TIDY=1` does it without asking.
 - A **read-along page** comes with it: the answer, the audio, and each block
-  highlighted as it is spoken. Self-contained, so it works offline.
+  highlighted as it is spoken. Self-contained, so it works offline. Only for answers
+  long enough to arrive as `answer.md`/`answer.html` (`TG_REPLY_FILE_CHARS`, default
+  6000) — it is a companion to those files, and a reply short enough to sit inline in
+  the chat gets a voice note and nothing to open.
   `TG_VOICE_READALONG_MAX_MIN` (default 20) caps how long an answer gets one;
   `TG_VOICE_CHUNKED=0` turns the whole progressive path off.
 

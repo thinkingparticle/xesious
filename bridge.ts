@@ -268,6 +268,14 @@ const CLAUDE_PROJECTS = join(CLAUDE_DIR, 'projects')
 const IMPORT_BACKFILL = Math.max(0, Number(process.env.TG_IMPORT_BACKFILL || 12))  // turns backfilled per session
 const IMPORT_MAX_SESSIONS = Math.max(1, Number(process.env.TG_IMPORT_MAX || 10))   // cap topics created per /import
 const REPLY_FILE_CHARS = Math.max(0, Number(process.env.TG_REPLY_FILE_CHARS || 6000)) // replies longer than this go as a file
+// The one question both the file delivery and the read-along page ask, so they can
+// never drift apart: is this answer long enough to arrive as answer.md/.html?
+// The read-along is a companion to those files — it is the same answer, laid out to
+// be read while it is spoken — so an answer short enough to sit inline in the chat
+// gets a voice note and nothing else. A 30-second reply does not need a document.
+function answerGoesToFile(text: string): boolean {
+  return !!REPLY_FILE_CHARS && text.length > REPLY_FILE_CHARS
+}
 // Which file(s) a long reply is delivered as: md | html | both (default).
 // Both, rather than swapping one for the other: the .md is the source of truth —
 // it diffs, and it is what other tools want — while the .html is the one that is
@@ -1634,7 +1642,7 @@ function answerCaption(text: string): { text: string; mode?: string; plain: stri
 // Deliver a Claude answer: inline (markdown) if short, else as an answer.md file
 // with a preview caption — so a huge reply isn't a dozen chunked messages.
 async function deliver(ctx: Context, threadId: number | undefined, text: string, replyTo?: number): Promise<number | undefined> {
-  if (REPLY_FILE_CHARS && text.length > REPLY_FILE_CHARS) {
+  if (answerGoesToFile(text)) {
     const dir = mkdtempSync(join(tmpdir(), 'tg-'))
     try {
       // The HTML goes first when both are sent: it is the one the user opens, and
@@ -1816,6 +1824,10 @@ type SpeechTask = {
   dir: string
   chunkIds: number[]     // the notes sent so far, for tidying
   cancelled: boolean
+  // Whether the answer was long enough to go out as answer.md/.html. Decided from
+  // the answer text at spawn time, not from the finished audio: a slow speaker can
+  // make three minutes of a paragraph, and that paragraph still does not want a page.
+  withFiles: boolean
 }
 // Kept AFTER the run finishes, deliberately. The tidy button rides on the full file,
 // which is the last thing sent, so a task discarded when the child closed could never
@@ -1865,7 +1877,7 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
   const units = speechUnits(text)
   if (!units.length) return true
   const dir = mkdtempSync(join(tmpdir(), 'tg-tts-'))
-  const task: SpeechTask = { id: newJobId(), key, dir, chunkIds: [], cancelled: false }
+  const task: SpeechTask = { id: newJobId(), key, dir, chunkIds: [], cancelled: false, withFiles: answerGoesToFile(text) }
   speechTasks.set(task.id, task)
   speechByTopic.set(key, task.id)
   const req = JSON.stringify({ units, outdir: dir, chunks: [0, 1, 2].map(speechChunkSeconds) })
@@ -1880,7 +1892,13 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
     // answers. Remembering the first chunk lets both happen anyway, without sending a
     // duplicate audio file of content already in the note above it.
     let onlyPath: string | undefined
-    let fullSent = false
+    // Set when the `full` LINE IS PARSED, not when its send finishes. `done` arrives
+    // on stdout immediately behind `full`, while the send is still sitting on the
+    // queue — so a flag set inside the send callback was still false when the `done`
+    // branch read it, and both paths queued a read-along. Two pages, every long
+    // answer. The question here is "did the synthesiser produce a full file?", which
+    // the parse answers and the send does not.
+    let haveFull = false
     // Sends are chained rather than awaited inline: stdout must keep being read or
     // the child blocks on a full pipe, and the notes still have to arrive in order.
     let queue: Promise<void> = Promise.resolve()
@@ -1919,6 +1937,7 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
           // Taken here as well as from `done`, because the section index is built the
           // moment the full file is sent and `done` arrives after it.
           if (o.timings) timings = o.timings.map((t: number[]) => ({ start: t[0], end: t[1] }))
+          haveFull = true
           later(async () => {
             if (task.cancelled) return
             // sendAudio, not sendVoice: a real player with seeking and a title, and
@@ -1938,7 +1957,6 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
               ...(rows.length ? { reply_markup: { inline_keyboard: rows } } : {}),
             } as any)
             noteBotMessage(key)
-            fullSent = true
             // The first note's stop button is stale now: nothing is left to stop.
             await dropStopButton(ctx, task)
             if (VOICE_TIDY) await tidySpeech(ctx, task)
@@ -1950,7 +1968,7 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
           timings = (o.timings || []).map((t: number[]) => ({ start: t[0], end: t[1] }))
           const seconds = o.seconds ?? 0
           const single = onlyPath
-          if (!fullSent && single) {
+          if (!haveFull && single) {
             later(async () => {
               if (task.cancelled) return
               await dropStopButton(ctx, task)
@@ -2029,6 +2047,10 @@ async function sendReadAlong(ctx: Context, threadId: number | undefined, key: st
                              units: SpeechUnit[], timings: UnitTiming[], oggPath: string,
                              seconds: number, replyTo?: number): Promise<void> {
   if (task.cancelled || !timings.length || !READALONG_MAX_MIN) return
+  // Only for answers that ALSO arrived as answer.md/.html. Every voice note used to
+  // get a page, so a thirty-second reply came with a document to open — the page is
+  // for following a long answer, and a short one is just clutter with an attachment.
+  if (!task.withFiles) return
   if (seconds > READALONG_MAX_MIN * 60) {
     console.log(`[voice] read-along skipped: ${Math.round(seconds)}s over the ${READALONG_MAX_MIN}min cap`)
     return

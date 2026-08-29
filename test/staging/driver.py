@@ -2286,6 +2286,12 @@ async def feature_voice_index_and_readalong(client, bot):
             problems.append("the page does not embed its audio — it would be silent offline")
         if re.search(r"https?://", doc):
             problems.append("the page fetches something over the network")
+        # The page is a companion to answer.md/.html, so those must have come too —
+        # otherwise the positive case would still pass with the gate wired backwards.
+        if not any(m.document and any((getattr(a, "file_name", "") or "").startswith("answer.")
+                                      and "readalong" not in (getattr(a, "file_name", "") or "")
+                                      for a in m.document.attributes) for m in seen[mark:]):
+            problems.append("the read-along arrived without the answer files it belongs to")
         offsets = re.findall(r'data-start="([\d.]+)" data-end="([\d.]+)"', doc)
         if len(offsets) < 4:
             problems.append(f"only {len(offsets)} timed blocks in the page")
@@ -2305,6 +2311,81 @@ async def feature_voice_index_and_readalong(client, bot):
             "; ".join(problems) if problems else
             f"{len(stamps)} section timestamps pointing into the audio, and a self-contained "
             f"read-along page with {len(offsets) if page else 0} timed blocks")
+
+
+async def feature_voice_readalong_only_for_long_answers(client, bot):
+    """A short answer is SPOKEN, never documented.
+
+    Reported: *"the fucking read-along html page is generated for every fucking
+    voice! even a 30 seconds voice is giving me read along html. I dont need this
+    shit. I only need this when text answer is too long and an md and html file is
+    generated."*
+
+    The page was gated on having timings, which every spoken answer has, so it rode
+    on how long the AUDIO was rather than on how long the ANSWER was. This asks for
+    the exact shape that produced the complaint: prose short enough to sit inline in
+    the chat, but long enough to speak for minutes and arrive as several notes. The
+    audio must all still be there; the attachment must not.
+
+    Only this tier settles it — the negative is about what Telegram never receives,
+    and the in-process suite can only prove the bridge never called sendDocument.
+    """
+    problems = []
+    seen = []
+
+    @client.on(events.NewMessage(from_users=bot, chats=bot))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    await send_and_wait(client, bot, "/voice on")
+    mark = len(seen)
+    print("  → asking for an answer that SPEAKS long but reads short")
+    # Deliberately under TG_REPLY_FILE_CHARS (6000 by default) and deliberately more
+    # than a minute of speech: the two must be allowed to disagree, because the whole
+    # bug was treating them as the same question.
+    await client.send_message(bot,
+        "Reply with ONLY the following, no preamble and no commentary. Eighteen "
+        "sentences of ordinary prose about how a kettle works. Plain paragraphs, no "
+        "headings, no lists, no code. Keep the whole reply under 2000 characters.")
+
+    note = await _until(lambda: next((m for m in seen[mark:] if m.voice), None), 600)
+    if not note:
+        client.remove_event_handler(handler)
+        await send_and_wait(client, bot, "/voice off")
+        return ("a short answer is spoken but not documented", False,
+                "no voice note arrived within 600s")
+
+    # Let the whole run finish — the page, if it were still coming, arrives last of
+    # all, behind the full file. Waiting only for the note would pass by being early.
+    await _until(lambda: next((m for m in seen[mark:] if m.audio), None), 600)
+    await asyncio.sleep(45)
+
+    msgs = seen[mark:]
+    notes = [m for m in msgs if m.voice]
+    spoken = sum(audio_seconds(m) for m in notes)
+    docs = [m for m in msgs if m.document and not m.voice and not m.audio]
+    names = []
+    for m in docs:
+        for a in m.document.attributes:
+            nm = getattr(a, "file_name", "") or ""
+            if nm:
+                names.append(nm)
+    print(f"    {len(notes)} note(s), {spoken:.0f}s spoken, documents: {names or 'none'}")
+
+    # The answer must genuinely have been spoken — otherwise this passes trivially.
+    if not notes:
+        problems.append("nothing was spoken at all")
+    if any("readalong" in n for n in names):
+        problems.append(f"a read-along page was sent for a short answer: {names}")
+    # …and it must genuinely have been short, or the case proves nothing.
+    if any(n.startswith("answer.") for n in names):
+        problems.append(f"the answer went out as files, so it was not the short case: {names}")
+
+    client.remove_event_handler(handler)
+    await send_and_wait(client, bot, "/voice off")
+    return ("a short answer is spoken but not documented", not problems,
+            "; ".join(problems) if problems else
+            f"{len(notes)} note(s) totalling {spoken:.0f}s of audio, and no attachment")
 
 
 async def feature_voice_cancel_and_tidy(client, bot):
@@ -2419,6 +2500,8 @@ FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_pro
                  # of the DM cases so nothing else is queued behind it.
                  feature_voice_progressive,
                  feature_voice_index_and_readalong,
+                 # The other half of the same rule: long audio, short answer, no page.
+                 feature_voice_readalong_only_for_long_answers,
                  # Slowest of the lot: it deliberately starts a long answer in order
                  # to cancel it part-way.
                  feature_voice_cancel_and_tidy,

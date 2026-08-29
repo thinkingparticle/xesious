@@ -2187,16 +2187,59 @@ describe('a long spoken answer can be stopped, indexed and tidied', () => {
   }, 25000)
 
   test('a read-along page follows the full file, self-contained', async () => {
+    // LONGHEADINGS, not HEADINGS: the page only exists for an answer that also went
+    // out as answer.md/.html, and HEADINGS is a paragraph that merely SPEAKS long.
     await withChunking(async () => {
       await incoming(1433, '/voice on')
       const before = calls.length
-      await incoming(1433, 'HEADINGS')
+      await incoming(1433, 'LONGHEADINGS')
       await bridge._drainQueue('1433:main#voice')
       await new Promise(r => setTimeout(r, 400))
-      const doc = calls.slice(before).find(c => c.method === 'sendDocument'
+      const cs = calls.slice(before)
+      // The premise: this answer really did arrive as files.
+      expect(cs.some(c => c.method === 'sendMediaGroup' || c.method === 'sendDocument')).toBe(true)
+      const doc = cs.find(c => c.method === 'sendDocument'
         && String(c.payload?.document?.filename ?? '').includes('readalong'))
       expect(doc).toBeTruthy()
       expect(String(doc!.payload.caption)).toContain('Read along')
+    })
+  }, 25000)
+
+  test('exactly ONE read-along page, not one per delivery path', async () => {
+    // `done` arrives on stdout immediately behind `full`, so a flag set inside the
+    // full file's queued SEND was still false when the `done` branch read it, and
+    // both queued a page: two near-identical documents for one answer. Found while
+    // gating the page on answer length — the log showed 11.2 KB and 11.1 KB back to
+    // back, the second built from the first chunk rather than the full audio.
+    await withChunking(async () => {
+      await incoming(1437, '/voice on')
+      const before = calls.length
+      await incoming(1437, 'LONGHEADINGS')
+      await bridge._drainQueue('1437:main#voice')
+      await new Promise(r => setTimeout(r, 600))
+      const pages = calls.slice(before).filter(c => c.method === 'sendDocument'
+        && String(c.payload?.document?.filename ?? '').includes('readalong'))
+      expect(pages).toHaveLength(1)
+    })
+  }, 25000)
+
+  test('a short answer gets NO read-along, however many notes it is spoken as', async () => {
+    // Reported: "even a 30 seconds voice is giving me read along html". The page was
+    // gated on having TIMINGS, which every spoken answer has — so it rode on audio
+    // length, not answer length. HEADINGS is ~180 characters and still speaks as
+    // several notes, which is exactly the case that produced an unwanted document.
+    await withChunking(async () => {
+      await incoming(1436, '/voice on')
+      const before = calls.length
+      await incoming(1436, 'HEADINGS')
+      await bridge._drainQueue('1436:main#voice')
+      await new Promise(r => setTimeout(r, 400))
+      const cs = calls.slice(before)
+      // The audio all still happens — this removes a document, not a feature.
+      expect(cs.filter(c => c.method === 'sendVoice').length).toBeGreaterThan(1)
+      expect(cs.some(c => c.method === 'sendAudio')).toBe(true)
+      // …and the answer itself was short enough to sit inline, so: no files at all.
+      expect(cs.some(c => c.method === 'sendDocument' || c.method === 'sendMediaGroup')).toBe(false)
     })
   }, 25000)
 
@@ -2261,10 +2304,12 @@ describe('a long spoken answer can be stopped, indexed and tidied', () => {
   }, 30000)
 })
 
-describe('a SHORT spoken answer still gets an index and a read-along', () => {
-  // One chunk means no full file — the single note is the whole thing — so both
-  // features used to be silently absent for short answers. Caught in tier 3 as
-  // "no full-length audio arrived", which read like a timeout and was a real gap.
+describe('a SHORT spoken answer gets an index, and no read-along', () => {
+  // One chunk means no full file — the single note is the whole thing — so the INDEX
+  // used to be silently absent for short answers. Caught in tier 3 as "no full-length
+  // audio arrived", which read like a timeout and was a real gap; it is still fixed.
+  // The read-along went the other way: it was attached here too, and should not have
+  // been. An index costs a caption already being sent; a page costs an attachment.
   test('the note itself is captioned with the section index', async () => {
     await incoming(1440, '/voice on')
     const before = calls.length
@@ -2280,7 +2325,7 @@ describe('a SHORT spoken answer still gets an index and a read-along', () => {
     expect(String(edit!.payload.caption)).toMatch(/^\d+:\d\d {2}\S/m)
   }, 25000)
 
-  test('and a read-along page still follows', async () => {
+  test('and no read-along page follows it', async () => {
     await incoming(1441, '/voice on')
     const before = calls.length
     await incoming(1441, 'SHORTHEADINGS')
@@ -2288,6 +2333,6 @@ describe('a SHORT spoken answer still gets an index and a read-along', () => {
     await new Promise(r => setTimeout(r, 400))
     const doc = calls.slice(before).find(c => c.method === 'sendDocument'
       && String(c.payload?.document?.filename ?? '').includes('readalong'))
-    expect(doc).toBeTruthy()
+    expect(doc).toBeUndefined()
   }, 25000)
 })

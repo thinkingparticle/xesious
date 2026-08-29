@@ -128,6 +128,15 @@ async function main() {
     result({ result: '## One\n\nA sentence.' })
     return
   }
+  if (scenario === 'LONGHEADINGS') {
+    // Headed AND past the file threshold, which is the ONLY combination that earns a
+    // read-along page: the page is a companion to answer.md/.html, so a structured
+    // answer that still sits inline in the chat must not produce one.
+    const body = (n: string) => `The ${n} section says a thing that runs on. `.repeat(60)
+    result({ result: `## Alpha\n\n${body('first')}\n\n## Beta\n\n${body('second')}\n\n` +
+      `## Gamma\n\n${body('third')}` })
+    return
+  }
   if (scenario === 'HEADINGS') {
     // A structured answer, for the speech path: the section index on the full voice
     // file and the read-along page both key off headings, and an answer without any
