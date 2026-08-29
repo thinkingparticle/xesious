@@ -2079,6 +2079,20 @@ async def feature_voice_keyboard_and_speaker(client, bot):
             "per topic without a restart, and /voice speaker reached one off the page")
 
 
+def is_full_file(msg):
+    """The complete-answer audio, whatever type Telegram decided to deliver it as.
+
+    The bridge calls sendAudio; the server re-classifies. Measured on real Telegram:
+    a 194s and a 128s .ogg arrived as AUDIO, a 71s one as a VOICE note. Both carry
+    the bridge's own filename and caption, so those are what identify it.
+    """
+    doc = getattr(msg, "document", None)
+    for a in getattr(doc, "attributes", []) or []:
+        if (getattr(a, "file_name", "") or "") == "full.ogg":
+            return True
+    return (msg.message or "").startswith("🎧 Full answer")
+
+
 def audio_seconds(msg):
     """Seconds of audio in a voice note or audio file.
 
@@ -2107,6 +2121,26 @@ async def feature_voice_progressive(client, bot):
     This is the case that CANNOT be faked: it is about real synthesis taking real
     time. Tier 2 stubs the engine and proves the plumbing; only here do the notes
     actually arrive one after another while the topic keeps answering.
+
+    ON ITS LENGTH. This used to ask for 150 spoken lines and took about ten minutes,
+    because two unrelated requirements were being met by the same string: the answer
+    had to exceed TG_REPLY_FILE_CHARS (6000) to take the FILE-GROUP path, and it had
+    to be spoken long enough to produce more than one chunk. Six thousand characters
+    of prose is nine minutes of audio, and eight of those minutes proved nothing that
+    the first two had not.
+
+    They are now met separately. speechBlocks() renders a fenced code block as the
+    single sentence "A N-line code block." — so the block supplies the characters at
+    a cost of about two seconds of speech, while a short run of prose supplies the
+    audio. Same file-group path, same ramp, same assertions, roughly a fifth of the
+    wall clock.
+
+    The truncation half of the first report moved to tier 2, where it is checked
+    exactly rather than inferred: a duration floor here could never distinguish a
+    whole answer from one sliced at 1400 characters, because that slice is still
+    about two minutes of perfectly good audio. See "the chunked path speaks the WHOLE
+    answer" in test/bridge.e2e.test.ts, which reads the units handed to the
+    synthesiser and fails if the last words of the answer are missing.
     """
     problems = []
     seen = []
@@ -2119,14 +2153,23 @@ async def feature_voice_progressive(client, bot):
     t0 = asyncio.get_event_loop().time()
     mark = len(seen)
     print("  → asking for a long answer with voice on")
-    # 150 lines, not 60, so the answer is past TG_REPLY_FILE_CHARS and goes out as a
-    # FILE GROUP. That is the exact production shape of the "the sound does not reply
-    # to anything" report: deliver could not name a single message, the fallback chain
-    # ended in undefined, and the note floated loose. A shorter answer arrives as one
-    # message and never exercises it.
+    # The answer must be past TG_REPLY_FILE_CHARS so it goes out as a FILE GROUP:
+    # that is the exact production shape of the "the sound does not reply to anything"
+    # report, where deliver() could not name a single message, the fallback chain
+    # ended in undefined and the note floated loose. An answer that arrives as one
+    # message never exercises it.
+    #
+    # The code block is what carries it past 6000 characters, and it is spoken as the
+    # four words "A 100-line code block." — so the file-group path is exercised at its
+    # real threshold while costing no synthesis. The 20 prose lines are the part that
+    # is actually read aloud: about 90 seconds, enough for the 45s first chunk to
+    # close and a second to follow, which is what "progressive" means here.
     await client.send_message(bot,
-        "Reply with ONLY a numbered list of 150 lines, no preamble and no commentary, "
-        "each line exactly 'N. The quick brown fox jumps over the lazy dog.' with N "
+        "Reply with ONLY the following, no preamble and no commentary. First a "
+        "numbered list of 20 lines, each exactly "
+        "'N. The quick brown fox jumps over the lazy dog.' with N counting up from 1. "
+        "Then a fenced code block (```) of 100 lines, each exactly "
+        "'const valueN = computeTheThing(alpha, beta, gamma); // step N' with N "
         "counting up from 1.")
 
     # --- the first note must arrive long before the whole thing is synthesised ----
@@ -2150,22 +2193,32 @@ async def feature_voice_progressive(client, bot):
                         "synthesis is still blocking the topic")
 
     # --- every note, then the full file -----------------------------------------
-    # Generous on purpose. Synthesis of a file-length answer is minutes, and measured
-    # on a loaded box it can run SLOWER than realtime (1.9-2.2x here against 0.79x
-    # when nothing else was running), so a fixed short window times out before the
-    # last chunk and reports a working feature as broken.
-    await _until(lambda: next((m for _, m in seen[mark:] if m.audio), None), 1500)
+    # Still generous relative to the ~90s of audio: measured on a loaded box synthesis
+    # can run SLOWER than realtime (1.9-2.2x here against 0.79x idle), so a window cut
+    # close to the audio length times out before the last chunk and reports a working
+    # feature as broken. It no longer needs to cover nine minutes of speech, though.
+    await _until(lambda: next((m for _, m in seen[mark:] if is_full_file(m)), None), 600)
     await asyncio.sleep(8)
     client.remove_event_handler(handler)
-    notes = [m for _, m in seen[mark:] if m.voice]
-    full = [m for _, m in seen[mark:] if m.audio]
+    # Partition by WHAT THE FILE IS, not by how Telegram classified it. The bridge
+    # sends the full file with sendAudio, but the server decides what arrives: an
+    # .ogg of 128s or more came back as an audio track, while a 71s one came back as
+    # a VOICE note — same code path, same call, different delivered type. Reading
+    # `.voice` as "a chunk" therefore counted the full file as a third chunk and then
+    # reported no full file at all. The name and caption are ours and do not change.
+    notes = [m for _, m in seen[mark:] if (m.voice or m.audio) and not is_full_file(m)]
+    full = [m for _, m in seen[mark:] if is_full_file(m)]
     durations = [audio_seconds(m) for m in notes]
     print(f"    {len(notes)} voice note(s): {durations}s   full file: {[audio_seconds(f) for f in full]}s")
 
-    # The old cap was 1400 characters, about 79 seconds. A 60-line answer is well past
-    # it, so a single short note means the truncation is back.
-    if sum(d for d in durations if d > 5) < 100:
-        problems.append(f"only {sum(durations)}s of audio for a long answer — the 1400-char cap looks alive")
+    # A sanity floor only: more than one chunk's worth of audio, so a single stunted
+    # note is still caught here. It is deliberately NOT the truncation assertion —
+    # a 1400-character slice is about two minutes of audio and would sail over any
+    # floor this test could afford to wait for. That check lives at tier 2, where the
+    # units handed to the synthesiser are read directly.
+    if sum(d for d in durations if d > 5) < 50:
+        problems.append(f"only {sum(durations)}s of audio for a long answer — "
+                        f"less than a single chunk, so nothing was spoken progressively")
     # The PING turn is spoken too — voice is still on, which is the correct
     # behaviour — so its one-second note is not one of this answer's chunks and must
     # not be counted as one. Measured: [47, 93, 78, 1] where 47+93+78 is exactly the
@@ -2179,7 +2232,7 @@ async def feature_voice_progressive(client, bot):
     # that proves the topic was not blocked, and it is checked above.
     if len(chunks) > 1:
         # Progressive delivery: note 2 must not arrive at the same instant as note 1.
-        times = [t - t0 for t, m in seen[mark:] if m.voice]
+        times = [t - t0 for t, m in seen[mark:] if m.voice and not is_full_file(m)]
         print(f"    note arrival times: {[f'{x:.0f}s' for x in times]}")
         if times[-1] - times[0] < 5:
             problems.append("all notes arrived at once — they were not sent as they became ready")
@@ -2241,17 +2294,36 @@ async def feature_voice_index_and_readalong(client, bot):
     await send_and_wait(client, bot, "/voice on")
     mark = len(seen)
     print("  → asking for an answer with real sections")
+    # Two requirements, met separately — see feature_voice_progressive's docstring.
+    # The SECTIONS need audio: enough prose under each heading that the timestamps
+    # land minutes apart and a seek to one is a real jump. The READ-ALONG needs
+    # CHARACTERS: it is only made for an answer that also went out as answer.md/.html,
+    # so the answer has to clear TG_REPLY_FILE_CHARS (6000). Twelve sentences a
+    # section used to supply the audio and still fell short of the characters, which
+    # is why this case asked for five and a half minutes of speech and then failed for
+    # want of a document. The code block closes that gap for two seconds of speech.
     await client.send_message(bot,
         "Reply with ONLY the following, no preamble and no commentary. Three markdown "
         "level-2 headings — 'Why it moved', 'What to watch', 'What to do' — each "
-        "followed by TWELVE sentences of ordinary prose about market liquidity. "
-        "The length matters: it has to be several minutes when read aloud.")
+        "followed by SIX sentences of ordinary prose about market liquidity. Then, at "
+        "the very end, a fenced code block (```) of 100 lines, each exactly "
+        "'const valueN = computeTheThing(alpha, beta, gamma); // step N' with N "
+        "counting up from 1.")
 
-    full = await _until(lambda: next((m for m in seen[mark:] if m.audio), None), 900)
+    full = await _until(lambda: next((m for m in seen[mark:] if is_full_file(m)), None), 600)
     if not full:
         client.remove_event_handler(handler)
         return ("the full voice file is indexed and a read-along page follows", False,
-                "no full-length audio arrived within 900s")
+                "no full-length audio arrived within 600s")
+
+    # Reported, not asserted. The bridge sends the full file with sendAudio precisely
+    # so it arrives as a track — a player with a title, visibly different from the
+    # chunk bubbles — but the server has the last word: measured here, a 128s .ogg
+    # came back as AUDIO and a 71s one as a VOICE note. Failing the case on it would
+    # be failing it for something the bridge does not control, so the run prints what
+    # arrived and the fact stays visible.
+    print(f"    full file delivered as: {'AUDIO track' if full.audio else 'VOICE note'} "
+          f"({audio_seconds(full)}s)")
 
     cap = full.message or ""
     print(f"    caption:\n      " + cap.replace("\n", "\n      "))
@@ -2270,7 +2342,11 @@ async def feature_voice_index_and_readalong(client, bot):
     # The part notes are the other half of the same report: their captions used to
     # read "part 3 — from 5:42", and that seek is relative to a note that begins at
     # 5:42 and therefore has no 5:42 in it. Every tap was dead.
-    for note in [m for m in seen[mark:] if m.voice]:
+    # is_full_file excluded: the full file is ALLOWED its M:SS lines — they are the
+    # section index, the one place a seek goes somewhere. When Telegram delivers it as
+    # a voice note (it does, below about two minutes) it would otherwise be scanned
+    # here and its working index reported as a dead link.
+    for note in [m for m in seen[mark:] if (m.voice or m.audio) and not is_full_file(m)]:
         ncap = note.message or ""
         if re.search(r"\d+:\d\d", ncap):
             problems.append(f"a part note still carries a dead seek link: {ncap!r}")
@@ -2372,10 +2448,13 @@ async def feature_voice_readalong_only_for_long_answers(client, bot):
     # Deliberately under TG_REPLY_FILE_CHARS (6000 by default) and deliberately more
     # than a minute of speech: the two must be allowed to disagree, because the whole
     # bug was treating them as the same question.
+    # Eight sentences, not eighteen: this only has to speak as more than one note to
+    # be the reported shape ("even a 30 seconds voice is giving me read along html"),
+    # and every sentence past that is a minute of synthesis buying nothing.
     await client.send_message(bot,
-        "Reply with ONLY the following, no preamble and no commentary. Eighteen "
+        "Reply with ONLY the following, no preamble and no commentary. Eight "
         "sentences of ordinary prose about how a kettle works. Plain paragraphs, no "
-        "headings, no lists, no code. Keep the whole reply under 2000 characters.")
+        "headings, no lists, no code. Keep the whole reply under 1500 characters.")
 
     note = await _until(lambda: next((m for m in seen[mark:] if m.voice), None), 600)
     if not note:
@@ -2386,11 +2465,11 @@ async def feature_voice_readalong_only_for_long_answers(client, bot):
 
     # Let the whole run finish — the page, if it were still coming, arrives last of
     # all, behind the full file. Waiting only for the note would pass by being early.
-    await _until(lambda: next((m for m in seen[mark:] if m.audio), None), 600)
+    await _until(lambda: next((m for m in seen[mark:] if is_full_file(m)), None), 600)
     await asyncio.sleep(45)
 
     msgs = seen[mark:]
-    notes = [m for m in msgs if m.voice]
+    notes = [m for m in msgs if (m.voice or m.audio) and not is_full_file(m)]
     spoken = sum(audio_seconds(m) for m in notes)
     docs = [m for m in msgs if m.document and not m.voice and not m.audio]
     names = []
@@ -2466,7 +2545,9 @@ async def feature_voice_cancel_and_tidy(client, bot):
         print(f"    notes at cancel: {n_at_cancel}; 45s later: {n_after}")
         if n_after > n_at_cancel:
             problems.append(f"{n_after - n_at_cancel} more notes arrived after cancelling")
-        if any(m.audio for m in seen[mark:]):
+        # Either delivered type: a short full file arrives as a voice note, and
+        # checking only .audio let exactly that case through as a pass.
+        if any(is_full_file(m) for m in seen[mark:]):
             problems.append("the full file was still sent after cancelling")
 
     # --- tidy ---------------------------------------------------------------------
@@ -2479,11 +2560,11 @@ async def feature_voice_cancel_and_tidy(client, bot):
         "Reply with ONLY the following, no preamble: two markdown level-2 headings, "
         "'One' and 'Two', each followed by TEN sentences of ordinary prose about "
         "shipping logistics. The length matters: several minutes when read aloud.")
-    full = await _until(lambda: next((m for m in seen[mark2:] if m.audio), None), 900)
+    full = await _until(lambda: next((m for m in seen[mark2:] if is_full_file(m)), None), 900)
     if not full:
         problems.append("no full file arrived for the tidy case")
     else:
-        notes = [m for m in seen[mark2:] if m.voice]
+        notes = [m for m in seen[mark2:] if (m.voice or m.audio) and not is_full_file(m)]
         tbtn = [b for row in (full.reply_markup.rows if full.reply_markup else []) for b in row.buttons]
         print(f"    {len(notes)} note(s); full file offers: {[b.text for b in tbtn]}")
         if len(notes) < 2:

@@ -2206,6 +2206,38 @@ describe('a long spoken answer can be stopped, indexed and tidied', () => {
     })
   }, 25000)
 
+  test('the chunked path speaks the WHOLE answer — the 1400-char cap is not on it', async () => {
+    // The cap (TG_VOICE_MAX_CHARS, default 1400) is the safety net for summary mode
+    // and for the one-note engines. On the progressive path it must not apply at all,
+    // and a regression here is invisible from the outside: a sliced answer still
+    // synthesises cleanly and just stops early.
+    //
+    // This lives at tier 2 on purpose. Tier 3 used to guard it by asking for an
+    // answer long enough that the missing minutes were obvious, which cost ~10
+    // minutes of real synthesis and STILL only checked a duration floor — a 1400-char
+    // slice is about 117 seconds of speech, comfortably over the floor it used. Here
+    // the units handed to the synthesiser are read directly, so the check is exact
+    // and instant.
+    const dump = join(TMP, 'spoken-units.json')
+    rmSync(dump, { force: true })
+    process.env.XESIOUS_SPEAK_STUB_DUMP = dump
+    try {
+      await withChunking(async () => {
+        await incoming(1443, '/voice on')
+        await incoming(1443, 'CAPLONG')
+        await bridge._drainQueue('1443:main#voice')
+      })
+      const units = JSON.parse(readFileSync(dump, 'utf8')) as { text: string }[]
+      const spoken = units.map(u => u.text).join(' ')
+      expect(spoken.length).toBeGreaterThan(1400)
+      // The end of the answer is the part a cap removes.
+      expect(spoken).toContain('ZZ_LAST_WORDS_OF_THE_ANSWER')
+    } finally {
+      delete process.env.XESIOUS_SPEAK_STUB_DUMP
+      rmSync(dump, { force: true })
+    }
+  }, 25000)
+
   test('the part notes carry NO timestamp, because that seek can never land', async () => {
     // Reported: "you are timestamping the shorter audio messages as well. But
     // clicking on those timestamp does not work." Telegram turns M:SS in a media

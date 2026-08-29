@@ -10,6 +10,11 @@ file, the tidy button and the read-along page.
 XESIOUS_SPEAK_STUB_SLOW: a file whose existence makes each chunk take ~3s, so a test
 can cancel one mid-flight. Not named TG_* because childEnv() strips that prefix
 before spawning, and the marker would never arrive.
+
+XESIOUS_SPEAK_STUB_DUMP: a path to write the units received on stdin to. That is the
+only way to see WHAT the bridge asked to have spoken, as opposed to what came back —
+which is what a truncation test needs, since a sliced answer still synthesises
+perfectly well and sounds fine right up to where it stops.
 """
 import json
 import os
@@ -32,6 +37,10 @@ def main() -> int:
         return 2
     ff = os.environ.get("TG_FFMPEG") or "ffmpeg"
     slow = os.environ.get("XESIOUS_SPEAK_STUB_SLOW")
+    dump = os.environ.get("XESIOUS_SPEAK_STUB_DUMP")
+    if dump:
+        with open(dump, "w", encoding="utf-8") as fh:
+            json.dump(units, fh)
 
     def make(path, seconds=0.4):
         subprocess.run([ff, "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",

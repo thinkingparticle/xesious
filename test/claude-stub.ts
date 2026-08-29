@@ -128,6 +128,16 @@ async function main() {
     result({ result: '## One\n\nA sentence.' })
     return
   }
+  if (scenario === 'CAPLONG') {
+    // Well past the old 1400-character speech cap, with a marker at the very END.
+    // The cap sliced mid-sentence and silently — a truncated answer synthesises
+    // perfectly and sounds fine right up to where it stops — so the only way to see
+    // it is to look at what was HANDED to the synthesiser and check the last words
+    // of the answer are in it.
+    const line = 'The quick brown fox jumps over the lazy dog. '
+    result({ result: line.repeat(90) + '\n\nZZ_LAST_WORDS_OF_THE_ANSWER.' })
+    return
+  }
   if (scenario === 'LONGHEADINGS') {
     // Headed AND past the file threshold, which is the ONLY combination that earns a
     // read-along page: the page is a companion to answer.md/.html, so a structured
