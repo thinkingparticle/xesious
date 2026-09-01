@@ -968,6 +968,60 @@ describe('/bg and running a message alongside instead of behind (D: /bg)', () =>
     expect(ran.length).toBe(1)
   }, 25000)
 
+  test('taking the offer answers WHILE the blocking run is still going', async () => {
+    // The assertion the count-based test above cannot make, and the one the user's
+    // complaint actually is. Under the old guard the promoted run consumed the
+    // skipQueued flag meant for its twin and returned without spawning: zero replies
+    // from the fork, one from the queued turn later — total one, so `runs it once`
+    // stayed green for precisely the behaviour it was written to forbid. For a
+    // feature whose whole value is WHEN something happens, counting how many times it
+    // happened is not a test of it.
+    const run = incoming(1178, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    await inject(1178, 'promote me too', 98401)
+    const before = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 98997,
+      callback_query: { id: 'cb3', from: { id: 1, is_bot: false, first_name: 'T' },
+        chat_instance: 'x', data: 'par:98401',
+        message: { message_id: 98402, date: 0, chat: { id: 1178, type: 'private' } } },
+    })
+    await bridge._drainQueue('1178:main#bg-98401')
+    // Read the answers BEFORE letting the blocking run end. Anything here arrived
+    // alongside it, which is the entire feature.
+    const during = calls.slice(before).filter(c => c.method === 'sendMessage'
+      && String(c.payload.text ?? '').includes('okReply'))
+    expect(during.length).toBe(1)
+    await inject(1178, '/interrupt', 98403)
+    await run
+    await bridge._drainQueue('1178:main')
+  }, 25000)
+
+  test('a promoted run does not steal the topic\'s session binding', async () => {
+    // It forked, so it reports a fresh session id on completion. Persisting that
+    // would silently continue the topic from the parallel job's transcript. The
+    // early binding was already guarded; the completion binding was not — and was
+    // unreachable until the fork above started actually running.
+    await incoming(1179, 'first, to establish a session')
+    const bound = stateNow().sessions['1179:main']?.sessionId
+    expect(bound).toBeTruthy()
+
+    const run = incoming(1179, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    await inject(1179, 'run me alongside', 98501)
+    await bridge.bot.handleUpdate({
+      update_id: 98996,
+      callback_query: { id: 'cb4', from: { id: 1, is_bot: false, first_name: 'T' },
+        chat_instance: 'x', data: 'par:98501',
+        message: { message_id: 98502, date: 0, chat: { id: 1179, type: 'private' } } },
+    })
+    await bridge._drainQueue('1179:main#bg-98501')
+    expect(stateNow().sessions['1179:main']?.sessionId).toBe(bound)
+    await inject(1179, '/interrupt', 98503)
+    await run
+    await bridge._drainQueue('1179:main')
+  }, 30000)
+
   test('a stale offer says so rather than forking a second run', async () => {
     const before = calls.length
     await bridge.bot.handleUpdate({

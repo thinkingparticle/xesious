@@ -87,6 +87,7 @@ thing that broke:
 | `rtl_answer_stays_rich` | A rich message arrives with `.message` empty and its content in `.rich_message`. Nothing else distinguishes rich from MarkdownV2. |
 | `rtl_answer_file_reads_correctly` | Downloads the `.html` Telegram actually delivered and reads what is in it. |
 | `usage_refreshes_in_place` | "Same message id, changed text" is a server-side fact, and Telegram's `message is not modified` rejection is only reachable against the real API. |
+| `run_alongside` / `promoted_run_keeps_the_topics_session` | A real inline-keyboard **tap** is the only thing that produces the callback the promotion runs on — tier 2 hand-builds that update — and the real CLI is the only thing that mints a real forked session id, which tier 2 has to stub. The second case then asks the topic itself whether it remembers what was said inside the fork, which is the harm a state file cannot show. |
 | `sessions_picker` | A callback button is the only in-chat tap that carries a payload back to the bot, so the picker cannot be exercised any other way. |
 
 ## Notes / caveats

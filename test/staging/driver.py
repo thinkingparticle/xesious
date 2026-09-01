@@ -94,6 +94,21 @@ def is_not_yet(text: str) -> bool:
     return "will run after it" in text
 
 
+def is_bg_note(text: str) -> bool:
+    """The bridge's own chatter about a BACKGROUND job — never an answer to the
+    message just sent.
+
+    `🌿 Background task finished.` (bridge.ts:2635) is posted whenever a forked run
+    lands, which is any time after a `/bg` or a promoted `— Run this now —`, and a
+    real `claude` will happily background a long shell command on its own. So it can
+    arrive in the middle of an unrelated later case, and the first-reply collectors
+    would hand it back as that case's answer. That is not hypothetical: it is what
+    made the session-binding case below read an inconclusive reply on its first real
+    run, several cases after the job that produced the note."""
+    t = text.strip()
+    return t.startswith("🌿") or "Background task finished" in t
+
+
 def rich_text(msg) -> str:
     """Flatten a Bot API 10.1 rich message into plain text, or '' if it isn't one.
 
@@ -144,7 +159,7 @@ async def send_and_wait_messages(client, bot, prompt: str):
     @client.on(events.NewMessage(from_users=bot, chats=bot))
     async def handler(ev):
         t = reply_text(ev.message)
-        if is_status(t) or is_not_yet(t):
+        if is_status(t) or is_not_yet(t) or is_bg_note(t):
             return
         msgs.append(ev.message)
         got.set()
@@ -177,7 +192,7 @@ async def send_and_collect(client, bot, prompt: str, settle: float = 8.0):
     async def handler(ev):
         nonlocal last
         t = reply_text(ev.message)
-        if is_status(t) or is_not_yet(t):
+        if is_status(t) or is_not_yet(t) or is_bg_note(t):
             return
         msgs.append(ev.message)
         last = asyncio.get_event_loop().time()
@@ -190,6 +205,35 @@ async def send_and_collect(client, bot, prompt: str, settle: float = 8.0):
             break
     client.remove_event_handler(handler)
     return msgs, sent
+
+
+async def drain(client, bot, quiet: float = 6.0, cap: float = 45.0):
+    """Swallow whatever is still arriving until the DM goes quiet.
+
+    Cases do not end cleanly just because their assertions did: a slow run started by
+    an earlier case can still be finishing, and the real CLI may have backgrounded
+    work that reports minutes later. The first-reply collectors then hand that
+    leftover to the NEXT case as its answer — which is exactly how the session
+    binding case first read `Foreground sleep 313 was blocked by the harness…` as its
+    own reply. Call this before taking a baseline that has to mean something."""
+    seen = []
+    last = asyncio.get_event_loop().time()
+
+    @client.on(events.NewMessage(from_users=bot, chats=bot))
+    async def handler(ev):
+        nonlocal last
+        seen.append(reply_text(ev.message))
+        last = asyncio.get_event_loop().time()
+
+    deadline = asyncio.get_event_loop().time() + cap
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(0.5)
+        if (asyncio.get_event_loop().time() - last) >= quiet:
+            break
+    client.remove_event_handler(handler)
+    if seen:
+        print(f"    (drained {len(seen)} leftover message(s) from earlier cases)")
+    return seen
 
 
 def topic_cwd():
@@ -432,8 +476,11 @@ async def feature_reply_threading(client, bot):
             f"lone={lone_targets}, contended={busy_targets}")
 
 
-def _sleepers(marker: str) -> set:
-    """pids of our own `sleep <marker>` processes, read from /proc."""
+def _procs_matching(marker: str) -> set:
+    """pids of our own processes whose command line carries `marker`, from /proc.
+
+    Substring, not an exact `sleep <marker>` match, because the blocking command is
+    now a loop (see slow_task) and the marker travels inside it."""
     out = set()
     for name in os.listdir("/proc"):
         if not name.isdigit():
@@ -441,11 +488,34 @@ def _sleepers(marker: str) -> set:
         try:
             with open(f"/proc/{name}/cmdline", "rb") as fh:
                 cl = fh.read().replace(b"\0", b" ").decode(errors="ignore")
-            if cl.strip() == f"sleep {marker}":
+            if marker in cl:
                 out.add(int(name))
         except Exception:
             pass
     return out
+
+
+def slow_task(marker: str, seconds: int = 120, word: str = "FIRST") -> str:
+    """A prompt that keeps a run busy in the FOREGROUND for `seconds`.
+
+    It used to be `Using Bash, run exactly: sleep <marker>`, and that quietly stopped
+    working. The CLI's own harness now refuses a standalone foreground sleep — it
+    says so: *"Foreground sleep 313 was blocked by the harness (standalone sleep). I
+    started it in the background instead"* — so the model starts it as a BACKGROUND
+    task and answers within seconds. Two things then go wrong at once for any case
+    about what happens WHILE a run is going: the run is not actually long, and a
+    detached `sleep` process is still on the machine, so a /proc scan cheerfully
+    reports "still running" about something that is no longer the run. That is why
+    feature_run_alongside passed one run and failed the next on identical code — the
+    exact flakiness you do not want on the one test guarding a feature that shipped
+    broken and stayed broken for three weeks.
+
+    A loop is not a standalone sleep, so it is permitted (measured: a 6x2s loop takes
+    20s end to end), and it blocks the tool call for its whole length. The marker is
+    echoed inside it so the loop's own process is findable in /proc."""
+    return (f"Using Bash, run exactly this one command and nothing else: "
+            f"for i in $(seq 1 {max(1, seconds // 2)}); do echo tick-{marker} $i; sleep 2; done "
+            f"— then reply with only the word {word}.")
 
 
 async def feature_interrupt_kills_the_tree(client, bot):
@@ -464,7 +534,7 @@ async def feature_interrupt_kills_the_tree(client, bot):
     whose fate is in question.
     """
     marker = "271"                     # distinctive, so /proc scanning cannot collide
-    before = _sleepers(marker)
+    before = _procs_matching(marker)
     await _show(client, bot, "/mode auto")
     print("  → (a run whose tool call blocks, so it can be interrupted)")
     await client.send_message(bot, f"Using Bash, run exactly: sleep {marker}")
@@ -472,7 +542,7 @@ async def feature_interrupt_kills_the_tree(client, bot):
     pid = None
     for _ in range(60):
         await asyncio.sleep(1)
-        fresh = _sleepers(marker) - before
+        fresh = _procs_matching(marker) - before
         if fresh:
             pid = sorted(fresh)[0]
             break
@@ -524,9 +594,10 @@ async def feature_run_alongside(client, bot):
     second message, assert the offer appears on THAT message, click the button, and
     check the second answer arrives while the first is still running."""
     marker = "313"
+    await drain(client, bot)
     await _show(client, bot, "/mode auto")
     print("  → (start something slow, then send a second message behind it)")
-    await client.send_message(bot, f"Using Bash, run exactly: sleep {marker}")
+    await client.send_message(bot, slow_task(marker, seconds=120, word="FIRST"))
     await asyncio.sleep(8)                      # let the run get going
 
     second = await client.send_message(bot, "Reply with only the word ALONGSIDE.")
@@ -559,16 +630,34 @@ async def feature_run_alongside(client, bot):
             got.append(ev.message)
 
     await offer.click(0)                        # tap it for real
-    for _ in range(45):
+    first_done_yet = None
+    still_running = False
+    for _ in range(90):
         await asyncio.sleep(1)
         if any("ALONGSIDE" in reply_text(m).upper() for m in got):
+            # Both readings taken AT the moment the promoted answer lands, not after.
+            #
+            # The one that decides the case is ORDER: has the first run answered yet?
+            # "Ran alongside" means the second message was answered BEFORE the message
+            # ahead of it — that is the whole feature, stated the way the user states
+            # it. A stopwatch cannot say it (a fast first run makes an ordinary queued
+            # turn look promoted) and neither can a /proc scan, because the CLI may
+            # have detached the blocking command, leaving a process alive that is no
+            # longer the run. The /proc reading is kept as corroboration only.
+            first_done_yet = any("FIRST" in reply_text(m).upper() for m in got)
+            still_running = bool(_procs_matching(marker))
             break
     client.remove_event_handler(handler)
 
     answered = any("ALONGSIDE" in reply_text(m).upper() for m in got)
-    print(f"    second answer arrived while the first run was going: {answered}")
+    print(f"    second answer arrived: {answered}; first run had already answered: "
+          f"{first_done_yet}; its command still in /proc: {still_running}")
     if not answered:
         problems.append("the promoted message was never answered while the first run continued")
+    elif first_done_yet:
+        problems.append("the first run had already answered by the time the promoted one did, "
+                        "so this proves nothing about running alongside — the slow prompt "
+                        "was not slow (check slow_task)")
 
     # The offer message should be gone once taken — it was an aside about a wait.
     still_there = False
@@ -583,6 +672,152 @@ async def feature_run_alongside(client, bot):
     return ("a queued message can be run alongside instead", not problems,
             "; ".join(problems) if problems else
             "offer appeared on the queued message, tapping it answered alongside, and the offer was withdrawn")
+
+
+async def feature_promoted_run_keeps_the_topics_session(client, bot):
+    """Taking `— Run this now —` must not move the topic onto the parallel job's
+    conversation.
+
+    A promoted run forks, so the CLI gives it a NEW session id, and the bridge used
+    to write that id back into the topic when the run finished. The topic then
+    silently continued inside the fork: everything said in the parallel job became
+    part of the conversation, and everything said after the fork point in the topic
+    itself was gone. Never seen in production only because the promoted run never
+    started at all (see feature_run_alongside) — fixing that made this reachable for
+    the first time, which is why the two are tested together.
+
+    Only this tier can settle it. Tier 2 has to STUB --fork-session, so it proves
+    the bridge behaves correctly given an assumption about what the CLI does; here
+    the real CLI mints the real id. And the harm is conversational, not a field in a
+    file: the check that matters is that the topic afterwards does not remember what
+    was said inside the fork. So this asserts both — the persisted id, and the model."""
+    marker = "277"
+    problems = []
+    # Before anything: let the previous case's leftovers land. This case reads a
+    # baseline and then a single one-word answer, and both are worthless if an
+    # earlier run's reply is still in flight.
+    await drain(client, bot)
+    await _show(client, bot, "/mode auto")
+
+    # A turn first, so the topic is bound to a session of its own. Without one there
+    # is no binding to steal and the case would pass vacuously.
+    bound = await _show(client, bot, "Reply with only the word BOUND.")
+    # Check the baseline turn actually answered the baseline question. If an earlier
+    # case's reply is still arriving, this reads it instead — and then every later
+    # assertion here is about the wrong turn. Say so rather than reporting a verdict
+    # on a conversation that was never in a known state.
+    if not any("BOUND" in t.upper() for t in bound):
+        return ("a promoted run keeps the topic's own session", False,
+                f"the DM was not quiet at the start — the baseline turn got {bound}; "
+                "an earlier case is still finishing, so nothing here would mean anything")
+    before = dm_session_id()
+    print(f"    topic session before: {before}")
+    if not before:
+        return ("a promoted run keeps the topic's own session", False,
+                "the DM never got a session id, so there was nothing to steal — check state.json")
+
+    print("  → (start something slow, then promote a second message past it)")
+    await client.send_message(bot, slow_task(marker, seconds=120, word="FIRST"))
+    await asyncio.sleep(8)
+
+    # The codeword goes ONLY into the promoted message. It therefore exists in the
+    # fork's transcript and nowhere else, which is exactly what makes the last
+    # question below able to tell the two conversations apart.
+    #
+    # "do not write it down" is not decoration. The first version said "Remember
+    # this: the codeword is ZEPHYR", and a real model remembers things the way it is
+    # built to — it wrote a memory file, in the operator's REAL ~/.claude (tier 3
+    # does not isolate CLAUDE_CONFIG_DIR the way tier 2 does). That leaks test data
+    # into a live install AND poisons this case: a topic that recalls the codeword
+    # from memory answers ZEPHYR whether or not the binding was stolen, turning the
+    # assertion into a coin flip. The transcript is the only place it may live.
+    second = await client.send_message(
+        bot, "The codeword is ZEPHYR. Reply with only the word PROMOTED. Do not mention "
+             "the codeword, and do not write it to any file, note or memory.")
+    offer = None
+    for _ in range(20):
+        await asyncio.sleep(1)
+        async for m in client.iter_messages(bot, limit=6):
+            if m.reply_markup and getattr(m, "reply_to", None) and \
+               m.reply_to.reply_to_msg_id == second.id:
+                offer = m
+                break
+        if offer:
+            break
+    if not offer:
+        await _show(client, bot, "/stop")
+        return ("a promoted run keeps the topic's own session", False,
+                "no offer appeared, so nothing could be promoted")
+
+    # Watch what the BOT says, not what is in the chat. Scanning iter_messages for
+    # the word matched the prompt that ASKED for it — a message this driver sent —
+    # so the case believed the promoted run had answered a second after tapping, and
+    # then /stop'd the topic while that run was still going. A run stopped before it
+    # completes never reaches the binding line at all, so the whole point of the case
+    # was silently skipped: it passed with the guard deliberately removed.
+    answers = []
+
+    @client.on(events.NewMessage(from_users=bot, chats=bot))
+    async def promoted_handler(ev):
+        t = reply_text(ev.message)
+        if not is_status(t) and not is_not_yet(t) and not is_bg_note(t):
+            answers.append(t)
+
+    await offer.click(0)
+    promoted = False
+    for _ in range(90):
+        await asyncio.sleep(1)
+        if any("PROMOTED" in t.upper() for t in answers):
+            promoted = True
+            break
+    client.remove_event_handler(promoted_handler)
+    print(f"    promoted run answered: {promoted}")
+    if not promoted:
+        # Fail here rather than carrying on. Everything below is about what a
+        # COMPLETED fork wrote, and there is nothing to say about a run that never
+        # finished.
+        await _show(client, bot, "/stop")
+        return ("a promoted run keeps the topic's own session", False,
+                "the promoted run never answered, so it never reached the point where "
+                "it could rebind the topic — nothing was under test")
+
+    await _show(client, bot, "/stop")           # release the slow run
+    # Not a fixed sleep: the codeword question below has to be the only thing in
+    # flight, or its answer is whatever landed first. Wait for the DM to go quiet,
+    # which also gives both runs time to finish writing state.
+    await drain(client, bot, quiet=6.0, cap=60.0)
+
+    after = dm_session_id()
+    print(f"    topic session after:  {after}")
+    if after != before:
+        problems.append(f"the topic was rebound from {before} to {after} — the fork stole it")
+
+    # The half a state file cannot show. Under the theft the topic resumes the
+    # fork's transcript and answers ZEPHYR; bound to its own it has never heard the
+    # word. Asked as one word with an explicit "never" answer so a chatty reply
+    # cannot be read as either.
+    # send_and_collect, not _show: it waits for the whole turn to go quiet and hands
+    # back every message, so a note landing ahead of the answer cannot be mistaken
+    # for it. Reading only the first reply is what made this case inconclusive once
+    # already.
+    msgs, _sent = await send_and_collect(
+        client, bot,
+        "Reply with exactly one word and nothing else. If I have told you a codeword "
+        "in this conversation, reply with that codeword. If I have not, reply NONE.")
+    replies = [reply_text(m) for m in msgs]
+    print(f"    ← {replies}")
+    said = " ".join(replies).upper()
+    if "ZEPHYR" in said:
+        problems.append("the topic remembers the codeword from the parallel job — "
+                        "its conversation is the fork's")
+    elif "NONE" not in said:
+        # Not a pass. A model that answers something else has not shown the topic is
+        # on its own conversation, and calling that green is how this case would rot.
+        problems.append(f"inconclusive answer to the codeword question: {replies}")
+
+    return ("a promoted run keeps the topic's own session", not problems,
+            "; ".join(problems) if problems else
+            f"session stayed {before}, and the topic has never heard the fork's codeword")
 
 
 async def feature_fanout_guard(client, bot):
@@ -1410,6 +1645,16 @@ def bridge_state():
 
 def cwd_of_topic(state, chat_id, thread_id):
     return ((state.get("sessions", {}) or {}).get(f"{chat_id}:{thread_id}") or {}).get("cwd")
+
+
+def dm_session_id():
+    """The session id the bridge has bound to this test account's DM.
+
+    Read from state.json rather than inferred: the binding is the whole subject of
+    the case below, and a directory listing cannot tell you which session a topic
+    is pointed at."""
+    uid = os.environ.get("TEST_ACCOUNT_USER_ID", "")
+    return ((bridge_state().get("sessions", {}) or {}).get(f"{uid}:main") or {}).get("sessionId")
 
 
 def _dirs_under_base():
@@ -2600,6 +2845,9 @@ FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_pro
                  feature_long_answer_is_one_album, feature_rtl_answer_file_reads_correctly,
                  feature_usage_refreshes_in_place,
                  feature_interrupt_kills_the_tree, feature_run_alongside,
+                 # Straight after it: the promoted run only exists once run_alongside
+                 # passes, and stealing the binding is what it does next.
+                 feature_promoted_run_keeps_the_topics_session,
                  feature_files_in_and_out, feature_fork_carries_the_conversation,
                  # After the other DM cases: it rebinds this DM's session to a past one
                  # and puts it back afterwards, so anything running between the two would

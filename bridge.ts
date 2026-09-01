@@ -2472,7 +2472,15 @@ async function maybeSynthesise(ctx: Context, f: Fanout): Promise<void> {
 async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string, replyTo?: number, forceReplyLink = false, background = false, isSynthesis = false): Promise<void> {
   // A message promoted to run in parallel has already been handled; its turn in the
   // queue must do nothing rather than run it a second time.
-  if (replyTo !== undefined && skipQueued.has(replyTo)) { skipQueued.delete(replyTo); return }
+  //
+  // `!background` is load-bearing, and its absence is why the button never once
+  // worked: `par:` sets the flag and then forks the promoted run with the SAME id as
+  // its replyTo, so the promoted run walked into the guard meant for its twin,
+  // consumed the flag and returned before spawning anything — after telling the user
+  // it had started. The guard is only ever about the QUEUED copy, which is always a
+  // foreground turn; scoping it that way also keeps the other background callers that
+  // pass a replyTo (/bg, the fan-out synthesis) out of a guard never aimed at them.
+  if (!background && replyTo !== undefined && skipQueued.has(replyTo)) { skipQueued.delete(replyTo); return }
   if (replyTo !== undefined) {
     // Its turn came up, so the offer is spent. Withdraw the message rather than
     // leaving it in the history: it was an aside about a wait that is now over, and
@@ -2566,7 +2574,24 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     }
     // Still persist on completion: a resumed turn reports the same id, and this
     // refreshes `updated`. Binding already happened above for a fresh session.
-    if (res.sessionId) bindSession(res.sessionId)
+    //
+    //
+    // Never when the run FORKED. `res.sessionId` is then a branch off the topic's
+    // conversation, and writing it back is exactly the theft the fork exists to
+    // prevent: the topic would silently continue from the parallel job's transcript
+    // instead of its own. `onInit` above was already guarded; this half was not, and
+    // until the fix above it was unreachable, because no promoted run ever completed.
+    //
+    // The condition is `forked`, not `background`, and the difference is load-bearing.
+    // `runStreaming` forks only when it also resumes (`fork && resumeId`, the
+    // --fork-session line), so a background run in a topic with no session yet is not
+    // a fork — it is that topic's first conversation. A fan-out part is exactly that
+    // case: it runs with background = true in its OWN topic, and the topic exists to
+    // be steered, which needs the part's session. Guarding on `background` alone
+    // leaves every part topic unbound, so the first correction you type starts from
+    // nothing.
+    const forked = background && resumeId !== undefined
+    if (res.sessionId && !forked) bindSession(res.sessionId)
     if (res.noAnswer) {
       await sendNoAnswer(ctx, threadId, key, prompt, replyLink())
       return
@@ -3642,6 +3667,11 @@ bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
   if (!isAllowed(ctx)) { await ctx.answerCallbackQuery({ text: 'Not authorized.', show_alert: true }).catch(() => {}); return }
   const key = keyFor(ctx.chat!.id, ctx.callbackQuery.message?.message_thread_id)
+  // Every `[in]` line in the log is a message, so a tap used to be invisible: the log
+  // could not tell "the button was never pressed" from "it was pressed and the run
+  // died silently" — the two hypotheses that had to be separated to find the bug
+  // above, which took a diagnosis instead of a glance.
+  console.log(`[cb] ${data} key=${key}`)
   if (data.startsWith('fanc:')) {
     const f = fanouts.get(data.slice(5))
     if (!f) { await ctx.answerCallbackQuery({ text: 'That fan-out is no longer available.', show_alert: true }).catch(() => {}); return }

@@ -55,16 +55,22 @@ const scenario = prompt.trim().split(/\s+/)[0] ?? ''
 const resumeId = val('--resume')
 const model = val('--model')
 const effort = val('--effort')
+const forked = argv.includes('--fork-session')
 // A stable-ish session id derived from the resume arg: a new turn mints one, a
 // resumed turn keeps reporting a session so bridge re-persists it.
-const sessionId = resumeId ?? 'sessTESTAAA'
+//
+// A FORK reports a different one, because that is what the real CLI does and it is
+// the entire point of --fork-session: the run branches off the transcript it
+// resumed. Echoing the parent's id back made every "the fork must not steal the
+// topic's binding" assertion vacuous — the stolen id and the right id were the
+// same string, so the theft was invisible to the tests that existed to catch it.
+const sessionId = forked && resumeId ? `fork-of-${resumeId}` : (resumeId ?? 'sessTESTAAA')
 
 const emit = (o: unknown) => process.stdout.write(JSON.stringify(o) + '\n')
 const initLine = () => emit({ type: 'system', subtype: 'init', session_id: sessionId, model: model ?? 'claude-opus-5[1m]', claude_code_version: '2.1.219' })
 const result = (extra: Record<string, unknown>) =>
   emit({ type: 'result', subtype: 'success', is_error: false, session_id: sessionId, ...extra })
 
-const forked = argv.includes('--fork-session')
 const tag = `${resumeId ? 'hadResume' : 'noResume'} ${model ? 'modelSet' : 'modelDefault'} ${framed ? 'framed' : 'unframed'} ${effort ? 'effort' + effort : 'effortDefault'} ${forked ? 'forked' : 'notForked'} ${carriedBg ? 'sawBgResult' : 'noBgResult'}`
 
 async function main() {
