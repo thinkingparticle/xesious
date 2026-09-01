@@ -1022,6 +1022,44 @@ describe('/bg and running a message alongside instead of behind (D: /bg)', () =>
     await bridge._drainQueue('1179:main')
   }, 30000)
 
+  test('taking the offer does not announce itself as a finished background task', async () => {
+    // The banner exists to close /bg's promise to "report back", after a gap in
+    // which the topic has moved on. A promoted turn has no such gap: the tap was
+    // seconds ago, the toast already said it was starting, and the answer quotes the
+    // question. Reported as "it feels unnecessary".
+    const run = incoming(1182, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    await inject(1182, 'no banner for me', 98601)
+    const before = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 98995,
+      callback_query: { id: 'cb5', from: { id: 1, is_bot: false, first_name: 'T' },
+        chat_instance: 'x', data: 'par:98601',
+        message: { message_id: 98602, date: 0, chat: { id: 1182, type: 'private' } } },
+    })
+    await bridge._drainQueue('1182:main#bg-98601')
+    const said = calls.slice(before).filter(c => c.method === 'sendMessage')
+      .map(c => String(c.payload.text ?? ''))
+    // The answer still lands — this suppresses the banner, not the reply.
+    expect(said.some(t => t.includes('okReply'))).toBe(true)
+    expect(said.some(t => t.includes('Background task finished'))).toBe(false)
+    await inject(1182, '/interrupt', 98603)
+    await run
+    await bridge._drainQueue('1182:main')
+  }, 25000)
+
+  test('/bg keeps the banner, because it promised to report back', async () => {
+    // The other side of the same rule. Dropping it here would leave "carry on here,
+    // I will report back" unanswered.
+    const before = calls.length
+    await incoming(1183, '/bg go and look something up')
+    await bridge._drainQueue('1183:main#bg-' + (updateId + 5000 - 1)).catch(() => {})
+    await new Promise(r => setTimeout(r, 800))
+    const said = calls.slice(before).filter(c => c.method === 'sendMessage')
+      .map(c => String(c.payload.text ?? ''))
+    expect(said.some(t => t.includes('Background task finished'))).toBe(true)
+  }, 15000)
+
   test('a stale offer says so rather than forking a second run', async () => {
     const before = calls.length
     await bridge.bot.handleUpdate({
@@ -1047,6 +1085,36 @@ describe('a finished background job is carried into the next turn', () => {
     const cs = await incoming(1180, 'so what did you find?')
     expect(finalReply(cs)).toContain('sawBgResult')
   }, 20000)
+
+  test('a PROMOTED job is carried into the next turn too, banner or no banner', async () => {
+    // The carry-over and the banner used to be one `if`, so suppressing the banner
+    // for a promoted turn could silently take this with it. It must not: a promoted
+    // run forks exactly like /bg does, so the topic's own conversation never sees it
+    // and the next turn would have no idea the question was ever answered.
+    await incoming(1184, 'establish the session')
+    const run = incoming(1184, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    await bridge.bot.handleUpdate({
+      update_id: 98994,
+      message: { message_id: 98701, date: 0, chat: { id: 1184, type: 'private', first_name: 'T' },
+                 from: { id: 1, is_bot: false, first_name: 'T' }, text: 'promote and remember me' },
+    })
+    await bridge.bot.handleUpdate({
+      update_id: 98993,
+      callback_query: { id: 'cb6', from: { id: 1, is_bot: false, first_name: 'T' },
+        chat_instance: 'x', data: 'par:98701',
+        message: { message_id: 98702, date: 0, chat: { id: 1184, type: 'private' } } },
+    })
+    await bridge._drainQueue('1184:main#bg-98701')
+    await bridge.bot.handleUpdate({
+      update_id: 98992,
+      message: { message_id: 98703, date: 0, chat: { id: 1184, type: 'private', first_name: 'T' },
+                 from: { id: 1, is_bot: false, first_name: 'T' }, text: '/interrupt' },
+    })
+    await run
+    await bridge._drainQueue('1184:main')
+    expect(finalReply(await incoming(1184, 'so what did that turn up?'))).toContain('sawBgResult')
+  }, 30000)
 
   test('an ordinary turn with no background history carries nothing', async () => {
     expect(finalReply(await incoming(1181, 'just a question'))).toContain('noBgResult')

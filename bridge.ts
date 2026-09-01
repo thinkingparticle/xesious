@@ -2252,7 +2252,7 @@ async function startFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): Pr
   // how a correction could vanish. Sharing the queue makes a correction what it
   // looks like: the next turn.
   child.jobKey = key
-  void enqueue(key, () => handlePrompt(ctx, topicId, key, brief, undefined, undefined, false, true))
+  void enqueue(key, () => handlePrompt(ctx, topicId, key, brief, undefined, undefined, { background: true }))
     .then(() => finishFanoutChild(ctx, f, child))
     .catch(e => { console.error(`[fanout ${f.id}] part ${child.n}: ${e}`); child.status = 'failed'; void maybeSynthesise(ctx, f) })
   await intro
@@ -2463,13 +2463,37 @@ async function maybeSynthesise(ctx: Context, f: Fanout): Promise<void> {
   const preamble = buildSynthesisPreamble(f.task, parts)
   const key = f.parentKey
   void enqueue(`${key}#fanout-synth-${f.id}`,
-    () => handlePrompt(ctx, f.parentThreadId, key, preamble, undefined, f.askedBy, true, true, true))
+    () => handlePrompt(ctx, f.parentThreadId, key, preamble, undefined, f.askedBy, { forceReplyLink: true, background: true, isSynthesis: true }))
     .then(() => cleanupFanout(ctx, f))
     .then(() => disposeFanoutTopics(ctx, f))
     .catch(e => console.error(`[fanout ${f.id}] synthesis: ${e}`))
 }
 
-async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string, replyTo?: number, forceReplyLink = false, background = false, isSynthesis = false): Promise<void> {
+// What KIND of turn this is. Named rather than four trailing booleans, because
+// they had become unreadable at the call sites and that is not cosmetic: `/bg` and
+// the `— Run this now —` promotion both read `..., undefined, id, true, true)`,
+// byte-identical, and the bug that hid in there for three weeks was one of those
+// positions meaning something different from what it looked like.
+type PromptKind = {
+  // Quote the question even when the topic is calm enough that needsReplyLink
+  // would not bother.
+  forceReplyLink?: boolean
+  // Runs off the topic's serial queue, and FORKS, so it gets its own session id
+  // rather than interleaving with the topic's conversation.
+  background?: boolean
+  // The run that writes a fan-out's combined answer. It IS the answer.
+  isSynthesis?: boolean
+  // A message pushed past the queue by `— Run this now —`. Background, but the
+  // user is sitting there waiting for it — unlike /bg, which they detached.
+  promoted?: boolean
+}
+async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string, replyTo?: number, kind: PromptKind = {}): Promise<void> {
+  // Renamed off `promoted` on the way in, because `promoteBlock`'s result already
+  // owns that name further down this function. Left as-is it SHADOWED this flag, so
+  // the banner check below read a mid-turn text block where it meant a kind of turn
+  // — and silently, since a string is a fine thing to negate. Caught by its own test,
+  // which is the only reason it is not still in here.
+  const { forceReplyLink = false, background = false, isSynthesis = false, promoted: promotedTurn = false } = kind
   // A message promoted to run in parallel has already been handled; its turn in the
   // queue must do nothing rather than run it a second time.
   //
@@ -2600,8 +2624,8 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     // the user never saw, deliver the substantive block before it as well. The
     // rest of the turn's text is in the run record above, so this is an
     // enhancement rather than the mechanism: a miss costs a tap, not a message.
-    const promoted = promoteBlock(res.blocks ?? [], res.text)
-    if (promoted) await deliver(ctx, threadId, promoted, replyLink())
+    const promotedBlock = promoteBlock(res.blocks ?? [], res.text)
+    if (promotedBlock) await deliver(ctx, threadId, promotedBlock, replyLink())
     // A background result arrives long after it was asked for, with anything in
     // between, so it always quotes its question and says what it is.
     const link = background ? replyTo : replyLink()
@@ -2628,10 +2652,27 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
         }
       }
     }
-    // A fan-out's synthesis IS the answer and needs no banner announcing itself. An
-    // ordinary /bg result does: it arrives long after it was asked for.
-    if (background && !owner && !isSynthesis) {
-      noteBgResult(key, res.text)
+    // A forked run is a dead end: the topic's own conversation never sees it, so
+    // without this the next turn has no idea the job happened. Carried for every
+    // detached job, promoted or not — the fan-out cases are excluded because their
+    // results reach the topic by their own routes (a part binds its own session; a
+    // synthesis IS the topic's answer).
+    if (background && !owner && !isSynthesis) noteBgResult(key, res.text)
+    // The BANNER is a narrower question than carrying the result, and its own
+    // precondition is written above: a /bg result "arrives long after it was asked
+    // for". That is what it is for — closing the promise /bg makes when it says
+    // "carry on here, I will report back", after a gap in which the topic has moved
+    // on and an old answer is easy to misread as a new one. It is silent by design,
+    // so it costs scrollback rather than a notification.
+    //
+    // None of that holds for a promoted turn. You tapped a button seconds ago and
+    // are watching for the answer; nothing promised to report back; and a background
+    // answer always quotes its question (`link` is replyTo unconditionally, bypassing
+    // needsReplyLink), so the one signal the banner adds is the one already there.
+    // Reported as exactly that: "it feels unnecessary… I can know it is the answer by
+    // the reply response". This is the third case that does not fit the premise, after
+    // the fan-out part and the synthesis.
+    if (background && !owner && !isSynthesis && !promotedTurn) {
       await send(ctx, threadId, `🌿 Background task finished.`, true, link)
     }
     const answerId = await deliver(ctx, threadId, res.text, link)
@@ -3421,7 +3462,7 @@ bot.on('message', async ctx => {
     // quietly steal the topic's binding.
     await send(ctx, threadId, '🌿 Running that in the background — carry on here, I will report back.', true, msg.message_id)
     void enqueue(`${key}#bg-${msg.message_id}`,
-      () => handlePrompt(ctx, threadId, key, task, undefined, msg.message_id, true, true))
+      () => handlePrompt(ctx, threadId, key, task, undefined, msg.message_id, { forceReplyLink: true, background: true }))
       .catch(e => console.error(`[error] bg ${key}: ${e}`))
     return
   }
@@ -3752,7 +3793,7 @@ bot.on('callback_query:data', async ctx => {
     if (rec.offerMsgId) await ctx.api.deleteMessage(ctx.chat!.id, rec.offerMsgId).catch(() => {})
     else await ctx.editMessageReplyMarkup(undefined).catch(() => {})
     void enqueue(`${rec.key}#bg-${id}`,
-      () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, id, true, true))
+      () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, id, { forceReplyLink: true, background: true, promoted: true }))
       .catch(e => console.error(`[error] parallel ${rec.key}: ${e}`))
     return
   }
@@ -3770,7 +3811,7 @@ bot.on('callback_query:data', async ctx => {
     retryPrompts.delete(data.slice(6))
     await ctx.answerCallbackQuery({ text: 'Retrying…' }).catch(() => {})
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})   // one tap only
-    void enqueue(rec.key, () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, rec.replyTo, true))
+    void enqueue(rec.key, () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, rec.replyTo, { forceReplyLink: true }))
       .catch(e => console.error(`[error] retry ${rec.key}: ${e}`))
     return
   }

@@ -701,12 +701,17 @@ async def feature_promoted_run_keeps_the_topics_session(client, bot):
 
     # A turn first, so the topic is bound to a session of its own. Without one there
     # is no binding to steal and the case would pass vacuously.
-    bound = await _show(client, bot, "Reply with only the word BOUND.")
+    # Arithmetic, deliberately, and not "reply with only the word BOUND". That word
+    # went into the topic's own transcript as a word it was TOLD TO SAY, which is
+    # close enough to a codeword that the closing question below could honestly be
+    # answered with it — and once was. The baseline has to leave nothing in the
+    # transcript that competes with ZEPHYR for the word "codeword".
+    bound = await _show(client, bot, "Reply with only the digit that is two plus two.")
     # Check the baseline turn actually answered the baseline question. If an earlier
     # case's reply is still arriving, this reads it instead — and then every later
     # assertion here is about the wrong turn. Say so rather than reporting a verdict
     # on a conversation that was never in a known state.
-    if not any("BOUND" in t.upper() for t in bound):
+    if not any("4" in t for t in bound):
         return ("a promoted run keeps the topic's own session", False,
                 f"the DM was not quiet at the start — the baseline turn got {bound}; "
                 "an earlier case is still finishing, so nothing here would mean anything")
@@ -755,11 +760,12 @@ async def feature_promoted_run_keeps_the_topics_session(client, bot):
     # then /stop'd the topic while that run was still going. A run stopped before it
     # completes never reaches the binding line at all, so the whole point of the case
     # was silently skipped: it passed with the guard deliberately removed.
-    answers = []
+    answers, raw = [], []
 
     @client.on(events.NewMessage(from_users=bot, chats=bot))
     async def promoted_handler(ev):
         t = reply_text(ev.message)
+        raw.append(t)
         if not is_status(t) and not is_not_yet(t) and not is_bg_note(t):
             answers.append(t)
 
@@ -780,6 +786,16 @@ async def feature_promoted_run_keeps_the_topics_session(client, bot):
         return ("a promoted run keeps the topic's own session", False,
                 "the promoted run never answered, so it never reached the point where "
                 "it could rebind the topic — nothing was under test")
+
+    # A rider, not a case of its own: the promotion is already set up here, so this
+    # costs nothing. The `\U0001F33F Background task finished.` banner closes the promise
+    # /bg makes when it says it will report back; a promoted turn made no such promise,
+    # and the user is watching for an answer that quotes their question anyway. `raw` is
+    # read rather than `answers` because the collectors filter that banner out by
+    # design — asserting on the filtered list would pass whether or not it was sent.
+    if any(is_bg_note(t) for t in raw):
+        problems.append("the promoted turn announced itself as a finished background "
+                        "task; that banner is /bg's, and there was no gap to explain")
 
     await _show(client, bot, "/stop")           # release the slow run
     # Not a fixed sleep: the codeword question below has to be the only thing in
@@ -802,8 +818,9 @@ async def feature_promoted_run_keeps_the_topics_session(client, bot):
     # already.
     msgs, _sent = await send_and_collect(
         client, bot,
-        "Reply with exactly one word and nothing else. If I have told you a codeword "
-        "in this conversation, reply with that codeword. If I have not, reply NONE.")
+        "Have I told you a codeword in this conversation, using the exact phrase "
+        "\"the codeword is\"? Reply with exactly one word and nothing else: that "
+        "codeword if I have, or NONE if I have not.")
     replies = [reply_text(m) for m in msgs]
     print(f"    ← {replies}")
     said = " ".join(replies).upper()
