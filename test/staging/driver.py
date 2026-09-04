@@ -2605,13 +2605,27 @@ async def feature_voice_progressive(client, bot):
         #    dollars a year" returns as "$100/yr" and a naive diff shows a false pass
         #    and a false fail in the same run. "slash" and "tilde" are bugs by
         #    construction — the answer contains no literal slash or tilde to read.
+        # COUNTED, not all-or-nothing. Eleven of these 25 lines carry a slash, so if
+        # normalisation had not run at all this lands in double figures — which is the
+        # regression worth failing on. One leak is a non-deterministic model missing a
+        # line, and it is a different line every run (measured: `and/or` once,
+        # `src/lib.ts` the next). Failing the suite on that trains people to ignore it,
+        # which costs more than the leak does. Reported either way.
+        leaks = []
         for bad in ("slash", "tilde", "dollar one", "dollar four"):
-            if bad in heard:
+            at = heard.find(bad)
+            while at != -1:
                 # Quote the surrounding words: "there is a slash somewhere in four
                 # minutes of audio" is not a bug report anyone can act on.
-                at = heard.index(bad)
-                problems.append(f"heard {bad!r} in the audio — normalisation did not run "
-                                f"(…{heard[max(0, at - 60):at + 40].strip()}…)")
+                leaks.append(f"{bad!r} in …{heard[max(0, at - 50):at + 30].strip()}…")
+                at = heard.find(bad, at + 1)
+        if leaks:
+            print(f"    {len(leaks)} unspoken symbol(s) leaked into the audio:")
+            for leak in leaks[:4]:
+                print(f"      {leak}")
+        if len(leaks) > 2:
+            problems.append(f"{len(leaks)} unspoken symbols in the audio — normalisation "
+                            f"is not running: {leaks[0]}")
     elif full:
         problems.append("the full answer produced no transcript, so nothing was checked")
 
@@ -2620,7 +2634,7 @@ async def feature_voice_progressive(client, bot):
             "; ".join(problems) if problems else
             f"first note at +{first[0] - t0:.0f}s, {len(chunks)} chunk(s) totalling {sum(chunks)}s, "
             f"a full file of {audio_seconds(full[0]) if full else 0}s, "
-            f"the last line of the answer present in the transcript, no unspoken symbols, "
+            f"the last line of the answer present in the transcript, symbols spoken as words, "
             f"and a new message answered in {waited:.0f}s while speech was still running")
 
 

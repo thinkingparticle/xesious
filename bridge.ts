@@ -260,7 +260,26 @@ const VOICE_TIDY = /^(1|true|yes)$/i.test(process.env.TG_VOICE_TIDY || '')
 // A read-along page embeds its audio as a data: URI to stay self-contained, so its
 // size grows with the answer. Past this it is skipped rather than silently producing
 // a page tens of megabytes wide.
-const READALONG_MAX_MIN = Math.max(0, Number(process.env.TG_VOICE_READALONG_MAX_MIN || 20))
+// How long an answer may be and still get a read-along page.
+//
+// This was a flat 20 minutes, and it fired SILENTLY on exactly the answers the page
+// is most useful for — reported after a five-transcript answer arrived with its
+// audio, its answer.md and its answer.html, and no page, the only trace being one
+// line in bridge.log that you would have to ssh in to find.
+//
+// Twenty minutes was a guess, not a measurement, and it was nowhere near what
+// actually breaks. The page embeds the .ogg as a base64 data: URI, so its size is
+// what matters, and the hard limit on that is what Telegram will accept from a bot:
+// TG_UPLOAD_LIMIT, 50 MB on the cloud API and 2000 MB with a local one. At speak.py's
+// 32 kbps opus that is ~240 KB of audio per minute, ~320 KB per minute once base64
+// has added its third — so the cloud cap is about 156 minutes of speech, not 20.
+//
+// Derived rather than hardcoded so a local Bot API server lifts it automatically.
+// 0 still means "no read-along at all", which is the only thing this knob used to
+// be able to express clearly.
+const READALONG_BYTES_PER_MIN = 320 * 1024
+const READALONG_MAX_MIN = Math.max(0, Number(
+  process.env.TG_VOICE_READALONG_MAX_MIN || Math.floor(TG_UPLOAD_LIMIT / READALONG_BYTES_PER_MIN)))
 
 // Importing existing Claude Code sessions (the ones the IDE/CLI session picker
 // shows) as topics. A directory's sessions live at CLAUDE_PROJECTS/<encoded>/<id>.jsonl.
@@ -2312,14 +2331,29 @@ async function sendReadAlong(ctx: Context, threadId: number | undefined, key: st
   // get a page, so a thirty-second reply came with a document to open — the page is
   // for following a long answer, and a short one is just clutter with an attachment.
   if (!task.withFiles) return
-  if (seconds > READALONG_MAX_MIN * 60) {
-    console.log(`[voice] read-along skipped: ${Math.round(seconds)}s over the ${READALONG_MAX_MIN}min cap`)
+  // Measured, not projected from the duration: the .ogg on disk is the thing that
+  // becomes the page, and base64 adds a known third. Checking the real file also
+  // means the page is never BUILT when it could not be sent — base64-ing 40 MB of
+  // audio into a string first, only to throw it away, is the sort of thing that
+  // takes a small VPS down.
+  const oggBytes = statSync(oggPath).size
+  const pageBytes = Math.ceil(oggBytes * 4 / 3) + 64 * 1024      // + the page around it
+  const tooLong = seconds > READALONG_MAX_MIN * 60
+  const tooBig = pageBytes > TG_UPLOAD_LIMIT
+  if (tooLong || tooBig) {
+    // SAID, not just logged. Three of the four ways this function can produce
+    // nothing are decisions the user would accept instantly if told — "26 minutes,
+    // the page would have been 9 MB" is a fine answer; silence is not, and from a
+    // phone it is indistinguishable from the feature being broken.
+    const why = tooBig
+      ? `it would be ${(pageBytes / 1024 / 1024).toFixed(0)} MB, over the ${Math.round(TG_UPLOAD_LIMIT / 1024 / 1024)} MB Telegram accepts`
+      : `${fmtDurationWords(seconds)} is over the ${READALONG_MAX_MIN} minute cap`
+    console.log(`[voice] read-along skipped: ${why}`)
+    await send(ctx, threadId, `📖 No read-along page for this one — ${why}. The full audio and the answer files above have everything.`, true, replyTo)
     return
   }
   const dir = mkdtempSync(join(tmpdir(), 'tg-read-'))
   try {
-    // base64 costs about a third over the .ogg; the cap above is what keeps that
-    // from becoming a page tens of megabytes wide.
     const uri = `data:audio/ogg;base64,${readFileSync(oggPath).toString('base64')}`
     const file = join(dir, 'answer-readalong.html')
     writeFileSync(file, readAlongHtml('Answer', units, timings, uri))
