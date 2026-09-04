@@ -2360,6 +2360,80 @@ describe('a long spoken answer can be stopped, indexed and tidied', () => {
     }
   }, 25000)
 
+  test('the synthesiser is given the spoken form and the reader is given the original', async () => {
+    // The whole point of the `speak` field. `$100/yr` is phonemised as "dollar one
+    // hundred slash er", so the audio needs "one hundred dollars per year" — but the
+    // read-along page and the section index are BEING READ, and there `$100/yr` is the
+    // better rendering. Two fields, three consumers, and only one of them wants the
+    // spoken form.
+    const dump = join(TMP, 'spoken-units-norm.json')
+    rmSync(dump, { force: true })
+    process.env.XESIOUS_SPEAK_STUB_DUMP = dump
+    try {
+      await withChunking(async () => {
+        await incoming(1444, '/voice on')
+        await incoming(1444, 'SYMBOLS')
+        await bridge._drainQueue('1444:main#voice')
+      })
+      const units = JSON.parse(readFileSync(dump, 'utf8')) as { text: string; speak?: string }[]
+      expect(units.length).toBeGreaterThan(0)
+      // Every unit here carries a symbol, so every unit should have been normalised.
+      const normalised = units.filter(u => u.speak?.startsWith('SPOKEN('))
+      expect(normalised.length).toBe(units.length)
+      // …and the written form is untouched, which is what the page and index read.
+      expect(units.every(u => u.text.includes('$100/yr'))).toBe(true)
+      expect(units.some(u => u.text.startsWith('SPOKEN('))).toBe(false)
+    } finally {
+      delete process.env.XESIOUS_SPEAK_STUB_DUMP
+      rmSync(dump, { force: true })
+    }
+  }, 30000)
+
+  test('a unit with nothing to fix is never sent to the model', async () => {
+    // The gate is what keeps this affordable: on a real answer 61 of 100 units matched
+    // and the other 39 cost nothing. A unit that skips the model must still be spoken,
+    // which means `speak` stays absent and speak.py falls back to `text`.
+    const dump = join(TMP, 'spoken-units-gate.json')
+    rmSync(dump, { force: true })
+    process.env.XESIOUS_SPEAK_STUB_DUMP = dump
+    try {
+      await withChunking(async () => {
+        await incoming(1445, '/voice on')
+        await incoming(1445, 'HEADINGS')
+        await bridge._drainQueue('1445:main#voice')
+      })
+      const units = JSON.parse(readFileSync(dump, 'utf8')) as { text: string; speak?: string }[]
+      expect(units.length).toBeGreaterThan(0)
+      expect(units.every(u => u.speak === undefined)).toBe(true)
+    } finally {
+      delete process.env.XESIOUS_SPEAK_STUB_DUMP
+      rmSync(dump, { force: true })
+    }
+  }, 25000)
+
+  test('TG_VOICE_NORMALISE=0 restores exactly the old audio', async () => {
+    // The kill switch has to be real: off means no `speak` field at all, so speak.py
+    // takes the same path it took before any of this existed.
+    const dump = join(TMP, 'spoken-units-off.json')
+    rmSync(dump, { force: true })
+    process.env.XESIOUS_SPEAK_STUB_DUMP = dump
+    const prev = bridge._setNormaliseSpeech(false)
+    try {
+      await withChunking(async () => {
+        await incoming(1446, '/voice on')
+        await incoming(1446, 'SYMBOLS')
+        await bridge._drainQueue('1446:main#voice')
+      })
+      const units = JSON.parse(readFileSync(dump, 'utf8')) as { text: string; speak?: string }[]
+      expect(units.length).toBeGreaterThan(0)
+      expect(units.every(u => u.speak === undefined)).toBe(true)
+    } finally {
+      bridge._setNormaliseSpeech(prev)
+      delete process.env.XESIOUS_SPEAK_STUB_DUMP
+      rmSync(dump, { force: true })
+    }
+  }, 30000)
+
   test('the part notes carry NO timestamp, because that seek can never land', async () => {
     // Reported: "you are timestamping the shorter audio messages as well. But
     // clicking on those timestamp does not work." Telegram turns M:SS in a media

@@ -25,7 +25,7 @@ import { apiThrottler } from '@grammyjs/transformer-throttler'
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, renameSync, mkdtempSync, rmSync, copyFileSync, readlinkSync, openSync, readSync, closeSync } from 'node:fs'
 import { dirname, join, isAbsolute, basename, extname, resolve, relative } from 'node:path'
-import { homedir, tmpdir } from 'node:os'
+import { homedir, tmpdir, freemem as osFreemem } from 'node:os'
 import { randomUUID, createHash } from 'node:crypto'
 import {
   parseIdList, keyFor, sanitize, encodeCwd, parseDirs,
@@ -35,6 +35,7 @@ import {
   markdownToHtml, htmlDocument, previewCut, transcriptSpeech, lastEffortFrom, needsReplyLink,
   speechUnits, speechChunkSeconds, SPEAKERS, SPEAKER_PAGE, SPEAKER_DEFAULT, kokoroLang, isSpeakerId, speakerLabel,
   speechToc, fullAudioCaption, readAlongHtml, fmtDurationWords, type SpeechUnit, type UnitTiming,
+  needsSpeechNormalising,
   fanoutPlanPrompt, parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble,
   FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName, filesPreamble,
   type FanoutPlanItem,
@@ -1722,6 +1723,146 @@ function summarizeForSpeech(answer: string): Promise<string> {
   })
 }
 
+// ---------------------------------------------------------------------------
+// speech normalisation
+// ---------------------------------------------------------------------------
+//
+// `$100/yr` is phonemised as "dollar one hundred slash er". Measured through the real
+// phonemiser, so is `5-10` ("five dash ten"), `2x` ("two ex"), `~5` ("tilde five") and
+// `src/lib.ts` read as its punctuation. Nothing normalises the text before espeak sees
+// it: kokoro_onnx's own normalize_text is, in full, `return text.strip()`.
+//
+// Rule tables and WFST grammars were both tried against a real 18.5k-character answer
+// from this bridge. Every one of them fixed the dollar sign and broke something else —
+// "one dollars", "$1.2B" -> "one dollars and twenty cents bytes", `2x faster` ->
+// "two times degrees Fahrenheit aster", `1,000` -> "thousand". A fast model got every
+// case right, lost none of the 134 proper nouns in the sample, and is what ships here.
+//
+// Off by TG_VOICE_NORMALISE=0, which restores exactly today's audio.
+let NORMALISE_SPEECH = (process.env.TG_VOICE_NORMALISE ?? '1') !== '0'
+const NORMALISE_MODEL = process.env.TG_VOICE_NORMALISE_MODEL || VOICE_SUMMARY_MODEL
+const NORMALISE_TIMEOUT_MS = Number(process.env.TG_VOICE_NORMALISE_TIMEOUT_MS || 60_000)
+
+// Same unit, same audio — and cheap on a re-speak.
+//
+// The model is NOT deterministic: the same sentence came back as "line 674" on one run
+// and "line six hundred seventy-four" on the next. Without this, replaying an answer
+// would sound different from the first time it was read, which reads as a glitch.
+// In-memory only, so a restart re-earns it; capped because an unbounded map on a
+// long-lived process is a leak with extra steps.
+const normCache = new Map<string, string>()
+const NORM_CACHE_MAX = 2000
+
+// How many normalisation calls to run at once, decided from the machine rather than
+// from a number someone has to tune.
+//
+// Measured: one `claude -p` call peaks at ~260 MB RSS. Half of what is AVAILABLE right
+// now (not total, and not free — MemAvailable is the one that accounts for reclaimable
+// cache) divided by a 300 MB allowance, so a 1 GB VPS lands on 1 and a large box lands
+// on the cap. Read per answer rather than at boot: the box is also synthesising, and
+// what it can spare changes.
+//
+// Capped at 8 because these are network-bound, not CPU-bound — past that the wall time
+// stops improving and only the rate-limit risk grows.
+function normaliseConcurrency(): number {
+  let availMb = 0
+  try {
+    const m = readFileSync('/proc/meminfo', 'utf8').match(/^MemAvailable:\s+(\d+) kB/m)
+    if (m) availMb = Number(m[1]) / 1024
+  } catch {}
+  // Not Linux, or /proc unreadable: os.freemem understates on Linux (it excludes
+  // reclaimable cache) but it is the honest fallback everywhere else.
+  if (!availMb) availMb = osFreemem() / 1024 / 1024
+  return Math.max(1, Math.min(8, Math.floor((availMb * 0.5) / 300)))
+}
+
+const NORMALISE_PROMPT = [
+  'Rewrite the line below so a speech synthesiser reads it aloud correctly.',
+  'Output ONLY the rewritten line. No preamble, no quotes, no explanation.',
+  '',
+  'Rules:',
+  '- Currency in spoken order with correct plural: $100 -> one hundred dollars, $1 -> one dollar,',
+  '  $1.2B -> one point two billion dollars, $40/bbl -> forty dollars a barrel.',
+  '- Ranges: 5-10 -> five to ten.',
+  '- Units as words: km/h -> kilometres per hour, mb/d -> million barrels a day, T/yr -> trillion a year.',
+  '- ~5 -> about five. 2x -> two times. #8 -> number eight. 50% -> fifty percent.',
+  '- A file path or identifier: say the name, not the punctuation.',
+  '- Dates: 2026-06-15 -> the fifteenth of June twenty twenty-six.',
+  '- Leave ordinary prose EXACTLY as written. Never summarise, shorten, reword or add anything.',
+  '  Every fact, name and number in the input must still be present in the output.',
+  '- If nothing needs changing, output the line unchanged.',
+  '',
+  'LINE:',
+].join('\n')
+
+// One unit in, one spoken unit out. Never throws: every failure path returns the
+// original, so the worst case is exactly the audio this bridge produces today.
+function normaliseUnit(text: string): Promise<string> {
+  const hit = normCache.get(text)
+  if (hit !== undefined) return Promise.resolve(hit)
+  return new Promise<string>(resolve => {
+    const args = ['-p', `${NORMALISE_PROMPT}\n${text}`, '--output-format', 'json',
+                  '--model', NORMALISE_MODEL, '--permission-mode', 'plan']
+    // cwd: HERE and no --resume, for the reason summarizeForSpeech gives: a stateless
+    // pass must not be able to touch or rebind the topic's session.
+    const child = spawn(CLAUDE_BIN, args, { cwd: HERE, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    let settled = false
+    const done = (v: string) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (v && v !== text) {
+        if (normCache.size >= NORM_CACHE_MAX) normCache.delete(normCache.keys().next().value as string)
+        normCache.set(text, v)
+      }
+      resolve(v || text)
+    }
+    const timer = setTimeout(() => { try { child.kill('SIGKILL') } catch {} ; done(text) }, NORMALISE_TIMEOUT_MS)
+    child.stdout.on('data', d => (out += d))
+    child.on('error', () => done(text))
+    child.on('close', () => {
+      let v = ''
+      try { v = String(JSON.parse(out).result ?? '').trim() } catch {}
+      // A model that decided to explain itself, refuse, or write an essay is not
+      // giving us a spoken line. Length is the cheap tell and it costs a unit, never
+      // the answer: anything suspicious falls back to the written form.
+      if (v.includes('\n') || v.length > text.length * 3 + 80) v = ''
+      done(v)
+    })
+  })
+}
+
+// Annotate units in place with what the synthesiser should say. Resolves when the
+// FIRST `upTo` units are done, so synthesis can start on them while the tail is still
+// being normalised — chunk one is what the wait for the first note is made of.
+// The returned promise settles the rest.
+function normaliseUnits(units: SpeechUnit[], upTo: number): { lead: Promise<void>; rest: Promise<void> } {
+  if (!NORMALISE_SPEECH) return { lead: Promise.resolve(), rest: Promise.resolve() }
+  const todo = units.map((u, i) => i).filter(i => needsSpeechNormalising(units[i].text))
+  const width = normaliseConcurrency()
+  let next = 0
+  let leadLeft = todo.filter(i => i < upTo).length
+  let resolveLead: () => void
+  const lead = new Promise<void>(r => { resolveLead = r })
+  if (!leadLeft) resolveLead!()
+  const worker = async () => {
+    for (;;) {
+      const k = next++
+      if (k >= todo.length) return
+      const i = todo[k]
+      units[i].speak = await normaliseUnit(units[i].text)
+      if (i < upTo && --leadLeft === 0) resolveLead!()
+    }
+  }
+  // The lead units are first in `todo` because it is built in order, so the workers
+  // reach them before anything else and the lead promise settles as early as it can.
+  const rest = Promise.all(Array.from({ length: Math.min(width, todo.length) }, worker))
+    .then(() => { if (leadLeft > 0) resolveLead!() })
+  console.log(`[voice] normalising ${todo.length}/${units.length} units, ${width} at a time`)
+  return { lead, rest }
+}
+
 // What the box can actually do, asked rather than assumed.
 //
 // The reported failure: /voice on, then a message, and the answer came back as text
@@ -1880,9 +2021,30 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
   const task: SpeechTask = { id: newJobId(), key, dir, chunkIds: [], cancelled: false, withFiles: answerGoesToFile(text) }
   speechTasks.set(task.id, task)
   speechByTopic.set(key, task.id)
-  const req = JSON.stringify({ units, outdir: dir, chunks: [0, 1, 2].map(speechChunkSeconds) })
+  // Only the units the FIRST chunk needs are waited for; the rest are streamed in as
+  // they finish. Estimated from characters because the real boundary is decided by
+  // duration inside speak.py, and that is not knowable until the audio exists —
+  // measured at ~12.6 spoken characters per second on this voice, so a 45s chunk is
+  // about 570 characters. Erring long only costs a little of the head start.
+  const leadChars = speechChunkSeconds(0) * 13
+  let lead = 0, acc = 0
+  while (lead < units.length && acc < leadChars) acc += units[lead++].text.length
+  const { lead: leadReady, rest: restReady } = normaliseUnits(units, lead)
+  await leadReady
+  const req = JSON.stringify({ units: units.slice(0, lead), outdir: dir,
+                               chunks: [0, 1, 2].map(speechChunkSeconds), streaming: true })
   return new Promise<boolean>(resolve => {
     const child = spawn('python3', [SPEAK_PY], { env: voiceEnv(key), stdio: ['pipe', 'pipe', 'pipe'] })
+    // The tail follows once its units are annotated. Written after the spawn so the
+    // synthesiser is already working on the lead while this is still waiting.
+    void restReady.then(() => {
+      if (child.killed || !child.stdin.writable) return
+      try {
+        if (lead < units.length) child.stdin.write(JSON.stringify({ units: units.slice(lead) }) + '\n')
+        child.stdin.write(JSON.stringify({ end: true }) + '\n')
+        child.stdin.end()
+      } catch {}
+    }).catch(() => { try { child.stdin.end() } catch {} })
     task.child = child
     let err = '', buf = ''
     let n = 0
@@ -2016,7 +2178,7 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
         resolve(task.cancelled || (code === 0 && n > 0))
       })
     })
-    child.stdin.write(req); child.stdin.end()
+    child.stdin.write(req + '\n')
   })
 }
 
@@ -4176,6 +4338,14 @@ export const _speakers = () => speakers
 export const _listing = { make: newListing, text: listingText, kb: listingKb }
 export const _listSessions = listSessions
 export const _maybeSynthesise = maybeSynthesise
+
+// The kill switch, flippable from a test: an env read at import time cannot be
+// exercised in-process, and a switch no test ever throws is a switch nobody knows works.
+export function _setNormaliseSpeech(on: boolean): boolean {
+  const was = NORMALISE_SPEECH
+  NORMALISE_SPEECH = on
+  return was
+}
 
 export function _drainQueue(key: string): Promise<unknown> { return queues.get(key) ?? Promise.resolve() }
 

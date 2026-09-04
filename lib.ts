@@ -751,7 +751,49 @@ export function speechChunkSeconds(index: number): number {
 // the synthesiser nothing knew which utterance had been a heading, so the only
 // timestamp the full file could print was its own total duration — a seek link
 // pointing at the last second of the audio.
-export type SpeechUnit = { text: string; gap: number; kind: SpeechBlock['kind'] }
+// `speak` is what the SYNTHESISER is given; `text` is what the READER is given.
+//
+// They are two fields rather than one rewritten string because three things consume
+// this array and only one of them wants the spoken form: speak.py reads `speak`, and
+// the section index (speechToc) and the read-along page (readAlongHtml) read `text`.
+// A page that says "one hundred dollars per year" where the answer said `$100/yr` is
+// worse to read, and the whole reason the answer goes out as a file is to be read.
+//
+// It is also what makes normalisation unable to damage the answer. The array is built
+// first and only annotated afterwards, so a normaliser cannot merge two units, split a
+// bullet run across lines, or drop a section — measured failures, all three, when the
+// same model was handed whole blocks of text and asked to preserve their structure.
+// Timings are one per unit, so the count staying fixed is not a nicety: the index and
+// the page both index into it.
+export type SpeechUnit = { text: string; gap: number; kind: SpeechBlock['kind']; speak?: string }
+
+// Does this unit contain anything a phonemiser is known to get wrong?
+//
+// The gate exists to make normalisation cheap, not to be exhaustive: on a real 100-unit
+// answer 61 units matched and the other 39 — "The headline numbers.", "How he invests."
+// — skipped the model entirely. A miss costs nothing, because an ungated unit is spoken
+// exactly the way it is spoken today.
+//
+// Deliberately does NOT match what espeak already gets right. Measured through the real
+// phonemiser: `50%` -> "fifty percent", `1,000` -> "one thousand", the Unicode maths
+// signs, and `v1.2.3` are all correct already. The pattern is that espeak knows the
+// Unicode symbols and does not know ASCII shorthand — so `%` is here only when bare
+// digits precede it, and the arrows and comparison signs are absent on purpose.
+export function needsSpeechNormalising(text: string): boolean {
+  return SPEECH_ODDITY.test(text)
+}
+const SPEECH_ODDITY = new RegExp([
+  '[$£€]\\s?\\d',                 // money, the reported case
+  '\\d\\s?%',                     // percentages next to digits
+  '[A-Za-z0-9]/[A-Za-z0-9]',      // per, or, path, fraction — four words, one symbol
+  '~\\s?\\d',                     // "about"
+  '\\d\\s?[-\u2013\u2014]\\s?\\d',        // ranges, incl. the en dash espeak drops silently
+  '\\d+(?:\\.\\d+)?x\\b',         // multipliers
+  '#\\d',                         // "number"
+  '\\d{4}-\\d{2}-\\d{2}',         // ISO dates
+  '\\d[.,]\\d{3}\\b',             // thousands separators
+  '\\d\\s?[KMB]\\b',              // magnitudes
+].join('|'))
 
 // Sentence-granular units, which is what makes progressive delivery work at all.
 // Chunks can only be closed on a unit boundary, so a block-granular list means one

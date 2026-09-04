@@ -29,8 +29,25 @@ def emit(o):
 
 
 def main() -> int:
-    req = json.loads(sys.stdin.read())
-    units = req.get("units") or []
+    # Line-delimited, mirroring speak.py: the first line is the request, and with
+    # {"streaming": true} the caller appends more {"units":[...]} lines and closes with
+    # {"end": true}. The stub has to speak the same protocol or it stops being able to
+    # express the thing under test — a stub that cannot see the difference turns the
+    # test guarding it into a no-op.
+    req = json.loads(sys.stdin.readline())
+    units = list(req.get("units") or [])
+    if req.get("streaming"):
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            if msg.get("end"):
+                break
+            units.extend(msg.get("units") or [])
     single = req.get("out")
     outdir = req.get("outdir") or (os.path.dirname(single) if single else ".")
     if not units:

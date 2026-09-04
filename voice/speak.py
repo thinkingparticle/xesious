@@ -39,8 +39,10 @@ Env: TG_KOKORO_MODEL / TG_KOKORO_VOICES / TG_KOKORO_VOICE / TG_KOKORO_SPEED /
 """
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -66,8 +68,19 @@ def find_ffmpeg():
 
 
 def main() -> int:
+    # Line-delimited on the way in, the way it already is on the way out. The first
+    # line is the whole request; with {"streaming": true} the caller may then append
+    # more {"units":[...]} lines and close with {"end": true}.
+    #
+    # That exists so synthesis can START while later units are still being normalised.
+    # Normalising a unit costs about as long as speaking it, so waiting for all of them
+    # would put a minute of silence in front of the first note — and the first note
+    # arriving in ~30s is the entire reason this file streams at all.
+    #
+    # readline, not read(): a non-streaming caller sends one line and closes, which
+    # readline returns whole, so tts.sh and every existing caller are unaffected.
     try:
-        req = json.loads(sys.stdin.read())
+        req = json.loads(sys.stdin.readline())
     except Exception as e:
         sys.stderr.write(f"speak.py: bad request ({e})\n")
         return 2
@@ -137,8 +150,44 @@ def main() -> int:
         sent += dur
         pending = []
 
-    for b in units:
-        text = (b.get("text") or "").strip()
+    def unit_stream():
+        """The initial units, then whatever the caller appends."""
+        for b in units:
+            yield b
+        if not req.get("streaming"):
+            return
+        q = queue.Queue()
+
+        def reader():
+            try:
+                for line in sys.stdin:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except Exception:
+                        continue          # a torn line must not end the answer
+                    if msg.get("end"):
+                        break
+                    for u in msg.get("units") or []:
+                        q.put(u)
+            finally:
+                q.put(None)               # in a finally: a reader that dies must not hang the synthesiser
+
+        threading.Thread(target=reader, daemon=True).start()
+        while True:
+            u = q.get()
+            if u is None:
+                return
+            yield u
+
+    for b in unit_stream():
+        # `speak` is the spoken rendering, `text` is what the reader is shown. They
+        # differ deliberately: the page and the section index quote the answer as
+        # written, and only the synthesiser is given "one hundred dollars per year".
+        # Absent (any older caller, or normalisation turned off) means speak the text.
+        text = (b.get("speak") or b.get("text") or "").strip()
         if not text:
             continue
         try:

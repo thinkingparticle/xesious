@@ -74,6 +74,20 @@ const result = (extra: Record<string, unknown>) =>
 const tag = `${resumeId ? 'hadResume' : 'noResume'} ${model ? 'modelSet' : 'modelDefault'} ${framed ? 'framed' : 'unframed'} ${effort ? 'effort' + effort : 'effortDefault'} ${forked ? 'forked' : 'notForked'} ${carriedBg ? 'sawBgResult' : 'noBgResult'}`
 
 async function main() {
+  // BEFORE initLine, because this call uses --output-format json and the caller does
+  // a plain JSON.parse of the whole output. An init line ahead of it makes the parse
+  // throw, the bridge falls back to the written text, and the test passes for the one
+  // reason it must not: the path under test never ran.
+  // The speech normaliser: one line in, one spoken line out. Deterministic, and
+  // deliberately NOT a real normalisation — the assertion that matters is that the
+  // synthesiser was handed `speak` while the page and index kept `text`, and a marker
+  // proves that where a plausible rewrite could be mistaken for the original.
+  if (/Rewrite the line below so a speech synthesiser/.test(rawPrompt)) {
+    const line = rawPrompt.split('\nLINE:\n')[1] ?? ''
+    result({ result: `SPOKEN(${line.trim()})` })
+    return
+  }
+
   initLine()
 
   if (scenario === 'HANG') {
@@ -132,6 +146,13 @@ async function main() {
     // Two headings but few enough units that the stub makes ONE chunk, which is the
     // case with no full file to hang an index or a read-along off.
     result({ result: '## One\n\nA sentence.' })
+    return
+  }
+  if (scenario === 'SYMBOLS') {
+    // Long enough to be chunked, and every sentence carries something the phonemiser
+    // is known to mangle, so the gate must select all of them.
+    const line = (i: number) => `Item ${i} cost $100/yr, about 2x the ~5 day estimate.`
+    result({ result: Array.from({ length: 12 }, (_, i) => line(i + 1)).join('\n\n') })
     return
   }
   if (scenario === 'CAPLONG') {
