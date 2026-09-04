@@ -2384,6 +2384,13 @@ async def feature_voice_progressive(client, bot):
     time. Tier 2 stubs the engine and proves the plumbing; only here do the notes
     actually arrive one after another while the topic keeps answering.
 
+    IT IS ALSO THE EAR TEST. Its 20 prose lines carry the symbols the phonemiser gets
+    wrong — currency, ranges, units, multipliers, paths, dates — so the notes it
+    produces are what you listen to when checking that speech normalisation is doing
+    its job. Nothing here asserts on their content, so that cannot make the case
+    flaky; it only means its output is worth hearing rather than being twenty
+    identical sentences about a fox.
+
     ON ITS LENGTH. This used to ask for 150 spoken lines and took about ten minutes,
     because two unrelated requirements were being met by the same string: the answer
     had to exceed TG_REPLY_FILE_CHARS (6000) to take the FILE-GROUP path, and it had
@@ -2426,11 +2433,51 @@ async def feature_voice_progressive(client, bot):
     # real threshold while costing no synthesis. The 20 prose lines are the part that
     # is actually read aloud: about 90 seconds, enough for the 45s first chunk to
     # close and a second to follow, which is what "progressive" means here.
+    # The 20 prose lines used to be "The quick brown fox jumps over the lazy dog."
+    # twenty times — which exercised the timing and nothing else. They now carry the
+    # symbols the phonemiser is known to mangle, one or two per line, so that this
+    # case's audio is also the thing you listen to when checking that normalisation
+    # is doing its job. Nothing here asserts on their CONTENT (the assertions are
+    # about arrival, count and duration), so this cannot make the case flaky — it
+    # just means the notes it produces are worth hearing.
+    #
+    # Every line is drawn from the measured failure table: `$100/yr` was phonemised
+    # "dollar one hundred slash er", `5-10` as "five dash ten", `2x` as "two ex",
+    # `~5` as "tilde five", and an en dash was dropped SILENTLY. Kept to roughly the
+    # length of the old fox line so the audio still runs past the 45s first chunk.
+    lines = [
+        "The pilot cost $100/yr, up from $1 last quarter.",
+        "Revenue hit $1.2B while the fund managed US$1.5M.",
+        "Crude settled near $40/bbl on thin volume today.",
+        "The job takes 5-10 minutes, sometimes 5\u201310 hours.",
+        "The rig cruised at 90 km/h for the whole run.",
+        "Output held at 2 mb/d against 30 T/yr of demand.",
+        "The switch reads on and/or off, but never N/A.",
+        "We ran it 24/7 and finished 3/4 of the queue.",
+        "That is 2x faster and 0.79x the old memory use.",
+        "Roughly ~5 engineers reviewed pull request #8.",
+        "Coverage climbed to 50% across 1,000 test cases.",
+        "The release landed on 2026-08-29 without incident.",
+        "Check src/lib.ts and lib.ts:674 for the exact fix.",
+        "Latency fell ~15% while throughput rose 2.5x again.",
+        "The invoice totalled \u00a3250 and \u20ac300 in extra fees.",
+        "Storage grew from 2GB/s to 8GB/s under real load.",
+        "He signed w/ a red pen and filed it under N/A.",
+        "Margins of 17-19% beat the 12% forecast easily.",
+        "The contract runs 2026-01-01 to 2026-12-31 inclusive.",
+        "Ship it at ~$40 per seat, or 2x that for teams.",
+        "The window opens 14:30 and closes 16:45 sharp.",
+        "Version v1.2.3 shipped to 1/4 of the fleet first.",
+        "Throughput reached 12,500 req/s at the 99th pct.",
+        "The delta was -5% against a +9,000% lira return.",
+    ]
+    numbered = " ".join(f"{i}. {t}" for i, t in enumerate(lines, 1))
     await client.send_message(bot,
-        "Reply with ONLY the following, no preamble and no commentary. First a "
-        "numbered list of 20 lines, each exactly "
-        "'N. The quick brown fox jumps over the lazy dog.' with N counting up from 1. "
-        "Then a fenced code block (```) of 100 lines, each exactly "
+        "Reply with ONLY the following, no preamble and no commentary. First these 24 "
+        "numbered lines, reproduced EXACTLY as written, character for character, one "
+        "per line — do not correct, expand, reformat or renumber anything: "
+        + numbered +
+        " Then a fenced code block (```) of 100 lines, each exactly "
         "'const valueN = computeTheThing(alpha, beta, gamma); // step N' with N "
         "counting up from 1.")
 

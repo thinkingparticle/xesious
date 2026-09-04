@@ -4338,6 +4338,7 @@ export const _speakers = () => speakers
 export const _listing = { make: newListing, text: listingText, kb: listingKb }
 export const _listSessions = listSessions
 export const _maybeSynthesise = maybeSynthesise
+export const _normaliseUnits = normaliseUnits
 
 // The kill switch, flippable from a test: an env read at import time cannot be
 // exercised in-process, and a switch no test ever throws is a switch nobody knows works.
