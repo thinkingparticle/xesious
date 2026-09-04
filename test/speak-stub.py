@@ -31,11 +31,11 @@ def emit(o):
 def main() -> int:
     # Line-delimited, mirroring speak.py: the first line is the request, and with
     # {"streaming": true} the caller appends more {"units":[...]} lines and closes with
-    # {"end": true}. The stub has to speak the same protocol or it stops being able to
-    # express the thing under test — a stub that cannot see the difference turns the
-    # test guarding it into a no-op.
+    # {"end": true}. The stub must speak the same protocol or it cannot see the thing
+    # under test — and the thing under test is whether the tail arrives at all.
     req = json.loads(sys.stdin.readline())
     units = list(req.get("units") or [])
+    saw_end = False
     if req.get("streaming"):
         for line in sys.stdin:
             line = line.strip()
@@ -46,8 +46,12 @@ def main() -> int:
             except Exception:
                 continue
             if msg.get("end"):
+                saw_end = True
                 break
             units.extend(msg.get("units") or [])
+        # Recorded in the dump so a test can assert the caller finished properly rather
+        # than merely closing the pipe — the difference between those two is the bug.
+        req["saw_end"] = saw_end
     single = req.get("out")
     outdir = req.get("outdir") or (os.path.dirname(single) if single else ".")
     if not units:
@@ -58,6 +62,11 @@ def main() -> int:
     if dump:
         with open(dump, "w", encoding="utf-8") as fh:
             json.dump(units, fh)
+        # The request beside the units, so a test can assert on HOW the answer was
+        # handed over and not only on what arrived. Whether the streamed path was used
+        # at all is the difference the kill switch is supposed to make.
+        with open(dump.replace(".json", "-req.json"), "w", encoding="utf-8") as fh:
+            json.dump({k: v for k, v in req.items() if k != "units"}, fh)
 
     def make(path, seconds=0.4):
         subprocess.run([ff, "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",

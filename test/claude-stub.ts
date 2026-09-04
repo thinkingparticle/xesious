@@ -148,6 +148,24 @@ async function main() {
     result({ result: '## One\n\nA sentence.' })
     return
   }
+  if (scenario === 'MIXED') {
+    // THE PRODUCTION DIAGONAL, and the one combination no test covered when a user
+    // lost 70% of an answer: some units need normalising and some do not, and the
+    // answer is long enough that most of it arrives AFTER the first chunk's worth.
+    //
+    // CAPLONG had nothing to normalise, so the normaliser never ran; SYMBOLS had
+    // everything to normalise, so `lead` covered every unit and there was no tail.
+    // Each missed this from the opposite side. Here the first two sentences carry the
+    // symbols and everything after them is plain prose in the tail.
+    // Separate paragraphs, not one run of sentences: speechUnits batches sentences
+    // into runs, so a single block collapses to a handful of units and there is no
+    // tail left to lose — which would make this test pass for the wrong reason.
+    const head = ['The pilot cost $100/yr, up from $1.', 'It ran 5-10 days at 2x speed.']
+    const body = Array.from({ length: 24 },
+      (_, i) => `Paragraph ${i + 1} is ordinary prose that needs no rewriting at all.`)
+    result({ result: [...head, ...body, 'ZZ_LAST_WORDS_OF_THE_ANSWER.'].join('\n\n') })
+    return
+  }
   if (scenario === 'SYMBOLS') {
     // Long enough to be chunked, and every sentence carries something the phonemiser
     // is known to mangle, so the gate must select all of them.

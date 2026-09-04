@@ -2470,10 +2470,15 @@ async def feature_voice_progressive(client, bot):
         "Version v1.2.3 shipped to 1/4 of the fleet first.",
         "Throughput reached 12,500 req/s at the 99th pct.",
         "The delta was -5% against a +9,000% lira return.",
+        # LAST, and deliberately odd. The whole answer is checked by transcribing the
+        # finished audio and looking for this word: a truncated reading loses the end
+        # and keeps the beginning, so only the end can tell you it was complete.
+        # "zebra" survives a whisper pass intact and appears nowhere else.
+        "In closing, the zebra crosses the road last.",
     ]
     numbered = " ".join(f"{i}. {t}" for i, t in enumerate(lines, 1))
     await client.send_message(bot,
-        "Reply with ONLY the following, no preamble and no commentary. First these 24 "
+        "Reply with ONLY the following, no preamble and no commentary. First these 25 "
         "numbered lines, reproduced EXACTLY as written, character for character, one "
         "per line — do not correct, expand, reformat or renumber anything: "
         + numbered +
@@ -2570,11 +2575,52 @@ async def feature_voice_progressive(client, bot):
     if not docs:
         problems.append("the answer was not long enough to become a file — the production case was not exercised")
 
+    # --- the answer was spoken IN FULL, and spoken for the ear -------------------
+    #
+    # Only this tier can ask either question, because both are about the audio that
+    # actually came out. Reported 2026-09-04: a 218-second answer arrived as 46
+    # seconds labelled "Full answer", ending on a heading. Every existing assertion
+    # passed — chunks arrived, the file was threaded, the duration cleared its floor,
+    # the exit code was 0. Nothing looked at what was IN the audio.
+    heard = ""
+    if full:
+        path = os.path.join(os.environ.get("TG_SESSIONS_BASE", "/tmp"), "voice-full.ogg")
+        try:
+            await client.download_media(full[0], file=path)
+            stt = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))), "voice", "stt.py")
+            out = subprocess.run([sys.executable, stt, path],
+                                 capture_output=True, text=True, timeout=600)
+            heard = (out.stdout or "").lower()
+        except Exception as e:                                   # noqa: BLE001
+            problems.append(f"could not transcribe the full answer: {e}")
+    if heard:
+        print(f"    transcript: {len(heard)} chars, ends {heard.strip()[-60:]!r}")
+        # 1. COMPLETENESS. The last line of the answer must be in the audio.
+        if "zebra" not in heard:
+            problems.append("the last line of the answer is not in the full audio — "
+                            "it was cut short, exactly as reported")
+        # 2. NORMALISATION. Assert on the words that must NOT be there rather than on
+        #    equality: whisper renders spoken numbers back as digits, so "one hundred
+        #    dollars a year" returns as "$100/yr" and a naive diff shows a false pass
+        #    and a false fail in the same run. "slash" and "tilde" are bugs by
+        #    construction — the answer contains no literal slash or tilde to read.
+        for bad in ("slash", "tilde", "dollar one", "dollar four"):
+            if bad in heard:
+                # Quote the surrounding words: "there is a slash somewhere in four
+                # minutes of audio" is not a bug report anyone can act on.
+                at = heard.index(bad)
+                problems.append(f"heard {bad!r} in the audio — normalisation did not run "
+                                f"(…{heard[max(0, at - 60):at + 40].strip()}…)")
+    elif full:
+        problems.append("the full answer produced no transcript, so nothing was checked")
+
     await send_and_wait(client, bot, "/voice off")
     return ("a long answer is spoken progressively without blocking the topic", not problems,
             "; ".join(problems) if problems else
             f"first note at +{first[0] - t0:.0f}s, {len(chunks)} chunk(s) totalling {sum(chunks)}s, "
             f"a full file of {audio_seconds(full[0]) if full else 0}s, "
+            f"the last line of the answer present in the transcript, no unspoken symbols, "
             f"and a new message answered in {waited:.0f}s while speech was still running")
 
 

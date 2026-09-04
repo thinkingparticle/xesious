@@ -995,6 +995,10 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     // (as tests use) would otherwise never be checked before the deadline.
     }, Math.max(250, Math.min(10_000, Math.floor(IDLE_TIMEOUT_MS / 4))))
     child.stderr.on('data', d => (err += d))
+    // setEncoding, so a multi-byte character split across two reads is not corrupted:
+    // without it each chunk is decoded on its own and a path or title outside ASCII
+    // comes back mangled.
+    child.stdout.setEncoding('utf8')
     child.stdout.on('data', d => {
       buf += d
       let nl: number
@@ -1742,6 +1746,11 @@ function summarizeForSpeech(answer: string): Promise<string> {
 let NORMALISE_SPEECH = (process.env.TG_VOICE_NORMALISE ?? '1') !== '0'
 const NORMALISE_MODEL = process.env.TG_VOICE_NORMALISE_MODEL || VOICE_SUMMARY_MODEL
 const NORMALISE_TIMEOUT_MS = Number(process.env.TG_VOICE_NORMALISE_TIMEOUT_MS || 60_000)
+// How long the tail of an answer may wait to be normalised before it is spoken as
+// written. Generous, because exceeding it means worse pronunciation for those units —
+// while never reaching it would mean an answer that stops halfway, which is the bug
+// this whole path is atoning for. A long answer measured 152s.
+const NORMALISE_TAIL_MS = Number(process.env.TG_VOICE_NORMALISE_TAIL_MS || 300_000)
 
 // Same unit, same audio — and cheap on a re-speak.
 //
@@ -1790,6 +1799,10 @@ const NORMALISE_PROMPT = [
   '- Dates: 2026-06-15 -> the fifteenth of June twenty twenty-six.',
   '- Leave ordinary prose EXACTLY as written. Never summarise, shorten, reword or add anything.',
   '  Every fact, name and number in the input must still be present in the output.',
+  '- NEVER output the words: slash, backslash, tilde, underscore, asterisk, caret, hash,',
+  '  or "dollar" before a number. They are how the synthesiser fails, not how anyone reads.',
+  '  Say what the symbol MEANS instead — and/or is "and or", km/h is "kilometres per hour",',
+  '  src/lib.ts is "lib dot t s" — or drop it if it means nothing aloud.',
   '- If nothing needs changing, output the line unchanged.',
   '',
   'LINE:',
@@ -1806,6 +1819,14 @@ function normaliseUnit(text: string): Promise<string> {
     // cwd: HERE and no --resume, for the reason summarizeForSpeech gives: a stateless
     // pass must not be able to touch or rebind the topic's session.
     const child = spawn(CLAUDE_BIN, args, { cwd: HERE, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    child.stdout.setEncoding('utf8')
+    // DRAINED, not ignored. A pipe nobody reads fills at 64 KB and then blocks the
+    // writer forever — so a child that decided to be chatty on stderr would hang here
+    // until the 60s SIGKILL below, turning the fast path into a minute of silence for
+    // that unit. Kept only as a tail, for the log line if it exits badly.
+    let errTail = ''
+    child.stderr.setEncoding('utf8')
+    child.stderr.on('data', d => { errTail = (errTail + d).slice(-500) })
     let out = ''
     let settled = false
     const done = (v: string) => {
@@ -1823,7 +1844,9 @@ function normaliseUnit(text: string): Promise<string> {
     child.on('error', () => done(text))
     child.on('close', () => {
       let v = ''
-      try { v = String(JSON.parse(out).result ?? '').trim() } catch {}
+      try { v = String(JSON.parse(out).result ?? '').trim() } catch {
+        if (errTail.trim()) console.error(`[voice] normaliser: ${errTail.trim()}`)
+      }
       // A model that decided to explain itself, refuse, or write an essay is not
       // giving us a spoken line. Length is the cheap tell and it costs a unit, never
       // the answer: anything suspicious falls back to the written form.
@@ -1833,34 +1856,42 @@ function normaliseUnit(text: string): Promise<string> {
   })
 }
 
-// Annotate units in place with what the synthesiser should say. Resolves when the
-// FIRST `upTo` units are done, so synthesis can start on them while the tail is still
-// being normalised — chunk one is what the wait for the first note is made of.
-// The returned promise settles the rest.
-function normaliseUnits(units: SpeechUnit[], upTo: number): { lead: Promise<void>; rest: Promise<void> } {
-  if (!NORMALISE_SPEECH) return { lead: Promise.resolve(), rest: Promise.resolve() }
+// Annotate units in place with what the synthesiser should say.
+//
+// Two promises, because the caller does not need the whole answer to start speaking:
+// `lead` settles once the first `upTo` units are decided, `all` once every one is.
+// Measured on a long answer — 100 units, 61 of them needing the model, 8 at a time —
+// that is 19s to the first note instead of 152s. On a short one the two settle
+// together and the split costs nothing.
+//
+// NEITHER promise ever rejects. This stage is an enhancement whose fallback is the
+// text as written, so a failure here must degrade the audio, never withhold it — and
+// a rejection reaching the caller is precisely how 70% of an answer was once dropped.
+function normaliseUnits(units: SpeechUnit[], upTo: number): { lead: Promise<void>; all: Promise<void> } {
+  if (!NORMALISE_SPEECH) return { lead: Promise.resolve(), all: Promise.resolve() }
   const todo = units.map((u, i) => i).filter(i => needsSpeechNormalising(units[i].text))
+  if (!todo.length) return { lead: Promise.resolve(), all: Promise.resolve() }
   const width = normaliseConcurrency()
   let next = 0
   let leadLeft = todo.filter(i => i < upTo).length
-  let resolveLead: () => void
+  let resolveLead!: () => void
   const lead = new Promise<void>(r => { resolveLead = r })
-  if (!leadLeft) resolveLead!()
+  if (!leadLeft) resolveLead()
   const worker = async () => {
     for (;;) {
       const k = next++
       if (k >= todo.length) return
       const i = todo[k]
-      units[i].speak = await normaliseUnit(units[i].text)
-      if (i < upTo && --leadLeft === 0) resolveLead!()
+      try { units[i].speak = await normaliseUnit(units[i].text) } catch { /* speak the text */ }
+      if (i < upTo && --leadLeft === 0) resolveLead()
     }
   }
-  // The lead units are first in `todo` because it is built in order, so the workers
-  // reach them before anything else and the lead promise settles as early as it can.
-  const rest = Promise.all(Array.from({ length: Math.min(width, todo.length) }, worker))
-    .then(() => { if (leadLeft > 0) resolveLead!() })
   console.log(`[voice] normalising ${todo.length}/${units.length} units, ${width} at a time`)
-  return { lead, rest }
+  // `todo` is in order, so the workers reach the lead units first and `lead` settles
+  // as early as it can. resolveLead again at the end in case none of them were gated.
+  const all = Promise.all(Array.from({ length: Math.min(width, todo.length) }, worker))
+    .then(() => { resolveLead() }, e => { console.error(`[voice] normalise: ${e}`); resolveLead() })
+  return { lead, all }
 }
 
 // What the box can actually do, asked rather than assumed.
@@ -2021,30 +2052,36 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
   const task: SpeechTask = { id: newJobId(), key, dir, chunkIds: [], cancelled: false, withFiles: answerGoesToFile(text) }
   speechTasks.set(task.id, task)
   speechByTopic.set(key, task.id)
-  // Only the units the FIRST chunk needs are waited for; the rest are streamed in as
-  // they finish. Estimated from characters because the real boundary is decided by
-  // duration inside speak.py, and that is not knowable until the audio exists —
-  // measured at ~12.6 spoken characters per second on this voice, so a 45s chunk is
-  // about 570 characters. Erring long only costs a little of the head start.
+  // Only the units the FIRST chunk needs are waited for; the rest follow as soon as
+  // they are ready. Estimated from characters because the real boundary is decided by
+  // duration inside speak.py and is not knowable until the audio exists — measured at
+  // ~12.6 spoken characters per second, so a 45s chunk is about 570 characters.
+  //
+  // This is what keeps the first note ~19s away on a long answer instead of ~152s.
+  // Its first version also lost a user 70% of an answer, by making the tail write
+  // conditional on the normaliser succeeding; see sendTail below, which cannot be
+  // skipped. `expect` rides along so the far side can say whether it got everything.
+  //
+  // With normalisation OFF there is nothing to wait for, so there is no reason to
+  // hand the answer over in two parts — everything goes in one write and the streamed
+  // path is not entered at all. That is what makes TG_VOICE_NORMALISE=0 a real kill
+  // switch: it restores the exact code path this bridge used before any of this
+  // existed, rather than merely skipping the model while keeping the new plumbing.
   const leadChars = speechChunkSeconds(0) * 13
   let lead = 0, acc = 0
-  while (lead < units.length && acc < leadChars) acc += units[lead++].text.length
-  const { lead: leadReady, rest: restReady } = normaliseUnits(units, lead)
+  if (NORMALISE_SPEECH) {
+    while (lead < units.length && acc < leadChars) acc += units[lead++].text.length
+  } else {
+    lead = units.length
+  }
+  const { lead: leadReady, all: allReady } = normaliseUnits(units, lead)
   await leadReady
-  const req = JSON.stringify({ units: units.slice(0, lead), outdir: dir,
-                               chunks: [0, 1, 2].map(speechChunkSeconds), streaming: true })
+  const streaming = lead < units.length
+  const req = JSON.stringify({ units: units.slice(0, lead), expect: units.length,
+                               outdir: dir, chunks: [0, 1, 2].map(speechChunkSeconds),
+                               ...(streaming ? { streaming: true } : {}) })
   return new Promise<boolean>(resolve => {
     const child = spawn('python3', [SPEAK_PY], { env: voiceEnv(key), stdio: ['pipe', 'pipe', 'pipe'] })
-    // The tail follows once its units are annotated. Written after the spawn so the
-    // synthesiser is already working on the lead while this is still waiting.
-    void restReady.then(() => {
-      if (child.killed || !child.stdin.writable) return
-      try {
-        if (lead < units.length) child.stdin.write(JSON.stringify({ units: units.slice(lead) }) + '\n')
-        child.stdin.write(JSON.stringify({ end: true }) + '\n')
-        child.stdin.end()
-      } catch {}
-    }).catch(() => { try { child.stdin.end() } catch {} })
     task.child = child
     let err = '', buf = ''
     let n = 0
@@ -2054,6 +2091,9 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
     // answers. Remembering the first chunk lets both happen anyway, without sending a
     // duplicate audio file of content already in the note above it.
     let onlyPath: string | undefined
+    // Set when speak.py reports it synthesised fewer units than it was sent. The whole
+    // reason this number crosses the pipe: audio cannot tell you what is missing from it.
+    let shortRead: { spoke: number; expect: number } | undefined
     // Set when the `full` LINE IS PARSED, not when its send finishes. `done` arrives
     // on stdout immediately behind `full`, while the send is still sitting on the
     // queue — so a flag set inside the send callback was still false when the `done`
@@ -2069,6 +2109,10 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
     const later = (fn: () => Promise<void>) => { queue = queue.then(fn).catch(e => console.error(`[voice] send: ${e}`)) }
 
     child.stderr.on('data', d => (err += d))
+    // setEncoding, so a multi-byte character split across two reads is not corrupted:
+    // without it each chunk is decoded on its own and a path or title outside ASCII
+    // comes back mangled.
+    child.stdout.setEncoding('utf8')
     child.stdout.on('data', d => {
       buf += d
       const lines = buf.split('\n'); buf = lines.pop() ?? ''
@@ -2131,6 +2175,9 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
             await sendReadAlong(ctx, threadId, key, task, units, timings, o.full, o.seconds, m?.message_id ?? replyTo)
           })
         } else if (o.done) {
+          if (typeof o.expect === 'number' && typeof o.spoke === 'number' && o.spoke !== o.expect) {
+            shortRead = { spoke: o.spoke, expect: o.expect }
+          }
           // Always last, and separate from `full`: a one-note answer has no full file
           // but still has timings, and the read-along wants them just the same.
           timings = (o.timings || []).map((t: number[]) => ({ start: t[0], end: t[1] }))
@@ -2172,13 +2219,59 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
           if (oldest === task.id) break
           speechTasks.delete(oldest)
         }
-        if (code !== 0 && !task.cancelled) console.error(`[voice] speak exit ${code}: ${err.slice(-300)}`)
+        // Printed whenever there IS any, not only on a non-zero exit. speak.py skips a
+        // unit it cannot synthesise and carries on — correct, one bad sentence must
+        // not cost the answer — and writes a line about it to stderr. Gating that on
+        // the exit code threw away the only record that anything had been dropped, on
+        // exactly the runs where something had been.
+        if (err.trim() && !task.cancelled) console.error(`[voice] speak stderr: ${err.trim().slice(-500)}`)
+        if (code !== 0 && !task.cancelled) console.error(`[voice] speak exit ${code}`)
         // A cancelled run is not a failure: the user asked for it, and reporting it
         // as one would trigger the "voice could not speak" warning.
-        resolve(task.cancelled || (code === 0 && n > 0))
+        // `n` is the number of CHUNKS, so `n > 0` said "some audio exists" and called
+        // that success — which is how a run that spoke 6 of 20 units reported true and
+        // the user was never told. `spoke` is the number of units speak.py actually
+        // synthesised; short means short.
+        if (!task.cancelled && shortRead) {
+          console.error(`[voice] INCOMPLETE: spoke ${shortRead.spoke} of ${shortRead.expect} units`)
+        }
+        resolve(task.cancelled || (code === 0 && n > 0 && !shortRead))
       })
     })
     child.stdin.write(req + '\n')
+
+    // THE TAIL ALWAYS GOES. Not "if the normaliser succeeded", not inside a swallowed
+    // catch — the previous version made this conditional and a single rejection
+    // anywhere upstream closed the pipe with 14 of 20 units unsent, which the user
+    // received as a complete-looking "Full answer" ending mid-thought.
+    //
+    // Un-normalised is a fine outcome; unsent is not. If the normaliser has not
+    // finished by the deadline the tail goes as written, which is exactly the audio
+    // this bridge produced before normalisation existed.
+    // Nothing was held back, so there is no second write and no end marker to wait
+    // for: speak.py sees one complete request and an immediate EOF, exactly as it did
+    // before streaming existed.
+    if (!streaming) child.stdin.end()
+    let tailSent = !streaming
+    const sendTail = (why: string) => {
+      if (tailSent) return
+      tailSent = true
+      clearTimeout(tailTimer)
+      try {
+        if (lead < units.length) child.stdin.write(JSON.stringify({ units: units.slice(lead) }) + '\n')
+        child.stdin.write(JSON.stringify({ end: true }) + '\n')
+        child.stdin.end()
+      } catch (e) {
+        // Logged, never swallowed: this is the one write whose loss costs the answer.
+        console.error(`[voice] could not send the rest of the answer (${why}): ${e}`)
+        try { child.stdin.end() } catch {}
+      }
+    }
+    const tailTimer = streaming ? setTimeout(() => {
+      console.error(`[voice] normalising the rest took over ${NORMALISE_TAIL_MS}ms — speaking it as written`)
+      sendTail('deadline')
+    }, NORMALISE_TAIL_MS) : undefined
+    void allReady.then(() => sendTail('ready'), () => sendTail('normaliser failed'))
   })
 }
 

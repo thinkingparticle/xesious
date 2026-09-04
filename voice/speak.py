@@ -68,23 +68,36 @@ def find_ffmpeg():
 
 
 def main() -> int:
-    # Line-delimited on the way in, the way it already is on the way out. The first
-    # line is the whole request; with {"streaming": true} the caller may then append
-    # more {"units":[...]} lines and close with {"end": true}.
+    # One request, read whole.
     #
-    # That exists so synthesis can START while later units are still being normalised.
-    # Normalising a unit costs about as long as speaking it, so waiting for all of them
-    # would put a minute of silence in front of the first note — and the first note
-    # arriving in ~30s is the entire reason this file streams at all.
+    # Line-delimited, the way stdout already is. The first line is the request; with
+    # {"streaming": true} the caller then appends {"units":[...]} lines and closes with
+    # {"end": true}.
     #
-    # readline, not read(): a non-streaming caller sends one line and closes, which
-    # readline returns whole, so tts.sh and every existing caller are unaffected.
+    # It exists so the first note does not wait for the WHOLE answer to be normalised.
+    # Measured on a long answer: 19s to the first note with the split, 152s without it.
+    #
+    # It also, in its first version, cost a user 70% of an answer — the caller closed
+    # the pipe without ever sending the tail, and EOF read as "finished". Hence
+    # `saw_end` below: a caller that vanishes is now a hard error, not a short answer.
+    #
+    # readline, not read(): a caller that sends one line and closes is unaffected.
     try:
-        req = json.loads(sys.stdin.readline())
+        _first = sys.stdin.readline()
+        _d = os.environ.get("XESIOUS_SPEAK_DUMP_STDIN")
+        if _d:
+            with open(_d, "a", encoding="utf-8") as fh:
+                fh.write(f"--- REQUEST {len(_first)}B ---\n{_first}")
+        req = json.loads(_first)
     except Exception as e:
         sys.stderr.write(f"speak.py: bad request ({e})\n")
         return 2
     units = req.get("units") or []
+    # How many the CALLER believes it sent. Echoed back on the `done` line so the two
+    # sides can disagree OUT LOUD. A run that speaks 6 of 20 units still exits 0, and
+    # without a number to compare there is nothing anywhere — not in the audio, not in
+    # the log, not in the exit code — that tells it apart from a complete one.
+    expect = req.get("expect")
     single = req.get("out")                      # one utterance, one file
     outdir = req.get("outdir") or (os.path.dirname(single) if single else ".")
     targets = req.get("chunks") or [45, 90, 180]
@@ -115,7 +128,18 @@ def main() -> int:
     def encode(samples, sr, path):
         wav = path + ".wav"
         sf.write(wav, samples, sr)
-        subprocess.run([ff, "-y", "-i", wav, "-ac", "1", "-c:a", "libopus", "-b:a", "32k", path],
+        # stdin=DEVNULL and -nostdin, and neither is optional.
+        #
+        # ffmpeg READS ITS STDIN looking for interactive keypresses, and a child with no
+        # stdin of its own inherits ours. Once this file started leaving stdin open to
+        # receive the rest of the answer, every chunk encode quietly ate the front of
+        # whatever was waiting there: measured, exactly the 10 bytes `{"units":[` off
+        # the head of the tail, which left the remainder unparseable and cost the user
+        # 14 of 26 units. Invisible before, because stdin was closed the moment the one
+        # request had been read and there was nothing left in it to steal.
+        subprocess.run([ff, "-nostdin", "-y", "-i", wav, "-ac", "1", "-c:a", "libopus",
+                        "-b:a", "32k", path],
+                       stdin=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         os.remove(wav)
 
@@ -124,6 +148,8 @@ def main() -> int:
     pending = []       # samples for the chunk being built
     everything = []    # every sample, for the full file at the end
     timings = []       # [start, end] per unit, in the full file
+    spoke = [0]        # units actually synthesised, reported back to the caller
+    saw_end = [False]  # did the caller say it was finished, or did it just vanish?
     elapsed = 0.0      # running position, so a unit's start is known as it is made
     n = 0
 
@@ -151,29 +177,39 @@ def main() -> int:
         pending = []
 
     def unit_stream():
-        """The initial units, then whatever the caller appends."""
+        """The units from the request, then whatever the caller appends."""
         for b in units:
             yield b
         if not req.get("streaming"):
             return
         q = queue.Queue()
 
+        dump = os.environ.get("XESIOUS_SPEAK_DUMP_STDIN")
+
         def reader():
             try:
                 for line in sys.stdin:
+                    if dump:
+                        with open(dump, "a", encoding="utf-8") as fh:
+                            fh.write(f"--- LINE {len(line)}B ---\n{line}")
                     line = line.strip()
                     if not line:
                         continue
                     try:
                         msg = json.loads(line)
-                    except Exception:
-                        continue          # a torn line must not end the answer
+                    except Exception as e:                      # noqa: BLE001
+                        # NOT silently skipped. A line we cannot read is a line of the
+                        # answer we are about to not speak, and the count check at the
+                        # end is what turns that into a visible failure.
+                        sys.stderr.write(f"speak.py: unreadable input line ({e})\n")
+                        continue
                     if msg.get("end"):
+                        saw_end[0] = True
                         break
                     for u in msg.get("units") or []:
                         q.put(u)
             finally:
-                q.put(None)               # in a finally: a reader that dies must not hang the synthesiser
+                q.put(None)     # in a finally: a reader that dies must not hang the synthesiser
 
         threading.Thread(target=reader, daemon=True).start()
         while True:
@@ -190,6 +226,7 @@ def main() -> int:
         text = (b.get("speak") or b.get("text") or "").strip()
         if not text:
             continue
+        spoke[0] += 1
         try:
             samples, sr = k.create(text, voice=voice, speed=speed, lang=lang)
         except Exception as e:                                  # noqa: BLE001
@@ -233,7 +270,24 @@ def main() -> int:
     # full file, but the read-along page and the section index want the timings just
     # the same. Tying them to the full file meant a one-note answer silently got
     # neither.
-    emit({"done": True, "seconds": round(elapsed, 3), "chunks": n, "timings": timings})
+    emit({"done": True, "seconds": round(elapsed, 3), "chunks": n, "timings": timings,
+          "spoke": spoke[0], "expect": expect})
+    # A short read is a FAILURE, and says so in the exit code.
+    #
+    # Every unit that fails to synthesise is skipped with a line on stderr and the
+    # answer continues, which is right — one unspeakable sentence must not cost the
+    # rest. But the sum of those skips is an answer the listener never heard, and
+    # until now it exited 0 and looked exactly like success. The caller cannot
+    # discover this on its own: it has the audio, and audio has no idea what it is
+    # missing.
+    if expect is not None and spoke[0] != expect:
+        sys.stderr.write(f"speak.py: spoke {spoke[0]} of {expect} units\n")
+        return 5
+    # EOF is not an ending. A caller that dies mid-answer closes the pipe in exactly
+    # the same way as one that finished, so only an explicit {"end": true} counts.
+    if req.get("streaming") and not saw_end[0]:
+        sys.stderr.write("speak.py: input ended without {\"end\": true} — caller vanished\n")
+        return 6
     return 0
 
 

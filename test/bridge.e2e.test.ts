@@ -2389,6 +2389,72 @@ describe('a long spoken answer can be stopped, indexed and tidied', () => {
     }
   }, 30000)
 
+  test('every unit reaches the synthesiser when only SOME of them are normalised', async () => {
+    // The case that shipped broken and cost a user 70% of an answer. The units are
+    // handed over in two parts — the first chunk's worth immediately, the rest once
+    // they are normalised — and the second hand-over was conditional on the
+    // normaliser succeeding. Any hiccup closed the pipe with the tail unsent, and a
+    // short reading exits 0, so it arrived labelled "Full answer" and ending
+    // mid-thought.
+    //
+    // Asserting on the LAST unit specifically: a truncated answer always keeps its
+    // beginning, so only the end can tell you it was complete.
+    const dump = join(TMP, 'spoken-units-mixed.json')
+    rmSync(dump, { force: true })
+    process.env.XESIOUS_SPEAK_STUB_DUMP = dump
+    try {
+      await withChunking(async () => {
+        await incoming(1447, '/voice on')
+        await incoming(1447, 'MIXED')
+        await bridge._drainQueue('1447:main#voice')
+      })
+      const units = JSON.parse(readFileSync(dump, 'utf8')) as { text: string; speak?: string }[]
+      const spoken = units.map(u => u.speak ?? u.text).join(' ')
+      // 1. the whole answer arrived — the tail is the part that used to vanish
+      expect(spoken).toContain('ZZ_LAST_WORDS_OF_THE_ANSWER')
+      // 2. and it really was a two-part hand-over, or this proves nothing
+      expect(units.length).toBeGreaterThan(10)
+      // 3. the normaliser did run, on the units that needed it and no others
+      expect(units.some(u => u.speak?.startsWith('SPOKEN('))).toBe(true)
+      expect(units.some(u => u.speak === undefined)).toBe(true)
+    } finally {
+      delete process.env.XESIOUS_SPEAK_STUB_DUMP
+      rmSync(dump, { force: true })
+    }
+  }, 30000)
+
+  test('the rest of the answer is still spoken when the normaliser fails', async () => {
+    // Un-normalised is a fine outcome; unsent is not. With the model unavailable every
+    // unit must still reach the synthesiser as written, which is the audio this bridge
+    // produced before normalisation existed — what its own comment promises.
+    const dump = join(TMP, 'spoken-units-broken.json')
+    rmSync(dump, { force: true })
+    process.env.XESIOUS_SPEAK_STUB_DUMP = dump
+    const realBin = process.env.CLAUDE_BIN
+    process.env.CLAUDE_BIN = join(TMP, 'no-such-normaliser')
+    try {
+      await withChunking(async () => {
+        await incoming(1448, '/voice on')
+        await incoming(1448, 'MIXED')
+        await bridge._drainQueue('1448:main#voice')
+      })
+      const units = JSON.parse(readFileSync(dump, 'utf8')) as { text: string; speak?: string }[]
+      const spoken = units.map(u => u.speak ?? u.text).join(' ')
+      // The whole answer, tail included. That is the entire point: a dead normaliser
+      // must cost pronunciation, never words.
+      expect(spoken).toContain('ZZ_LAST_WORDS_OF_THE_ANSWER')
+      expect(units.length).toBeGreaterThan(10)
+      // Deliberately NOT asserting that no unit has a spoken form. The normaliser
+      // caches by text, in memory, for the life of the process — so a unit an earlier
+      // test already normalised still comes back from the cache with the binary gone.
+      // That is the cache working; asserting otherwise pins the wrong behaviour.
+    } finally {
+      process.env.CLAUDE_BIN = realBin
+      delete process.env.XESIOUS_SPEAK_STUB_DUMP
+      rmSync(dump, { force: true })
+    }
+  }, 30000)
+
   test('a unit with nothing to fix is never sent to the model', async () => {
     // The gate is what keeps this affordable: on a real answer 61 of 100 units matched
     // and the other 39 cost nothing. A unit that skips the model must still be spoken,
@@ -2427,6 +2493,11 @@ describe('a long spoken answer can be stopped, indexed and tidied', () => {
       const units = JSON.parse(readFileSync(dump, 'utf8')) as { text: string; speak?: string }[]
       expect(units.length).toBeGreaterThan(0)
       expect(units.every(u => u.speak === undefined)).toBe(true)
+      // …and the streamed hand-over is not used either. The switch has to restore the
+      // OLD code path, not merely skip the model while keeping the new plumbing — the
+      // plumbing is what dropped 14 of 26 units, so "off" must not go near it.
+      const req = JSON.parse(readFileSync(dump.replace('.json', '-req.json'), 'utf8'))
+      expect(req.streaming).toBeUndefined()
     } finally {
       bridge._setNormaliseSpeech(prev)
       delete process.env.XESIOUS_SPEAK_STUB_DUMP
