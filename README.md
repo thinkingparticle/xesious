@@ -79,7 +79,7 @@ off is now a **hard startup error**, not a warning.
 | `/resume [id]` | Restore the previous session (undo `/new`), or bind this topic to a specific past session — the 8-character prefix `/sessions` prints is enough, and an ambiguous one is refused rather than guessed |
 | `/compact [focus]` | Summarize this topic's session history to free up context (memory kept) |
 | `/stop` | Cancel the task currently running in this topic |
-| `/voice [on\|off]` | Voice mode: transcribe voice notes and speak answers back (eyes-free). Default from `TG_VOICE`. |
+| `/voice [on\|off\|parts on\|off]` | Voice mode: transcribe voice notes and speak answers back (eyes-free). Default from `TG_VOICE`. `parts` decides whether the progressive notes are sent or only the full file. |
 | `/interrupt [on\|off]` | Toggle interrupt mode: a new message cancels the running task and starts immediately (its reply comes as a new message) instead of queueing. Default from `TG_INTERRUPT`. |
 | `/mode [plan\|acceptEdits\|auto\|bypass]` | Show or set this topic's permission mode. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_PERMISSION_MODE`. |
 | `/plan <task>` | One read-only turn: Claude researches and proposes without editing. Doesn't change the topic's mode, so "go ahead" carries the plan out. |
@@ -156,23 +156,34 @@ listening, and neither costs you the install.
 No configuration follows: `voice/tts.sh` selects Kokoro whenever its model is on
 disk. `TG_TTS_ENGINE` (`kokoro|piper|espeak`) and `TG_KOKORO_VOICE` are overrides.
 
-A long answer is **spoken as it is made** rather than after it: notes arrive at 45s,
-90s, then every 3 minutes, each one a reply to the answer, so you start listening in
-about a minute instead of waiting out the whole thing. Synthesis runs off the topic's
-queue, so the next message you send is answered immediately.
+A long answer is **spoken as it is made** rather than after it — but by default it is
+**sent quietly**: one status bubble while it speaks, then the finished audio.
 
-- **🛑 Stop speaking** on the first note ends the whole thing; so does `/stop`.
+- **`🎙 Speaking… ~5m`** goes up the moment synthesis starts, carrying **🛑 Stop
+  speaking** from the first second rather than from whenever the first note appears.
+  `/stop` still works too.
+- **▶️ Send it in parts** on that bubble switches to progressive delivery, and it
+  **back-fills**: tap it a minute in and every chunk already made arrives at once,
+  then the rest follow live. `/voice parts on` makes that the topic's default
+  (`TG_VOICE_PARTS=1` for all topics).
 - The **full file** follows as one audio message, captioned with a timestamp per
-  section — tap one to jump there.
-- **🧹 Remove the parts** on that file clears the chunk notes and keeps the file.
-  `TG_VOICE_TIDY=1` does it without asking.
+  section — tap one to jump there — and the status bubble is deleted. Synthesis is
+  chunked either way, so this arrives at exactly the same moment whichever you choose;
+  only the number of messages differs.
+- Any parts that were sent **stay**. **🧹 Remove the parts** on the full file clears
+  them if you want that; nothing deletes a voice note on its own, because the full file
+  lands while you are most likely still mid-chunk.
 - A **read-along page** comes with it: the answer, the audio, and each block
-  highlighted as it is spoken. Self-contained, so it works offline. Only for answers
-  long enough to arrive as `answer.md`/`answer.html` (`TG_REPLY_FILE_CHARS`, default
-  6000) — it is a companion to those files, and a reply short enough to sit inline in
-  the chat gets a voice note and nothing to open.
-  `TG_VOICE_READALONG_MAX_MIN` (default 20) caps how long an answer gets one;
+  highlighted as it is spoken, with a **section list** in the player bar — tap a
+  heading to seek there and the page scrolls with it. Self-contained, so it works
+  offline. Only for answers long enough to arrive as `answer.md`/`answer.html`
+  (`TG_REPLY_FILE_CHARS`, default 6000) — it is a companion to those files, and a
+  reply short enough to sit inline in the chat gets a voice note and nothing to open.
+  `TG_VOICE_READALONG_MAX_MIN` caps how long an answer gets one;
   `TG_VOICE_CHUNKED=0` turns the whole progressive path off.
+
+Synthesis runs off the topic's queue, so the next message you send is answered
+immediately.
 
 Then per topic send `/voice on` (or set `TG_VOICE=1` for all topics). With voice on:
 

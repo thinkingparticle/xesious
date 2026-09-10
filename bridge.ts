@@ -34,7 +34,7 @@ import {
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
   markdownToHtml, htmlDocument, previewCut, transcriptSpeech, lastEffortFrom, needsReplyLink,
   speechUnits, speechChunkSeconds, SPEAKERS, SPEAKER_PAGE, SPEAKER_DEFAULT, kokoroLang, isSpeakerId, speakerLabel,
-  speechToc, fullAudioCaption, readAlongHtml, fmtDurationWords, type SpeechUnit, type UnitTiming,
+  speechToc, fullAudioCaption, readAlongHtml, fmtDurationWords, speechEstimateSeconds, type SpeechUnit, type UnitTiming,
   needsSpeechNormalising,
   fanoutPlanPrompt, parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble,
   FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName, filesPreamble,
@@ -252,11 +252,20 @@ const SPEAK_PY = process.env.TG_SPEAK_CMD || join(HERE, 'voice', 'speak.py')
 const KOKORO_MODEL = process.env.TG_KOKORO_MODEL || join(HERE, 'voice', 'kokoro', 'kokoro-v1.0.onnx')
 // The single knob for people who want one note however long it takes.
 const VOICE_CHUNKED = !/^(0|false|no)$/i.test(process.env.TG_VOICE_CHUNKED || '')
-// Tidy the chunk notes away once the full file lands. OFF by default and it must
-// stay that way: the chunks exist to be listened to WHILE the rest is still being
-// made, and the full file arrives exactly when a listener is most likely mid-chunk,
-// so deleting what is playing stops playback dead. The button is the safe form.
-const VOICE_TIDY = /^(1|true|yes)$/i.test(process.env.TG_VOICE_TIDY || '')
+// Whether the progressive notes are SENT by default. Off: synthesis is unchanged and
+// still chunk-by-chunk, but the parts are held and only the full file goes out, so a
+// spoken answer costs one status bubble instead of five messages of audio — four of
+// them audio and the same audio twice over. On: today's behaviour for every answer.
+// Per topic with /voice parts; this is only the fallback.
+const VOICE_PARTS_DEFAULT = /^(1|true|yes)$/i.test(process.env.TG_VOICE_PARTS || '')
+// NOTHING deletes a voice note on its own, and there is no setting that makes it.
+//
+// There was a TG_VOICE_TIDY knob, and briefly a rule that parts you had opted into
+// were cleared once the full file landed — the reasoning being that you must be
+// finished with them by then. You are not. The full file arrives exactly when a
+// listener is most likely mid-chunk, and deleting the note that is playing stops
+// playback dead. Asking for the parts is, if anything, a reason to expect them to
+// stay. The 🧹 button on the full file is the only way they go, and that is a tap.
 // A read-along page embeds its audio as a data: URI to stay self-contained, so its
 // size grows with the answer. Past this it is skipped rather than silently producing
 // a page tens of megabytes wide.
@@ -402,11 +411,20 @@ let voice: Record<string, string> = {}
 // deployment-wide constant: voiceEnv() copied TG_KOKORO_VOICE out of the bridge's
 // OWN environment, so changing it meant editing .env and restarting.
 let speakers: Record<string, string> = {}
+// Whether this topic wants the progressive notes SENT, not merely synthesised.
+// Sticky per topic because the preference is stable — someone who wants parts wants
+// them every time — with the status message's button as the per-answer override in
+// whichever direction this is not.
+let voiceParts: Record<string, boolean> = {}
 function voiceMode(key: string): 'off' | 'full' | 'summary' {
   const v = voice[key]
   if (v === 'full' || v === 'summary') return v
   if (v === undefined) return VOICE_DEFAULT ? 'full' : 'off'
   return 'off'
+}
+function partsMode(key: string): boolean {
+  const v = voiceParts[key]
+  return v === undefined ? VOICE_PARTS_DEFAULT : v
 }
 
 function loadState(): void {
@@ -422,6 +440,7 @@ function loadState(): void {
       efforts = o.efforts ?? {}
       voice = o.voice ?? {}
       speakers = o.speakers ?? {}
+      voiceParts = o.voiceParts ?? {}
       // Plans proposed but not yet confirmed. A plan is just text until you tap
       // "run", and losing it to a restart made the button answer "that plan is no
       // longer available" for something the person had only just been offered.
@@ -435,7 +454,7 @@ function loadState(): void {
 function saveState(): void {
   try {
     mkdirSync(dirname(STATE_FILE), { recursive: true })
-    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode, modes, models, efforts, voice, speakers,
+    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode, modes, models, efforts, voice, speakers, voiceParts,
       // Only the ones still awaiting a decision. A fan-out that has started cannot be
       // resumed — its parts were child processes and died with the bridge — so
       // persisting it would offer a button that could not honour itself.
@@ -1290,7 +1309,8 @@ function voiceText(key: string): string {
   const sp = speakers[key] || SPEAKER_DEFAULT
   return `🎙 Voice — ${voiceMode(key)}\n` +
     `Engine: ${p.engine}${p.speak ? '' : ' (not available — tap Install below)'}\n` +
-    `Speaker: ${speakerLabel(sp)} (${sp})\n\n` +
+    `Speaker: ${speakerLabel(sp)} (${sp})\n` +
+    `Parts: ${partsMode(key) ? 'on — every chunk as its own note' : 'off — one status message, then the full file'}\n\n` +
     `The complete answer always comes as text, whatever this is set to.\n` +
     `${SPEAKERS.length} English voices here; /voice speaker <id> also reaches the ` +
     `Spanish, French, Hindi, Italian, Japanese, Portuguese and Chinese ones.`
@@ -1313,6 +1333,12 @@ function voiceKeyboard(key: string, offset?: number): any {
     { text: `${mode === 'summary' ? '● ' : ''}Summary`, callback_data: 'voice:summary' },
     { text: `${mode === 'off' ? '● ' : ''}Off`, callback_data: 'voice:off' },
   ]]
+  // A toggle rather than a pair, because this is one preference with two states and
+  // the row above already spends three buttons on the mode.
+  if (mode !== 'off') rows.push([{
+    text: partsMode(key) ? '● Send every part' : 'Send every part',
+    callback_data: `vpartset:${partsMode(key) ? 'off' : 'on'}`,
+  }])
   const page = SPEAKERS.slice(off, off + SPEAKER_PAGE)
   for (let i = 0; i < page.length; i += 2) {
     rows.push(page.slice(i, i + 2).map(v => ({
@@ -2015,6 +2041,24 @@ type SpeechTask = {
   dir: string
   chunkIds: number[]     // the notes sent so far, for tidying
   cancelled: boolean
+  // The status bubble: `🎙 Speaking… ~5 min`, posted the moment synthesis starts and
+  // deleted when the audio lands. It is also the home of the 🛑 button, which used to
+  // ride on note 1 — a message that does not exist for the first ~30 seconds, so
+  // during the slowest and least interruptible part of a run there was no way to stop
+  // it at all.
+  statusId?: number
+  // Whether the progressive notes are being SENT. Synthesis is chunked either way;
+  // this only decides whether each chunk becomes a message.
+  sendParts: boolean
+  // Chunks finished while sendParts was false. Held rather than dropped, so the
+  // button can BACK-FILL: its whole value is the 30 seconds before the first note
+  // exists, so a tap at t=60s has to send everything already made and then continue
+  // live. Also the safety net — if no full file is ever produced, these are the
+  // answer, and they go out regardless.
+  held: { path: string; seconds?: number }[]
+  // Installed by speakChunked so the callback can reach into the run's send queue.
+  // Sends must stay on that one chain or they arrive out of order.
+  release?: (why: string) => void
   // Whether the answer was long enough to go out as answer.md/.html. Decided from
   // the answer text at spawn time, not from the finished audio: a slow speaker can
   // make three minutes of a paragraph, and that paragraph still does not want a page.
@@ -2064,13 +2108,58 @@ function canChunk(): boolean {
 // because synthesis runs at ~0.79x realtime every later note is ready before you
 // finish the previous one. The complete file follows at the end for anyone who wants
 // one file rather than a list.
+//
+// The notes are no longer SENT by default, and that is a different decision from how
+// they are made. A long answer used to post six messages — the text, three voice
+// notes, the full file, the read-along page — four of them audio and the same audio
+// twice, because the parts exist only so you do not wait and are pure sediment once
+// the full file lands. Scroll back through a day of that and the conversation is
+// unreadable. So synthesis is untouched, still chunk by chunk, and the SENDING is
+// what became opt-in: the chunks are held, the full file arrives at exactly the same
+// moment it does today, and a button releases the parts for anyone who wants them.
 async function speakChunked(ctx: Context, threadId: number | undefined, key: string, text: string, replyTo?: number): Promise<boolean> {
   const units = speechUnits(text)
   if (!units.length) return true
   const dir = mkdtempSync(join(tmpdir(), 'tg-tts-'))
-  const task: SpeechTask = { id: newJobId(), key, dir, chunkIds: [], cancelled: false, withFiles: answerGoesToFile(text) }
+  const wantParts = partsMode(key)
+  const task: SpeechTask = { id: newJobId(), key, dir, chunkIds: [], cancelled: false, withFiles: answerGoesToFile(text),
+                             sendParts: wantParts, held: [] }
   speechTasks.set(task.id, task)
   speechByTopic.set(key, task.id)
+  // The status bubble, before a single sample exists. Two jobs: say what is happening
+  // and for how long, and carry the 🛑 button from t=0 rather than from whenever note
+  // one shows up.
+  //
+  // A short answer is one note and no full file, so there are no parts to offer and
+  // the button would be a lie. Predicted from the estimate, because the real boundary
+  // is decided by duration inside speak.py and is not knowable until the audio exists.
+  //
+  // Compared against HALF the first chunk, not the whole of it, because the estimate
+  // is a floor rather than a guess. It measures the answer as WRITTEN, and what gets
+  // spoken is the normalised form, which only ever grows: `$100/yr` is seven
+  // characters that become "one hundred dollars per year", thirty. A symbol-dense
+  // answer therefore speaks far longer than it reads, and comparing its written length
+  // against the real boundary hides the button on exactly the answers long enough to
+  // want it. The two errors are not symmetrical — a button shown needlessly back-fills
+  // whatever exists, which for a one-note answer is that one note arriving a moment
+  // early, while a button wrongly hidden leaves no way to ask for parts at all.
+  const estimate = speechEstimateSeconds(units)
+  const willChunk = estimate > speechChunkSeconds(0) / 2
+  // Installed BEFORE the button is posted, because the wait for the lead units to be
+  // normalised sits between here and the spawn and can run to twenty seconds — a
+  // button that answers "already finished speaking" for the first twenty seconds of a
+  // run is worse than no button. Nothing exists to back-fill yet, so setting the flag
+  // is the whole job; the version installed alongside the send queue below replaces
+  // this one and adds the back-fill.
+  task.release = () => { task.sendParts = true }
+  const statusRows: any[][] = []
+  if (willChunk && !task.sendParts) statusRows.push([{ text: '▶️ Send it in parts', callback_data: `vparts:${task.id}` }])
+  statusRows.push([{ text: '🛑 Stop speaking', callback_data: `vstop:${task.id}` }])
+  await ctx.api.sendMessage(ctx.chat!.id, `🎙 Speaking… ~${fmtDurationWords(estimate)}`, {
+    ...destOpts({ threadId, replyTo }),
+    reply_markup: { inline_keyboard: statusRows },
+  }).then((m: any) => { task.statusId = m?.message_id; noteBotMessage(key) })
+    .catch(e => console.error(`[warn] voice status: ${e}`))
   // Only the units the FIRST chunk needs are waited for; the rest follow as soon as
   // they are ready. Estimated from characters because the real boundary is decided by
   // duration inside speak.py and is not knowable until the audio exists — measured at
@@ -2127,6 +2216,46 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
     // serialises Telegram sends, and the two are one keystroke apart.
     const later = (fn: () => Promise<void>) => { queue = queue.then(fn).catch(e => console.error(`[voice] send: ${e}`)) }
 
+    // One place a part becomes a message, because there are now two callers: the live
+    // chunk as it is synthesised, and the back-fill when the button releases what was
+    // held. They must produce identical notes, and the part numbers must stay the
+    // numbers speak.py produced them in.
+    const sendPart = (part: number, path: string, seconds?: number) => later(async () => {
+      if (task.cancelled) return
+      const opts: any = destOpts({ threadId, replyTo })
+      // No caption on the first note: a short answer is one note and a "part 1"
+      // label on a thing with no part 2 is noise.
+      //
+      // No TIMESTAMP on any of them either. It used to read "part 3 — from 5:42",
+      // and Telegram turns that M:SS into a seek — but the seek is relative to
+      // THIS note, which holds 90 seconds starting at 5:42 and has no 5:42 in it.
+      // Every tap was a dead link. A note is a position in the answer, not a
+      // place you can jump to; the full file below is what you navigate.
+      //
+      // The 🛑 button is NOT here any more. It rode on note 1, which does not exist
+      // for the first ~30 seconds — so during the slowest, least interruptible part
+      // of a run there was no way to stop it. The status bubble exists from t=0 and
+      // is the right home for it whether or not parts are ever sent.
+      if (part > 1) opts.caption = `🎙 part ${part}`
+      if (seconds) opts.duration = Math.round(seconds)
+      const m: any = await ctx.api.sendVoice(ctx.chat!.id, new InputFile(path), opts)
+      if (m?.message_id) task.chunkIds.push(m.message_id)
+      noteBotMessage(key)
+    })
+
+    // Turn the parts on mid-run. The whole value of the button is the window before
+    // the first note exists, so it has to BACK-FILL — a tap at t=60s sends every part
+    // already finished and then the rest follow live. A switch that only affected
+    // future chunks would be useless exactly when it is wanted.
+    task.release = (why: string) => {
+      if (task.sendParts) return
+      task.sendParts = true
+      const held = task.held.splice(0)
+      console.log(`[voice] parts released (${why}) for ${task.id}: ${held.length} held`)
+      // The held chunks are always parts 1..k — nothing was sent before them.
+      held.forEach((h, i) => sendPart(i + 1, h.path, h.seconds))
+    }
+
     child.stderr.on('data', d => (err += d))
     // setEncoding, so a multi-byte character split across two reads is not corrupted:
     // without it each chunk is decoded on its own and a path or title outside ASCII
@@ -2142,26 +2271,11 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
           n++
           const part = n
           if (part === 1) onlyPath = o.path
-          later(async () => {
-            if (task.cancelled) return
-            const opts: any = destOpts({ threadId, replyTo })
-            // No caption on the first note: a short answer is one note and a "part 1"
-            // label on a thing with no part 2 is noise.
-            //
-            // No TIMESTAMP on any of them either. It used to read "part 3 — from 5:42",
-            // and Telegram turns that M:SS into a seek — but the seek is relative to
-            // THIS note, which holds 90 seconds starting at 5:42 and has no 5:42 in it.
-            // Every tap was a dead link. A note is a position in the answer, not a
-            // place you can jump to; the full file below is what you navigate.
-            if (part > 1) opts.caption = `🎙 part ${part}`
-            if (o.seconds) opts.duration = Math.round(o.seconds)
-            // The stop button rides on the FIRST note, which is the one that exists
-            // while there is still something worth stopping.
-            if (part === 1) opts.reply_markup = { inline_keyboard: [[{ text: '🛑 Stop speaking', callback_data: `vstop:${task.id}` }]] }
-            const m: any = await ctx.api.sendVoice(ctx.chat!.id, new InputFile(o.path), opts)
-            if (m?.message_id) task.chunkIds.push(m.message_id)
-            noteBotMessage(key)
-          })
+          // Held, not dropped. The file stays in the run's temp directory, which is
+          // only removed once the send queue has drained, so a tap at t=60s can still
+          // back-fill everything already made.
+          if (!task.sendParts) { task.held.push({ path: o.path, seconds: o.seconds }); continue }
+          sendPart(part, o.path, o.seconds)
         } else if (o.full) {
           // Taken here as well as from `done`, because the section index is built the
           // moment the full file is sent and `done` arrives after it.
@@ -2173,6 +2287,8 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
             // visibly a different thing from the chunk bubbles above it.
             const toc = speechToc(units, timings)
             const rows: any[][] = []
+            // Offered, never done for you: the notes are what you have been listening
+            // to, and this file arrives mid-chunk more often than not.
             if (task.chunkIds.length > 1) rows.push([{ text: '🧹 Remove the parts', callback_data: `vtidy:${task.id}` }])
             const m: any = await ctx.api.sendAudio(ctx.chat!.id, new InputFile(o.full), {
               ...destOpts({ threadId, replyTo }),
@@ -2188,9 +2304,12 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
               ...(rows.length ? { reply_markup: { inline_keyboard: rows } } : {}),
             } as any)
             noteBotMessage(key)
-            // The first note's stop button is stale now: nothing is left to stop.
-            await dropStopButton(ctx, task)
-            if (VOICE_TIDY) await tidySpeech(ctx, task)
+            // The status bubble has said everything it had to say, and the audio it
+            // was standing in for is now above it. It cannot BECOME the audio — a
+            // text message cannot be edited into a media one, editMessageMedia only
+            // edits messages that already carry media — so it is deleted, which is
+            // what makes the quiet path one bubble instead of five.
+            await clearStatus(ctx, task)
             await sendReadAlong(ctx, threadId, key, task, units, timings, o.full, o.seconds, m?.message_id ?? replyTo)
           })
         } else if (o.done) {
@@ -2203,9 +2322,15 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
           const seconds = o.seconds ?? 0
           const single = onlyPath
           if (!haveFull && single) {
+            // No full file means the held notes ARE the answer — a short one is a
+            // single note and nothing follows it. Releasing here is not a preference,
+            // it is the difference between an answer and silence, so it happens
+            // whatever the parts setting says. Queued before the caption edit below,
+            // which needs the note to exist.
+            task.release?.('no full file')
             later(async () => {
               if (task.cancelled) return
-              await dropStopButton(ctx, task)
+              await clearStatus(ctx, task)
               // The index goes onto the note itself: there is no second message to
               // put it on, and a lone note with no way to navigate it is the same
               // complaint one chunk smaller.
@@ -2223,11 +2348,25 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
     })
     child.on('error', e => { console.error(`[voice] speak spawn: ${e}`); resolve(false) })
     child.on('close', code => {
+      // A run that ended without a full file leaves the held notes as the only audio
+      // there is. `done` covers the ordinary short answer; this covers the crash, the
+      // non-zero exit and the truncated pipe, where holding them would turn a partial
+      // answer into no answer at all. Queued before the drain below so the sends are
+      // on the chain rather than racing the temp directory's removal.
+      if (!task.cancelled && !haveFull && task.held.length) task.release?.(`exit ${code} with no full file`)
       queue.finally(async () => {
         if (task.cancelled) {
-          await dropStopButton(ctx, task)
-          await send(ctx, threadId, `🛑 Stopped speaking. ${task.chunkIds.length} note(s) already sent stay; the text answer is complete above.`)
+          await clearStatus(ctx, task)
+          const kept = task.chunkIds.length
+            ? `${task.chunkIds.length} note(s) already sent stay; `
+            : 'Nothing had been sent yet; '
+          await send(ctx, threadId, `🛑 Stopped speaking. ${kept}the text answer is complete above.`)
         }
+        // Unconditional, and it has to be. The ordinary paths retire the bubble when
+        // the audio lands, but a crash, a non-zero exit or a torn pipe reaches none of
+        // them — and what survives is a message reading "🎙 Speaking…" with a live 🛑
+        // on it, for a run that ended minutes ago. Idempotent: it clears statusId.
+        await clearStatus(ctx, task)
         rmSync(dir, { recursive: true, force: true })
         task.child = undefined
         if (speechByTopic.get(key) === task.id) speechByTopic.delete(key)
@@ -2294,12 +2433,23 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
   })
 }
 
-// Quietly remove the stop button once there is nothing left to stop. Editing only
-// the markup keeps the note itself — and its audio — exactly as it was.
-async function dropStopButton(ctx: Context, task: SpeechTask): Promise<void> {
-  const first = task.chunkIds[0]
-  if (!first) return
-  await ctx.api.editMessageReplyMarkup(ctx.chat!.id, first, { reply_markup: { inline_keyboard: [] } }).catch(() => {})
+// Retire the status bubble once the audio it announced has arrived.
+//
+// Deleted rather than edited, and it has to be a delete: a text message cannot be
+// turned into a media one — editMessageMedia only edits messages that already contain
+// media — so the bubble was never a placeholder the audio could grow into. It is a
+// separate message with its own lifetime, and its lifetime ends here. That is the
+// whole of "one bubble in the quiet path": the status goes, the audio stays.
+//
+// Falls back to stripping the buttons if the delete is refused (a bot may only delete
+// its own messages, and only within 48 hours — both hold for a bubble minutes old, but
+// a stale 🛑 is worse than a stale sentence).
+async function clearStatus(ctx: Context, task: SpeechTask): Promise<void> {
+  const id = task.statusId
+  if (!id) return
+  task.statusId = undefined
+  if (await ctx.api.deleteMessage(ctx.chat!.id, id).then(() => true).catch(() => false)) return
+  await ctx.api.editMessageReplyMarkup(ctx.chat!.id, id, { reply_markup: { inline_keyboard: [] } }).catch(() => {})
 }
 
 // Delete the chunk notes, leaving the full file. Never automatic unless asked for:
@@ -3500,6 +3650,25 @@ bot.on('message', async ctx => {
       await send(ctx, threadId, `🎙 Speaker set to ${speakerLabel(id)} (${id}, ${kokoroLang(id)}).`)
       return
     }
+    // Sticky, because the preference is stable: someone who wants the parts wants them
+    // every time. The status bubble's button is the per-answer override in whichever
+    // direction this is not.
+    if (arg === 'parts') {
+      const v = (parts[2] || '').toLowerCase()
+      if (v !== 'on' && v !== 'off') {
+        await send(ctx, threadId, `🎙 Parts here: ${partsMode(key) ? 'on' : 'off'}\n\n` +
+          (partsMode(key)
+            ? 'Each chunk arrives as its own voice note, then the full file.'
+            : 'Only the full file is sent; tap ▶️ on the status message for the parts.') +
+          '\n\nUsage: /voice parts on | off')
+        return
+      }
+      voiceParts[key] = v === 'on'; saveState()
+      await send(ctx, threadId, v === 'on'
+        ? '🎙 Parts ON — every chunk arrives as it is made, then the full file. They are tidied away once it lands.'
+        : '🎙 Parts OFF — one status message while I speak, then the full file. Tap ▶️ on it for the parts.')
+      return
+    }
     let next: 'off' | 'full' | 'summary' | undefined
     if (arg === 'off') next = 'off'
     else if (arg === 'on' || arg === 'full') next = 'full'
@@ -3511,7 +3680,7 @@ bot.on('message', async ctx => {
         .catch(e => console.error(`[warn] /voice: ${e}`))
       noteBotMessage(key)
       return
-    } else { await send(ctx, threadId, 'Usage: /voice on | summary | off | speaker <id>'); return }
+    } else { await send(ctx, threadId, 'Usage: /voice on | summary | off | parts on|off | speaker <id>'); return }
     if (next === 'off') delete voice[key]; else voice[key] = next
     saveState()
     await send(ctx, threadId,
@@ -3799,7 +3968,7 @@ bot.on('message', async ctx => {
       `mode: ${modeFor(key)}${bypassDowngraded(key) ? ' (stored: bypass — disabled on this deployment)' : ''}\n` +
       `model: ${modelLine(key)}\n` +
       `effort: ${effortLabel(key)}\n` +
-      `voice: ${voiceMode(key)}\n\n` +
+      `voice: ${voiceMode(key)}${voiceMode(key) !== 'off' && partsMode(key) ? ' (parts)' : ''}\n\n` +
       `resume on the server:\n  cd "${e?.cwd ?? resolveCwd(ctx, threadId)}" && claude --continue`)
     return
   }
@@ -4115,6 +4284,28 @@ bot.on('callback_query:data', async ctx => {
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})
     return
   }
+  if (data.startsWith('vparts:')) {
+    const t = speechTasks.get(data.slice(7))
+    // speechByTopic is cleared when a run ends, and a finished task keeps its record
+    // only so the tidy button can honour itself. Releasing parts into a run whose temp
+    // directory has already been removed would upload nothing, slowly.
+    if (!t || t.cancelled || speechByTopic.get(t.key) !== t.id) {
+      await ctx.answerCallbackQuery({ text: 'That answer has already finished speaking.' }).catch(() => {}); return
+    }
+    if (t.sendParts) { await ctx.answerCallbackQuery({ text: 'Already sending the parts.' }).catch(() => {}); return }
+    // Answered first: Telegram wants a reply inside ten seconds and the back-fill is a
+    // run of uploads. Idempotent by the guard above and by release() itself, because
+    // this button WILL be tapped twice.
+    const waiting = t.held.length
+    await ctx.answerCallbackQuery({ text: waiting ? `Sending ${waiting} part(s)…` : 'Parts on — they will arrive as they are made.' }).catch(() => {})
+    t.release?.('button')
+    // The offer is spent. The 🛑 stays, because there is still something to stop —
+    // and this edits the message the button was tapped on, which IS the status bubble.
+    await ctx.editMessageReplyMarkup({
+      reply_markup: { inline_keyboard: [[{ text: '🛑 Stop speaking', callback_data: `vstop:${t.id}` }]] },
+    }).catch(() => {})
+    return
+  }
   if (data.startsWith('vtidy:')) {
     const t = speechTasks.get(data.slice(6))
     if (!t) { await ctx.answerCallbackQuery({ text: 'Those notes are no longer tracked.' }).catch(() => {}); return }
@@ -4132,6 +4323,14 @@ bot.on('callback_query:data', async ctx => {
     if (v === 'off') delete voice[key]; else voice[key] = v
     saveState()
     await ctx.answerCallbackQuery({ text: `Voice: ${v}` }).catch(() => {})
+    await ctx.editMessageText(voiceText(key), { reply_markup: voiceKeyboard(key) }).catch(() => {})
+    return
+  }
+  if (data.startsWith('vpartset:')) {
+    const on = data.slice(9) === 'on'
+    voiceParts[key] = on
+    saveState()
+    await ctx.answerCallbackQuery({ text: on ? 'Parts: on' : 'Parts: off' }).catch(() => {})
     await ctx.editMessageText(voiceText(key), { reply_markup: voiceKeyboard(key) }).catch(() => {})
     return
   }

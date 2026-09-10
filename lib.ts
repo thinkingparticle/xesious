@@ -682,6 +682,15 @@ export function readAlongHtml(title: string, units: SpeechUnit[], timings: UnitT
     // timestamps give in Telegram.
     return `<${tag} class="u" data-start="${t.start.toFixed(2)}" data-end="${t.end.toFixed(2)}" dir="auto">${esc(u.text)}</${tag}>`
   }).filter(Boolean).join('\n')
+  // The SAME table of contents the full file's caption is built from, computed here
+  // rather than passed in — so the page and the caption cannot drift into disagreeing
+  // about what the sections are. [] when the answer has no headings, and then no chip
+  // is rendered at all: an empty menu is worse than no menu, which is the rule
+  // fullAudioCaption already follows.
+  const toc = speechToc(units, timings)
+  const sheet = toc.map(e =>
+    `<li><button class="s" data-at="${e.at.toFixed(2)}">` +
+    `<span class="st">${fmtDuration(e.at)}</span><span class="sl">${esc(e.title)}</span></button></li>`).join('\n')
   return [
     '<!doctype html>',
     '<html dir="auto"><head><meta charset="utf-8">',
@@ -691,10 +700,18 @@ export function readAlongHtml(title: string, units: SpeechUnit[], timings: UnitT
     ':root { color-scheme: light dark; }',
     'body { max-width: 46rem; margin: 0 auto 6rem; padding: 0 1rem;',
     '  font: 17px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }',
-    // The player is sticky because the whole point is to follow along while scrolling.
-    'header { position: sticky; top: 0; padding: .75rem 0; backdrop-filter: blur(8px);',
-    '  background: color-mix(in srgb, Canvas 88%, transparent); border-bottom: 1px solid rgba(127,127,127,.25); }',
-    'audio { width: 100%; }',
+    // The player is sticky because the whole point is to follow along while scrolling,
+    // and it sticks to the BOTTOM. The three dots on <audio controls> are the browser's
+    // own shadow-DOM overflow menu (speed, download): no CSS and no script reaches it,
+    // so which way it opens is not ours to set. Pinned to the top edge it opened off the
+    // screen, and margin could not fix that — sticking re-pins the bar to the edge on the
+    // first scroll, which is exactly when you reach for the speed control. Anchored to
+    // the bottom the menu opens INTO the page under either browser heuristic: upward
+    // always, or upward because that is where the free space now is.
+    'header { position: sticky; bottom: 0; padding: .5rem 0 calc(.5rem + env(safe-area-inset-bottom));',
+    '  backdrop-filter: blur(8px);',
+    '  background: color-mix(in srgb, Canvas 88%, transparent); border-top: 1px solid rgba(127,127,127,.25); }',
+    'audio { width: 100%; display: block; }',
     'h3 { line-height: 1.3; margin: 1.6em 0 .4em; }',
     '.u { cursor: pointer; padding: .15em .35em; margin-inline: -.35em; border-radius: 5px;',
     '  transition: background-color .15s ease; }',
@@ -703,20 +720,71 @@ export function readAlongHtml(title: string, units: SpeechUnit[], timings: UnitT
     '.u.on { background: rgba(255,214,0,.28); box-shadow: inset 3px 0 0 rgba(255,193,7,.9); }',
     '@media (prefers-color-scheme: dark) { .u.on { background: rgba(255,214,0,.16); } }',
     '.hint { color: rgba(127,127,127,.9); font-size: .85em; margin: .4rem 0 1.2rem; }',
+    // ONE collapsed line naming the section being spoken, never a permanently open
+    // list: on a phone a list in the bar eats the screen the text needs, and the text
+    // is the point. It is also the orientation the highlight alone never gives — the
+    // highlight says WHAT is being spoken, never where you are in the whole.
+    '#chip { display: flex; width: 100%; gap: .5rem; align-items: center; background: none;',
+    '  border: 0; padding: .1rem .1rem .35rem; margin: 0; cursor: pointer; font: inherit;',
+    '  font-size: .85em; color: inherit; text-align: start; }',
+    '#cur { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
+    '#caret { opacity: .6; transition: transform .15s ease; }',
+    '#chip[aria-expanded="true"] #caret { transform: rotate(180deg); }',
+    '#sheet { max-height: 50vh; overflow: auto; margin: 0 0 .35rem;',
+    '  border-bottom: 1px solid rgba(127,127,127,.25); }',
+    '#sheet ol { list-style: none; margin: 0; padding: 0; }',
+    '.s { display: flex; gap: .6rem; width: 100%; background: none; border: 0; cursor: pointer;',
+    '  font: inherit; font-size: .92em; color: inherit; text-align: start; padding: .45rem .2rem;',
+    '  border-radius: 5px; }',
+    '.s:hover, .s.on { background: rgba(127,127,127,.16); }',
+    '.st { opacity: .6; font-variant-numeric: tabular-nums; }',
     '</style></head><body>',
-    '<header><audio id="a" controls preload="metadata" src="' + audioDataUri + '"></audio></header>',
+    // Above the text now: it used to sit under a header that is no longer there.
     '<p class="hint">Tap any line to jump there.</p>',
     body,
+    '<header>',
+    toc.length ? '<nav id="sheet" hidden><ol>\n' + sheet + '\n</ol></nav>' : '',
+    toc.length ? '<button id="chip" aria-expanded="false"><span id="cur"></span><span id="caret">&#9662;</span></button>' : '',
+    '<audio id="a" controls preload="metadata" src="' + audioDataUri + '"></audio>',
+    '</header>',
     '<script>',
     '(function(){',
     'var a=document.getElementById("a");',
+    'var bar=document.querySelector("header");',
     'var us=[].slice.call(document.querySelectorAll(".u"));',
     'us.forEach(function(u){u.addEventListener("click",function(){a.currentTime=parseFloat(u.dataset.start)||0;a.play();});});',
+    // A TOC row is a second control pointing at a block that already seeks: set the
+    // time, bring the heading into view, and the existing highlight follows the
+    // playhead on its own. Seeking AND scrolling is two lines, not a feature.
+    'var chip=document.getElementById("chip"),sheet=document.getElementById("sheet");',
+    'var secs=[].slice.call(document.querySelectorAll(".s"));',
+    'function openSheet(v){if(!sheet)return;sheet.hidden=!v;chip.setAttribute("aria-expanded",v?"true":"false");}',
+    'if(chip)chip.addEventListener("click",function(){openSheet(sheet.hidden);});',
+    'secs.forEach(function(s){s.addEventListener("click",function(){',
+    ' a.currentTime=parseFloat(s.dataset.at)||0;',
+    ' var h=us.filter(function(u){return u.dataset.start===s.dataset.at;})[0];',
+    ' if(h)h.scrollIntoView({block:"center",behavior:"smooth"});',
+    ' openSheet(false); a.play(); tick();',
+    '});});',
+    'var curSec=null;',
+    // The current section is the nearest PRECEDING heading, and the sheet is already
+    // in that order — so this is a walk that stops, not a search.
+    'function section(t){',
+    ' if(!secs.length)return;',
+    ' var hit=null;',
+    ' for(var i=0;i<secs.length;i++){ if(parseFloat(secs[i].dataset.at)<=t+0.01)hit=secs[i]; else break; }',
+    ' if(!hit)hit=secs[0];',
+    ' if(hit===curSec)return;',
+    ' if(curSec)curSec.classList.remove("on");',
+    ' curSec=hit; curSec.classList.add("on");',
+    ' document.getElementById("cur").textContent=curSec.querySelector(".sl").textContent;',
+    '}',
     'var cur=null;',
     // Linear scan from the last match rather than a search: the list is short and the
     // playhead only ever moves a little between timeupdate events.
     'function tick(){',
     ' var t=a.currentTime, hit=null;',
+    ' section(t);',
     ' for(var i=0;i<us.length;i++){ var u=us[i];',
     '  if(t>=parseFloat(u.dataset.start)&&t<parseFloat(u.dataset.end)){hit=u;break;} }',
     ' if(hit===cur)return;',
@@ -724,16 +792,42 @@ export function readAlongHtml(title: string, units: SpeechUnit[], timings: UnitT
     ' cur=hit;',
     ' if(cur){cur.classList.add("on");',
     // Only scroll when the highlight has left the viewport, or reading is impossible.
-    '  var r=cur.getBoundingClientRect();',
-    '  if(r.top<80||r.bottom>innerHeight-40)cur.scrollIntoView({block:"center",behavior:"smooth"});}',
+    // The reserved band moved with the bar — it is at the BOTTOM now, and it is
+    // MEASURED rather than a constant, because the bar grows when the section sheet
+    // opens. A line coming to rest behind the player is the same bug the old 80px at
+    // the top was there to prevent.
+    '  var r=cur.getBoundingClientRect(), h=bar?bar.getBoundingClientRect().height:0;',
+    '  if(r.top<16||r.bottom>innerHeight-h-16)cur.scrollIntoView({block:"center",behavior:"smooth"});}',
     '}',
     'a.addEventListener("timeupdate",tick);',
     'a.addEventListener("seeked",tick);',
+    'section(0);',
     '})();',
     '</script>',
     '</body></html>',
     '',
-  ].join('\n')
+  ].filter((l, i, all) => l !== '' || i === all.length - 1).join('\n')
+}
+
+// Roughly how long these units will take to SPEAK, before a single one is synthesised.
+//
+// Needed because the status bubble goes up the moment synthesis starts, and "Speaking…"
+// with no idea how long is the same non-answer as no message at all — the whole reason
+// the bubble exists is to say what is happening and for how long.
+//
+// Characters, not words: 12.6 spoken characters per second is what this box measures,
+// and it is the same constant speakChunked already uses to size its first chunk. The
+// pauses are real time too and they are known exactly, so they are added rather than
+// absorbed into the rate. Deliberately an over-estimate of nothing and an under-estimate
+// of nothing — it is shown as "~", and a wrong minute costs nobody anything.
+export const SPEECH_CHARS_PER_SEC = 12.6
+export function speechEstimateSeconds(units: SpeechUnit[]): number {
+  let s = 0
+  // `speak` is what the synthesiser is handed when normalisation rewrote the unit, and
+  // it is a different length from what the reader sees — "one hundred dollars per year"
+  // takes four times as long to say as `$100/yr` takes to read.
+  for (const u of units) s += (u.speak ?? u.text).length / SPEECH_CHARS_PER_SEC + u.gap
+  return s
 }
 
 export function speechChunkSeconds(index: number): number {

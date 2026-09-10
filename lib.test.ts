@@ -366,6 +366,52 @@ describe('readAlongHtml', () => {
   test('a unit with no timing is dropped rather than rendered untimed', () => {
     expect(readAlongHtml('x', u, [{ start: 0, end: 1 }], 'data:,')).not.toContain('Some body text')
   })
+
+  // The player's three-dot menu is the browser's own, and it opened off the top of the
+  // screen. Nothing we can write aims it, so the bar moved instead.
+  test('the player is anchored to the bottom, below the text', () => {
+    expect(html).toContain('position: sticky; bottom: 0')
+    expect(html).not.toContain('position: sticky; top: 0')
+    // Order in the document is the fix, not just the CSS: a bar that is still the
+    // first child covers the opening lines the moment sticking gives out.
+    expect(html.indexOf('Some body text')).toBeLessThan(html.indexOf('<header>'))
+    // And the hint came with it, since it used to sit under a header that has moved.
+    expect(html.indexOf('Tap any line')).toBeLessThan(html.indexOf('Some body text'))
+  })
+  test('the autoscroll band is reserved at the bottom, measured from the bar', () => {
+    // 80px at the top was the old header's height. The bar grows when the sheet opens,
+    // so the reserve has to be read off the element rather than hardcoded.
+    expect(html).toContain('bar.getBoundingClientRect().height')
+    expect(html).toContain('r.bottom>innerHeight-h-16')
+    expect(html).not.toContain('r.top<80')
+  })
+
+  test('the section index reaches the page, and every row seeks a block that exists', () => {
+    const src = '## First\n\nOne.\n\n## Second\n\nTwo.'
+    const un = speechUnits(src)
+    const ti = un.map((_, i) => ({ start: i * 10, end: i * 10 + 9 }))
+    const page = readAlongHtml('x', un, ti, 'data:,')
+    const toc = speechToc(un, ti)
+    expect(toc.length).toBe(2)
+    for (const e of toc) {
+      // The row's target and the block's own offset are the same string, which is what
+      // makes "seek the audio and scroll the page" the two lines it is.
+      expect(page).toContain(`class="s" data-at="${e.at.toFixed(2)}"`)
+      expect(page).toContain(`data-start="${e.at.toFixed(2)}"`)
+      expect(page).toContain(e.title)
+    }
+  })
+  test('no headings means no chip at all, not an empty menu', () => {
+    // Same rule fullAudioCaption follows: marks every two minutes would be navigation
+    // to arbitrary places, so there is nothing to show.
+    const un = speechUnits('Just prose. And more of it.')
+    const page = readAlongHtml('x', un, un.map(() => ({ start: 0, end: 5 })), 'data:,')
+    expect(speechToc(un, [{ start: 0, end: 5 }])).toEqual([])
+    expect(page).not.toContain('id="chip"')
+    expect(page).not.toContain('id="sheet"')
+    // The script still has to run — the highlight does not depend on the chip.
+    expect(page).toContain('a.addEventListener("timeupdate",tick)')
+  })
 })
 
 describe('speechUnits carries the block kind', () => {

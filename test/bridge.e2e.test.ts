@@ -2172,6 +2172,7 @@ describe('the voice note is threaded, and never blocks the topic', () => {
     // the group now reports its first message id, and the last resort is the user's
     // own message rather than undefined.
     await incoming(1423, '/voice on')
+    await incoming(1423, '/voice parts on')            // this is about threading, not about parts
     const before = calls.length
     await incoming(1423, 'LONG')                       // stub answer past REPLY_FILE_CHARS
     await bridge._drainQueue('1423:main#voice')
@@ -2242,24 +2243,165 @@ describe('a long spoken answer can be stopped, indexed and tidied', () => {
   const withChunking = async (fn: () => Promise<void>) => fn()
   const kbOf = (c: any) => c.payload?.reply_markup?.inline_keyboard
 
-  test('the first note carries a Stop button and later notes say where they start', async () => {
+  test('the notes carry no buttons — Stop lives on the status message, from t=0', async () => {
     // Reported: "if a very long voice is being generated… I have no way to cancel
     // that shit". Nothing had a handle on synthesis at all.
+    //
+    // The first fix put 🛑 on note 1 — a message that does not exist for the first
+    // ~30 seconds, so during the slowest and least interruptible stretch of a run
+    // there was still no way to stop it. The status bubble exists before a single
+    // sample does, which is the only place the button is any use.
     await withChunking(async () => {
       await incoming(1430, '/voice on')
+      await incoming(1430, '/voice parts on')
       const before = calls.length
       await incoming(1430, 'HEADINGS')
+      const status = calls.slice(before).find(c => c.method === 'sendMessage'
+        && String(c.payload?.text ?? '').includes('🎙 Speaking'))
+      expect(status).toBeTruthy()
+      expect(String(kbOf(status)?.flat().find((b: any) => String(b.text).includes('Stop'))?.callback_data))
+        .toStartWith('vstop:')
       await bridge._drainQueue('1430:main#voice')
       const notes = calls.slice(before).filter(c => c.method === 'sendVoice')
       expect(notes.length).toBeGreaterThan(1)
-      const btn = kbOf(notes[0])?.[0]?.[0]
-      expect(String(btn?.text)).toContain('Stop')
-      expect(String(btn?.callback_data)).toStartWith('vstop:')
-      // …and only the first: a button on every bubble is noise.
-      expect(notes.slice(1).every(c => !kbOf(c))).toBe(true)
+      // Not on any note any more, first or otherwise.
+      expect(notes.every(c => !kbOf(c))).toBe(true)
       // The label says where you are in the answer; it deliberately carries no
       // timestamp, since a seek inside a 90-second chunk cannot reach 5:42.
       expect(String(notes[1].payload.caption)).toMatch(/part 2/)
+    })
+  }, 25000)
+
+  test('QUIET BY DEFAULT: one status bubble and the full file, no part notes', async () => {
+    // Requested: "current implementation makes the chat messy". A long answer used to
+    // post six messages — four of them audio, and the same audio twice, because the
+    // parts are pure sediment once the full file lands.
+    await withChunking(async () => {
+      await incoming(1440, '/voice on')
+      const before = calls.length
+      await incoming(1440, 'HEADINGS')
+      await bridge._drainQueue('1440:main#voice')
+      await new Promise(r => setTimeout(r, 300))
+      const cs = calls.slice(before)
+      // Synthesis is untouched — the full file is here, and on time.
+      expect(cs.some(c => c.method === 'sendAudio')).toBe(true)
+      // …and not one part note went out.
+      expect(cs.filter(c => c.method === 'sendVoice').length).toBe(0)
+      // The bubble was posted, and then deleted once the audio landed: a text message
+      // cannot be edited into a media one, so it can never BECOME the audio.
+      const status = cs.find(c => c.method === 'sendMessage'
+        && String(c.payload?.text ?? '').includes('🎙 Speaking'))
+      expect(status).toBeTruthy()
+      // …and it said how long, because "Speaking…" alone is the same non-answer as
+      // no message at all.
+      expect(String(status!.payload.text)).toMatch(/~\d+(s|m|h)/)
+      expect(cs.some(c => c.method === 'deleteMessage')).toBe(true)
+    })
+  }, 25000)
+
+  test('the button BACK-FILLS: a tap at t=60s sends the parts already made', async () => {
+    // Its whole value is the window before the first note exists, so a switch that
+    // only affected future chunks would be useless exactly when it is wanted.
+    await withChunking(async () => {
+      // LONGHEADINGS, not HEADINGS: the button is only offered when the answer is
+      // predicted to have parts at all, and HEADINGS speaks in about twelve seconds.
+      await incoming(1441, '/voice on')
+      const before = calls.length
+      await incoming(1441, 'LONGHEADINGS')
+      const status = calls.slice(before).find(c => c.method === 'sendMessage'
+        && String(c.payload?.text ?? '').includes('🎙 Speaking'))
+      const parts = kbOf(status)?.flat().find((b: any) => String(b.callback_data).startsWith('vparts:'))
+      expect(parts).toBeTruthy()
+      // Let some chunks pile up unsent, then ask for them.
+      await new Promise(r => setTimeout(r, 250))
+      const mark = calls.length
+      await bridge.bot.handleUpdate({
+        update_id: 98810,
+        callback_query: { id: 'vp1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+          data: String(parts.callback_data),
+          message: { message_id: 98811, date: 0, chat: { id: 1441, type: 'private' } } },
+      })
+      await bridge._drainQueue('1441:main#voice')
+      await new Promise(r => setTimeout(r, 300))
+      const after = calls.slice(mark).filter(c => c.method === 'sendVoice')
+      expect(after.length).toBeGreaterThan(1)
+      // Back-filled in order and numbered as speak.py made them: part 1 has no
+      // caption, and the next one says part 2.
+      expect(after[0].payload.caption).toBeUndefined()
+      expect(String(after[1].payload.caption)).toMatch(/part 2/)
+    })
+  }, 25000)
+
+  test('the button works the moment it appears, with no chunk yet in existence', async () => {
+    // Tapped against a deliberately slow synthesiser, so nothing has been made yet.
+    //
+    // What this does NOT cover, stated because it looks like it should: the bubble is
+    // posted before the lead units are normalised, and that wait can run to twenty
+    // seconds — a window in which an earlier version answered "already finished
+    // speaking", which is the worst possible reply during exactly the stretch the
+    // button exists for. The suite runs with normalisation OFF, so `leadReady`
+    // resolves immediately and that window does not exist here. Verified by removing
+    // the fix: this test still passed. The guard is the ordering in speakChunked —
+    // release is installed before the message carrying its button is sent.
+    writeFileSync(SLOW_SPEAK, 'x')
+    try {
+      await withChunking(async () => {
+        await incoming(1444, '/voice on')
+        const before = calls.length
+        const run = bridge._drainQueue('1444:main#voice')
+        await incoming(1444, 'LONGHEADINGS')
+        const status = calls.slice(before).find(c => c.method === 'sendMessage'
+          && String(c.payload?.text ?? '').includes('🎙 Speaking'))
+        const parts = kbOf(status)?.flat().find((b: any) => String(b.callback_data).startsWith('vparts:'))
+        expect(parts).toBeTruthy()
+        // Tapped immediately — no waiting for a chunk to exist.
+        const mark = calls.length
+        await bridge.bot.handleUpdate({
+          update_id: 98820,
+          callback_query: { id: 'vp2', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+            data: String(parts.callback_data),
+            message: { message_id: 98821, date: 0, chat: { id: 1444, type: 'private' } } },
+        })
+        const answered = calls.slice(mark).find(c => c.method === 'answerCallbackQuery')
+        expect(answered).toBeTruthy()          // or the assertion below passes vacuously
+        expect(String(answered!.payload?.text ?? '')).not.toContain('already finished')
+        await run
+        await bridge._drainQueue('1444:main#voice')
+        await new Promise(r => setTimeout(r, 300))
+        // …and the parts really did start arriving, rather than the tap being a no-op.
+        expect(calls.slice(mark).filter(c => c.method === 'sendVoice').length).toBeGreaterThan(0)
+      })
+    } finally { rmSync(SLOW_SPEAK, { force: true }) }
+  }, 40000)
+
+  test('a short answer is offered no parts button — there are no parts', async () => {
+    // One note and no full file, so the button would be a lie. Predicted from the
+    // estimate, since the real boundary is decided by duration inside speak.py.
+    await withChunking(async () => {
+      await incoming(1442, '/voice on')
+      const before = calls.length
+      await incoming(1442, 'hello there')
+      await bridge._drainQueue('1442:main#voice')
+      const status = calls.slice(before).find(c => c.method === 'sendMessage'
+        && String(c.payload?.text ?? '').includes('🎙 Speaking'))
+      expect(status).toBeTruthy()
+      expect(kbOf(status)?.flat().some((b: any) => String(b.callback_data).startsWith('vparts:'))).toBe(false)
+      // 🛑 is still there: a short answer is still worth stopping.
+      expect(kbOf(status)?.flat().some((b: any) => String(b.callback_data).startsWith('vstop:'))).toBe(true)
+    })
+  }, 25000)
+
+  test('with no full file the held note goes out anyway — silence is not an option', async () => {
+    // The quiet path holds every chunk. A short answer produces no full file at all,
+    // so if the hold were unconditional the answer would simply never be spoken.
+    await withChunking(async () => {
+      await incoming(1443, '/voice on')
+      const before = calls.length
+      await incoming(1443, 'hello there')
+      await bridge._drainQueue('1443:main#voice')
+      const cs = calls.slice(before)
+      expect(cs.some(c => c.method === 'sendAudio')).toBe(false)   // the premise
+      expect(cs.filter(c => c.method === 'sendVoice').length).toBeGreaterThan(0)
     })
   }, 25000)
 
@@ -2281,19 +2423,28 @@ describe('a long spoken answer can be stopped, indexed and tidied', () => {
     })
   }, 25000)
 
-  test('the full file offers to remove the parts, and the tap deletes exactly those', async () => {
+  test('the parts SURVIVE the full file — removing them is a tap, never automatic', async () => {
+    // Nothing deletes a voice note on its own. A rule that cleared parts you had opted
+    // into was tried and removed: the full file lands exactly when a listener is most
+    // likely mid-chunk, and deleting the note that is playing stops playback dead.
     await withChunking(async () => {
       await incoming(1432, '/voice on')
+      await incoming(1432, '/voice parts on')
       const before = calls.length
       await incoming(1432, 'HEADINGS')
       await bridge._drainQueue('1432:main#voice')
+      await new Promise(r => setTimeout(r, 300))
       const cs = calls.slice(before)
+      const notes = cs.filter(c => c.method === 'sendVoice').length
+      expect(notes).toBeGreaterThan(1)
       const full = cs.find(c => c.method === 'sendAudio')
-      const tidy = kbOf(full)?.[0]?.[0]
-      expect(String(tidy?.callback_data)).toStartWith('vtidy:')
-      const noteIds = cs.filter(c => c.method === 'sendVoice').length
-      expect(noteIds).toBeGreaterThan(1)
+      expect(full).toBeTruthy()
+      // Only the status bubble was deleted. The notes are all still there.
+      expect(cs.filter(c => c.method === 'deleteMessage').length).toBeLessThan(notes + 1)
 
+      // …and the button is offered, and IT is what removes them.
+      const tidy = kbOf(full)?.flat().find((b: any) => String(b.callback_data).startsWith('vtidy:'))
+      expect(tidy).toBeTruthy()
       const mark = calls.length
       await bridge.bot.handleUpdate({
         update_id: 98800,
@@ -2304,7 +2455,7 @@ describe('a long spoken answer can be stopped, indexed and tidied', () => {
       await new Promise(r => setTimeout(r, 300))
       const after = calls.slice(mark)
       // One delete per note, and the full file is NOT deleted.
-      expect(after.filter(c => c.method === 'deleteMessage').length).toBe(noteIds)
+      expect(after.filter(c => c.method === 'deleteMessage').length).toBe(notes)
       expect(after.some(c => c.method === 'editMessageReplyMarkup')).toBe(true)
     })
   }, 25000)
@@ -2512,6 +2663,7 @@ describe('a long spoken answer can be stopped, indexed and tidied', () => {
     // on a note holding 90 seconds that begin at 5:42, so it has no 5:42 to seek to.
     await withChunking(async () => {
       await incoming(1438, '/voice on')
+      await incoming(1438, '/voice parts on')          // this is about the captions, not the default
       const before = calls.length
       await incoming(1438, 'HEADINGS')
       await bridge._drainQueue('1438:main#voice')
@@ -2599,6 +2751,7 @@ describe('a long spoken answer can be stopped, indexed and tidied', () => {
     // several notes, which is exactly the case that produced an unwanted document.
     await withChunking(async () => {
       await incoming(1436, '/voice on')
+      await incoming(1436, '/voice parts on')          // several notes is the premise here
       const before = calls.length
       await incoming(1436, 'HEADINGS')
       await bridge._drainQueue('1436:main#voice')
@@ -2621,16 +2774,17 @@ describe('a long spoken answer can be stopped, indexed and tidied', () => {
         const before = calls.length
         const run = bridge._drainQueue('1434:main#voice')
         await incoming(1434, 'HEADINGS')
-        // Poll for the first note rather than guessing: the synthesiser is
-        // deliberately slow here, so a fixed wait taps before anything exists.
-        let note: any
-        for (let i = 0; i < 60 && !note; i++) {
-          await new Promise(r => setTimeout(r, 250))
-          note = calls.slice(before).find(c => c.method === 'sendVoice')
-        }
-        expect(note).toBeTruthy()
-        const stop = kbOf(note)?.[0]?.[0]
-        expect(String(stop?.callback_data)).toStartWith('vstop:')
+        // No polling any more, and that IS the fix. This used to wait up to fifteen
+        // seconds for note 1 to appear, because that was where 🛑 lived — which is the
+        // whole complaint: with a slow synthesiser there was a long stretch at the
+        // start of every run with nothing to tap. The status bubble is posted before
+        // the child is even spawned.
+        const status = calls.slice(before).find(c => c.method === 'sendMessage'
+          && String(c.payload?.text ?? '').includes('🎙 Speaking'))
+        expect(status).toBeTruthy()
+        expect(calls.slice(before).some(c => c.method === 'sendVoice')).toBe(false)
+        const stop = kbOf(status)?.flat().find((b: any) => String(b.callback_data).startsWith('vstop:'))
+        expect(stop).toBeTruthy()
 
         const tap = (id: string) => bridge.bot.handleUpdate({
           update_id: Math.floor(Math.random() * 1e6),
