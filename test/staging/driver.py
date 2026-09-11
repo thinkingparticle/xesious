@@ -2419,6 +2419,12 @@ async def feature_voice_progressive(client, bot):
         seen.append((asyncio.get_event_loop().time(), ev.message))
 
     await send_and_wait(client, bot, "/voice on")
+    # The part notes are OPT-IN now: by default a spoken answer is one status bubble
+    # and then the full file, because six messages of audio per answer — four of them
+    # audio, and the same audio twice — made the topic unreadable. This case is about
+    # the notes arriving progressively, so it asks for them. The quiet default is
+    # asserted in tier 2 ("QUIET BY DEFAULT"), where it costs no synthesis.
+    await send_and_wait(client, bot, "/voice parts on")
     t0 = asyncio.get_event_loop().time()
     mark = len(seen)
     print("  → asking for a long answer with voice on")
@@ -2629,6 +2635,8 @@ async def feature_voice_progressive(client, bot):
     elif full:
         problems.append("the full answer produced no transcript, so nothing was checked")
 
+    # Per-topic and persisted, so it would leak into every case that runs after this.
+    await send_and_wait(client, bot, "/voice parts off")
     await send_and_wait(client, bot, "/voice off")
     return ("a long answer is spoken progressively without blocking the topic", not problems,
             "; ".join(problems) if problems else
@@ -2887,22 +2895,38 @@ async def feature_voice_cancel_and_tidy(client, bot):
 
     # --- cancel -------------------------------------------------------------------
     mark = len(seen)
+    t0 = asyncio.get_event_loop().time()
     print("  → a long answer, to be cancelled part-way")
     await client.send_message(bot,
         "Reply with ONLY a numbered list of 120 lines, no preamble and no commentary, "
         "each line exactly 'N. The quick brown fox jumps over the lazy dog.' with N "
         "counting up from 1.")
-    first = await _until(lambda: next((m for m in seen[mark:] if m.voice), None), 600)
-    if not first:
+    # 🛑 USED to ride on note 1 — a message that does not exist for the first ~30
+    # seconds, so during the slowest and least interruptible part of a run there was
+    # nothing to tap. It lives on the status bubble now, which is posted before the
+    # synthesiser is even spawned. So this waits for the BUBBLE, not for audio, and
+    # that it arrives in seconds rather than minutes is the fix being exercised.
+    #
+    # Parts are left OFF here deliberately: this half now also asserts the quiet
+    # default, that a spoken answer in flight has produced no voice notes at all.
+    status = await _until(lambda: next((m for m in seen[mark:]
+                                        if "Speaking" in (reply_text(m) or "")), None), 120)
+    if not status:
         client.remove_event_handler(handler)
         return ("a long spoken answer can be cancelled and its parts removed", False,
-                "no voice note arrived within 600s")
-    btns = [b for row in (first.reply_markup.rows if first.reply_markup else []) for b in row.buttons]
-    print(f"    first note carries: {[b.text for b in btns]}")
-    if not any("Stop" in b.text for b in btns):
-        problems.append("the first note carries no Stop button")
+                "no '🎙 Speaking…' status message arrived within 120s")
+    print(f"    status bubble at +{asyncio.get_event_loop().time() - t0:.0f}s: {reply_text(status)!r}")
+    if [m for m in seen[mark:] if m.voice]:
+        problems.append("voice notes arrived without being asked for — parts are meant to be opt-in")
+    rows = status.reply_markup.rows if status.reply_markup else []
+    btns = [b for row in rows for b in row.buttons]
+    print(f"    status bubble carries: {[b.text for b in btns]}")
+    stop_at = next(((i, j) for i, row in enumerate(rows)
+                    for j, b in enumerate(row.buttons) if "Stop" in b.text), None)
+    if stop_at is None:
+        problems.append("the status bubble carries no Stop button")
     else:
-        await first.click(0)
+        await status.click(*stop_at)
         await asyncio.sleep(10)
         n_at_cancel = len([m for m in seen[mark:] if m.voice])
         said = " ".join((reply_text(m) or "") for m in seen[mark:])
@@ -2920,6 +2944,12 @@ async def feature_voice_cancel_and_tidy(client, bot):
             problems.append("the full file was still sent after cancelling")
 
     # --- tidy ---------------------------------------------------------------------
+    # Nothing is auto-removed any more — a rule that cleared parts you had opted into
+    # was tried and removed, because the full file lands exactly when a listener is
+    # most likely mid-chunk and deleting the note that is playing stops playback dead.
+    # So the 🧹 button is always offered when there are parts, and it is the only way
+    # they go. Which means this half has to ask for parts first.
+    await send_and_wait(client, bot, "/voice parts on")
     mark2 = len(seen)
     print("  → a shorter answer, to be tidied once complete")
     # Long enough to be split across MORE THAN ONE note, which is the only case with
@@ -2955,6 +2985,8 @@ async def feature_voice_cancel_and_tidy(client, bot):
                 problems.append("tidying deleted the full file as well")
 
     client.remove_event_handler(handler)
+    # Per-topic and persisted, so it would leak into every case that runs after this.
+    await send_and_wait(client, bot, "/voice parts off")
     await send_and_wait(client, bot, "/voice off")
     return ("a long spoken answer can be cancelled and its parts removed", not problems,
             "; ".join(problems) if problems else
