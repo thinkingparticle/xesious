@@ -83,8 +83,8 @@ async function main() {
   // synthesiser was handed `speak` while the page and index kept `text`, and a marker
   // proves that where a plausible rewrite could be mistaken for the original.
   if (/Rewrite the line below so a speech synthesiser/.test(rawPrompt)) {
-    const line = rawPrompt.split('\nLINE:\n')[1] ?? ''
-    result({ result: `SPOKEN(${line.trim()})` })
+    const line = (rawPrompt.match(/<line>\n([\s\S]*)\n<\/line>/)?.[1] ?? '').trim()
+    result({ result: `SPOKEN(${line})` })
     return
   }
 

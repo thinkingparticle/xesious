@@ -2346,10 +2346,10 @@ describe('a long spoken answer can be stopped, indexed and tidied', () => {
     writeFileSync(SLOW_SPEAK, 'x')
     try {
       await withChunking(async () => {
-        await incoming(1444, '/voice on')
+        await incoming(1450, '/voice on')
         const before = calls.length
-        const run = bridge._drainQueue('1444:main#voice')
-        await incoming(1444, 'LONGHEADINGS')
+        const run = bridge._drainQueue('1450:main#voice')
+        await incoming(1450, 'LONGHEADINGS')
         const status = calls.slice(before).find(c => c.method === 'sendMessage'
           && String(c.payload?.text ?? '').includes('🎙 Speaking'))
         const parts = kbOf(status)?.flat().find((b: any) => String(b.callback_data).startsWith('vparts:'))
@@ -2360,13 +2360,13 @@ describe('a long spoken answer can be stopped, indexed and tidied', () => {
           update_id: 98820,
           callback_query: { id: 'vp2', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
             data: String(parts.callback_data),
-            message: { message_id: 98821, date: 0, chat: { id: 1444, type: 'private' } } },
+            message: { message_id: 98821, date: 0, chat: { id: 1450, type: 'private' } } },
         })
         const answered = calls.slice(mark).find(c => c.method === 'answerCallbackQuery')
         expect(answered).toBeTruthy()          // or the assertion below passes vacuously
         expect(String(answered!.payload?.text ?? '')).not.toContain('already finished')
         await run
-        await bridge._drainQueue('1444:main#voice')
+        await bridge._drainQueue('1450:main#voice')
         await new Promise(r => setTimeout(r, 300))
         // …and the parts really did start arriving, rather than the tap being a no-op.
         expect(calls.slice(mark).filter(c => c.method === 'sendVoice').length).toBeGreaterThan(0)

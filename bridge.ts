@@ -1763,7 +1763,10 @@ function summarizeForSpeech(answer: string): Promise<string> {
     'outcome and any decision the user must make. If it is already short, lightly rephrase for the ear.\n\n---\n' +
     answer.slice(0, 6000)
   return new Promise(resolve => {
-    const args = ['-p', prompt, '--output-format', 'json', '--model', VOICE_SUMMARY_MODEL, '--permission-mode', 'plan']
+    // No plan mode here either: the same shape as normaliseUnit, and the same reason —
+    // there is nothing to plan about rewriting one reply into three sentences, and plan
+    // mode is what produces a preamble about whether planning is needed.
+    const args = ['-p', prompt, '--output-format', 'json', '--model', VOICE_SUMMARY_MODEL]
     const child = spawn(CLAUDE_BIN, args, { cwd: HERE, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
     let out = ''
     child.stdout.on('data', d => (out += d))
@@ -1796,6 +1799,13 @@ const NORMALISE_TIMEOUT_MS = Number(process.env.TG_VOICE_NORMALISE_TIMEOUT_MS ||
 // while never reaching it would mean an answer that stops halfway, which is the bug
 // this whole path is atoning for. A long answer measured 152s.
 const NORMALISE_TAIL_MS = Number(process.env.TG_VOICE_NORMALISE_TAIL_MS || 300_000)
+// Log every rewrite the model made, not only the ones thrown out. Off by default
+// because it is a line per changed unit, but it is the difference between "a listener
+// says a sentence was missing" and being able to answer that: the text handed to the
+// synthesiser is the one artefact nothing kept, so after the fact there was no record
+// anywhere on disk of what had actually been said. Confirming the second report was
+// impossible for exactly this reason — /vtidy had already deleted the audio.
+const NORMALISE_LOG = /^(1|true|yes)$/i.test(process.env.TG_VOICE_NORMALISE_LOG || '')
 
 // Same unit, same audio — and cheap on a re-speak.
 //
@@ -1806,6 +1816,11 @@ const NORMALISE_TAIL_MS = Number(process.env.TG_VOICE_NORMALISE_TAIL_MS || 300_0
 // long-lived process is a leak with extra steps.
 const normCache = new Map<string, string>()
 const NORM_CACHE_MAX = 2000
+// Per-answer tallies, reset by normaliseUnits. Module-level because normaliseUnit is
+// called from workers and threading a stats object through buys nothing: only one
+// answer normalises at a time per topic, and the count is for the log, not for logic.
+let changed = 0
+let rejected = 0
 
 // How many normalisation calls to run at once, decided from the machine rather than
 // from a number someone has to tune.
@@ -1849,8 +1864,6 @@ const NORMALISE_PROMPT = [
   '  Say what the symbol MEANS instead — and/or is "and or", km/h is "kilometres per hour",',
   '  src/lib.ts is "lib dot t s" — or drop it if it means nothing aloud.',
   '- If nothing needs changing, output the line unchanged.',
-  '',
-  'LINE:',
 ].join('\n')
 
 // One unit in, one spoken unit out. Never throws: every failure path returns the
@@ -1859,8 +1872,21 @@ function normaliseUnit(text: string): Promise<string> {
   const hit = normCache.get(text)
   if (hit !== undefined) return Promise.resolve(hit)
   return new Promise<string>(resolve => {
-    const args = ['-p', `${NORMALISE_PROMPT}\n${text}`, '--output-format', 'json',
-                  '--model', NORMALISE_MODEL, '--permission-mode', 'plan']
+    // Delimited, and NOT introduced by a bare label. The prompt used to end with the
+    // word `LINE:` and then the text — so a unit that itself opens `The honest caveat:`
+    // read as another label in the same frame, and the model answered with what it took
+    // to be the payload, dropping the label. Three reported failures in a row opened
+    // with a colon clause; that is a prompt-shape bug, not a phoneme bug.
+    //
+    // And no `--permission-mode plan`. Plan mode invites the model to reason about
+    // whether to plan, and a stateless one-line rewrite has nothing to plan. Measured
+    // over 108 samples per arm on the units that actually reproduce: the shipped
+    // combination was the ONLY arm to emit meta-commentary ("I've already provided the
+    // rewritten line above. No further action is needed…") or multiline output at all,
+    // and it was worst on faithfulness (4/108 against 1/108). Dropping plan mode also
+    // takes ~2s off the median call.
+    const args = ['-p', `${NORMALISE_PROMPT}\n\n<line>\n${text}\n</line>`, '--output-format', 'json',
+                  '--model', NORMALISE_MODEL]
     // cwd: HERE and no --resume, for the reason summarizeForSpeech gives: a stateless
     // pass must not be able to touch or rebind the topic's session.
     const child = spawn(CLAUDE_BIN, args, { cwd: HERE, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
@@ -1892,10 +1918,26 @@ function normaliseUnit(text: string): Promise<string> {
       try { v = String(JSON.parse(out).result ?? '').trim() } catch {
         if (errTail.trim()) console.error(`[voice] normaliser: ${errTail.trim()}`)
       }
+      // The delimiters are a frame, not content: an echoed `</line>` would be READ
+      // ALOUD. Never observed in 12 samples, and one line to be sure of.
+      v = v.replace(/^<line>\s*/i, '').replace(/\s*<\/line>$/i, '').trim()
       // A model that decided to explain itself, refuse, or write an essay is not
       // giving us a spoken line. Length is the cheap tell and it costs a unit, never
       // the answer: anything suspicious falls back to the written form.
-      if (v.includes('\n') || v.length > text.length * 3 + 80) v = ''
+      //
+      // This is ALL that stands between the model and the listener, and it is blind to
+      // the failure that was actually reported: a preamble standing in for the
+      // paragraph is one line and SHORTER than its input, so it passes both tests.
+      // Measured on this prompt shape — 0 of 92 samples — but the shape is what makes
+      // that true, and it is not ours to hold still. See the FEEDBACK entry.
+      if (v.includes('\n') || v.length > text.length * 3 + 80) {
+        console.error(`[voice] normalise rejected (shape): ${JSON.stringify(text.slice(0, 60))} -> ${JSON.stringify(v.slice(0, 60))}`)
+        rejected++
+        v = ''
+      } else if (v && v !== text) {
+        changed++
+        if (NORMALISE_LOG) console.log(`[voice] speak: ${JSON.stringify(text.slice(0, 80))} -> ${JSON.stringify(v.slice(0, 80))}`)
+      }
       done(v)
     })
   })
@@ -1913,6 +1955,10 @@ function normaliseUnit(text: string): Promise<string> {
 // text as written, so a failure here must degrade the audio, never withhold it — and
 // a rejection reaching the caller is precisely how 70% of an answer was once dropped.
 function normaliseUnits(units: SpeechUnit[], upTo: number): { lead: Promise<void>; all: Promise<void> } {
+  // One line saying what the stage actually did. `normalising 6/20 units` was the only
+  // trace a run left, and it says what was ATTEMPTED — so a run that dropped a sentence
+  // and a run that did not looked identical in the log.
+  const report = () => console.log(`[voice] normalised ${changed} units, ${rejected} rejected`)
   if (!NORMALISE_SPEECH) return { lead: Promise.resolve(), all: Promise.resolve() }
   const todo = units.map((u, i) => i).filter(i => needsSpeechNormalising(units[i].text))
   if (!todo.length) return { lead: Promise.resolve(), all: Promise.resolve() }
@@ -1931,11 +1977,13 @@ function normaliseUnits(units: SpeechUnit[], upTo: number): { lead: Promise<void
       if (i < upTo && --leadLeft === 0) resolveLead()
     }
   }
+  changed = 0
+  rejected = 0
   console.log(`[voice] normalising ${todo.length}/${units.length} units, ${width} at a time`)
   // `todo` is in order, so the workers reach the lead units first and `lead` settles
   // as early as it can. resolveLead again at the end in case none of them were gated.
   const all = Promise.all(Array.from({ length: Math.min(width, todo.length) }, worker))
-    .then(() => { resolveLead() }, e => { console.error(`[voice] normalise: ${e}`); resolveLead() })
+    .then(() => { report(); resolveLead() }, e => { console.error(`[voice] normalise: ${e}`); report(); resolveLead() })
   return { lead, all }
 }
 
