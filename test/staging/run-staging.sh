@@ -56,6 +56,13 @@ case "$STAGE_SESSIONS" in
   *) echo "[staging] refusing to use $STAGE_SESSIONS as the sessions base: it is wiped every run, so its path must contain 'staging'" >&2; exit 1 ;;
 esac
 rm -f "$STAGE_DIR/state.json"; rm -rf "$STAGE_DIR/sessions" "$STAGE_SESSIONS"
+# The same goes for Telegram's queue. The previous run's teardown is a clean exit, and
+# a clean exit leaves the marker that makes the next start KEEP messages received
+# while down — right for production, wrong here: whatever reached the staging bot
+# between runs was replayed into this one. A /restart typed from the test account
+# between runs did exactly that, and stopped the bridge before the first case
+# (2026-09-27). Without the marker the bridge drops the backlog at startup.
+rm -f "$STAGE_DIR/.clean-exit"
 LOG="$STAGE_DIR/bridge.log"; : > "$LOG"
 
 # Isolated environment for the staging bridge process. Both .env loaders are

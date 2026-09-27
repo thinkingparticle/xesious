@@ -28,7 +28,7 @@ import { dirname, join, isAbsolute, basename, extname, resolve, relative } from 
 import { homedir, tmpdir, freemem as osFreemem } from 'node:os'
 import { randomUUID, createHash } from 'node:crypto'
 import {
-  parseIdList, keyFor, sanitize, encodeCwd, parseDirs,
+  parseIdList, keyFor, sanitize, encodeCwd, parseDirs, getPathArg,
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
   EFFORT_LEVELS, EFFORT_DEFAULT, normalizeEffort,
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
@@ -2184,7 +2184,7 @@ async function askForInput(m: ConfigMenu, tok: string, kind: AwaitedInput['kind'
       : `📝 ${who}, reply to this message with the instructions Claude should follow in this group (up to ${INSTRUCTIONS_MAX.toLocaleString('en-US')} characters). They replace the current ones.`
   const sent = await bot.api.sendMessage(m.chatId, text, {
     ...destOpts({ threadId: m.threadId }), parse_mode: 'HTML',
-    reply_markup: { force_reply: true, selective: true, input_field_placeholder: kind === 'editor' ? '@username' : 'Instructions for Claude' },
+    reply_markup: { force_reply: true, selective: true, input_field_placeholder: kind === 'editor' ? '@username' : 'Prompts and instructions for Claude' },
   }).catch(e => { console.error(`[config] input prompt: ${e}`); return null })
   if (!sent) return false
   for (const [k, a] of awaitingInput) if (Date.now() - a.at > INPUT_TTL_MS) awaitingInput.delete(k)
@@ -4727,6 +4727,14 @@ type PromptKind = {
   // declines with SILENT_REPLY (or fails — nobody is waiting for an error).
   auto?: { reason: string; text?: string }
 }
+// A person's message the way the model must see it to act on it: behind the marker
+// the system prompt declares. Anything the model is asked to DO goes through this —
+// text without the marker is, by that same prompt, material and never an instruction.
+const frameFrom = (ctx: Context, text: string) => frameUserMessage(text, {
+  nonce: BRIDGE_NONCE,
+  name: [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || ctx.from?.username,
+  id: ctx.from?.id,
+})
 async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string, replyTo?: number, kind: PromptKind = {}): Promise<void> {
   // Renamed off `promoted` on the way in, because `promoteBlock`'s result already
   // owns that name further down this function. Left as-is it SHADOWED this flag, so
@@ -4784,11 +4792,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   const convBlock = kind.conv && !background && ctx.chat?.type !== 'private'
     ? await conversationContext(ctx, key, threadId, kind.conv.msgId, kind.conv.reply, cwd, !!kind.auto, kind.auto ? kind.auto.text ?? '' : prompt).catch(e => { console.error(`[conv] ${key}: ${e}`); return '' })
     : ''
-  const framed = shareNote + filesPreamble(BRIDGE_NONCE, arrived) + preamble + convBlock + (kind.auto ? autoFrame(kind.auto.reason) : frameUserMessage(prompt, {
-    nonce: BRIDGE_NONCE,
-    name: [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || ctx.from?.username,
-    id: ctx.from?.id,
-  }))
+  const framed = shareNote + filesPreamble(BRIDGE_NONCE, arrived) + preamble + convBlock + (kind.auto ? autoFrame(kind.auto.reason) : frameFrom(ctx, prompt))
   // If this topic has a live link, the shared link is the source of truth for the
   // session id, so a conversation held over the live web call continues here (and
   // vice-versa). Otherwise use the topic's own stored id.
@@ -4994,9 +4998,16 @@ const refreshing = new Set<string>()
 // the CLI mints a throwaway that would otherwise bind this topic to an empty session.
 // The button path goes through HERE rather than reaching for runStreaming directly,
 // so that guarantee is made in one place instead of two.
+//
+// Only the bare command is forwarded. In a group, Telegram adds the bot's name to a
+// command tapped from the menu — `/usage@some_bot` — and the CLI has no command by
+// that name, so it went to the model as an ordinary prompt. Unframed, since a
+// passthrough is not speech, and the model rightly refused it as unverified
+// (reported 2026-09-25).
+const passthroughCommand = (text: string) => text.trim().split(/\s+/)[0].toLowerCase().replace(/@\S+$/, '')
 async function runPassthrough(ctx: Context, threadId: number | undefined, key: string, text: string): Promise<string> {
   const cwd = resolveCwd(ctx, threadId)
-  const res = await runStreaming(ctx, threadId, key, text, cwd, sessions[key]?.sessionId, modeFor(key), modelFor(key), { silent: true })
+  const res = await runStreaming(ctx, threadId, key, passthroughCommand(text), cwd, sessions[key]?.sessionId, modeFor(key), modelFor(key), { silent: true })
   return res.text
 }
 
@@ -5012,7 +5023,7 @@ async function handlePassthrough(ctx: Context, threadId: number | undefined, key
     out = await runPassthrough(ctx, threadId, key, text)
   } catch (e) { await send(ctx, threadId, `⚠️ ${e}`); return }
   if (stopped.has(key)) { stopped.delete(key); return }
-  const cmd = text.trim().split(/\s+/)[0].toLowerCase().replace(/@\S+$/, '')
+  const cmd = passthroughCommand(text)
   const body = stamped(out.trim())
   // The button only goes on an answer that fits ONE message. A chunked report has
   // no single message to edit, and a Refresh that silently replaced the first of
@@ -5746,7 +5757,11 @@ bot.on('message', async ctx => {
       { ...destOpts({ threadId, replyTo: msg.message_id }), disable_notification: true }).catch(() => null)
     void enqueue(key, async () => {
       const cwd = resolveCwd(ctx, threadId)
-      const res = await runStreaming(ctx, threadId, key, fanoutPlanPrompt(task, setting('fanoutMax', key) as number), cwd,
+      // Framed as the asker's message, like any turn. Sent bare, it carried no marker,
+      // and the model — told that unmarked text is never an instruction — declined to
+      // plan at all: "This message doesn't start with your verification marker"
+      // (Tier 3, 2026-09-27).
+      const res = await runStreaming(ctx, threadId, key, frameFrom(ctx, fanoutPlanPrompt(task, setting('fanoutMax', key) as number)), cwd,
         sessions[key]?.sessionId, 'plan', modelFor(key), { effort: effortFor(key), fork: true })
       const items = parseFanoutPlan(res.text, { max: setting('fanoutMax', key) as number })
       if (thinking) await ctx.api.deleteMessage(ctx.chat!.id, thinking.message_id).catch(() => {})
@@ -5849,8 +5864,8 @@ bot.on('message', async ctx => {
     return
   }
   if (cmd === '/get') {
-    const arg = text.slice(text.indexOf(' ') + 1).trim()
-    if (!arg || arg.startsWith('/')) { await send(ctx, threadId, `Usage: /get <path>  (relative to this topic's directory, or absolute)`); return }
+    const arg = getPathArg(text, homedir())
+    if (!arg) { await send(ctx, threadId, `Usage: /get <path>  (relative to this topic's directory, or absolute)`); return }
     const cwd = resolveCwd(ctx, threadId)
     const target = isAbsolute(arg) ? arg : resolve(cwd, arg)
     await sendFile(ctx, threadId, target)

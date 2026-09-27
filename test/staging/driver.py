@@ -3288,7 +3288,7 @@ async def feature_config_topic_instructions(client, bot):
             await _until(lambda: sum(1 for m in pool if m.id == menu.id) > n, 15)
             return None
 
-        for pattern in (r"More settings", r"^📝 Instructions", r"Add instructions for .* only"):
+        for pattern in (r"More settings", r"^📝 Prompts and Instructions", r"Add instructions for .* only"):
             err = await tap(pattern)
             if err:
                 return (name, False, err)

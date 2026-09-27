@@ -10,7 +10,7 @@ import { test, expect, describe } from 'bun:test'
 import {
   effectiveAnswers, effectiveRecords, modeAnswers, foldRecords, sinceMark, replyWindow, contextParts, fitNewest, convLine, conversationPreamble, type ConvRecord,
   SETTINGS, settingDef, resolveSetting, choiceLabel, normalizeUsername, canEditSettings, pinPendingEditor, type EditorPolicy,
-  parseIdList, keyFor, sanitize, encodeCwd, parseDirs,
+  parseIdList, keyFor, sanitize, encodeCwd, parseDirs, getPathArg,
   allowedModes, normalizeMode, permissionArgs,
   normalizeModel, MODEL_DEFAULT,
   toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step,
@@ -244,6 +244,46 @@ describe('speechUnits — the granularity progressive delivery actually needs', 
   })
 })
 
+describe('speechUnits — a line break with no full stop before it is a pause', () => {
+  // Reported 2026-09-26: heard as "…than Europeans AI is actually happening in the
+  // US…". The lines of a block were joined with a space, and the splitter only cuts
+  // after . ! or ?, so a headline ran into the line under it as one sentence.
+  const reported = '2. Why Americans are more anti-AI than Europeans\n' +
+    'AI is actually happening in the US, so Americans feel it. Europe is so far behind.\n' +
+    '3. "Bad" is worse than "evil"\nThiel says we moralize too much.'
+  test('a numbered title is said on its own, with a heading pause, apart from its paragraph', () => {
+    const u = speechUnits(reported)
+    expect(u[0]).toMatchObject({ kind: 'heading', text: '2. Why Americans are more anti-AI than Europeans.', gap: SPEECH_GAPS.heading })
+    expect(u[1].text.startsWith('AI is actually happening in the US')).toBe(true)
+  })
+  test('a title ending in a closing quote is still a title — the quote is not a full stop', () => {
+    const u = speechUnits(reported)
+    expect(u[2]).toMatchObject({ kind: 'heading', text: '3. "Bad" is worse than "evil".' })
+    expect(u[3].text).toBe('Thiel says we moralize too much.')
+  })
+  test('a bold line over a paragraph is a title too', () => {
+    expect(speechUnits('**Why it matters**\nBody text here.').map(u => [u.kind, u.text]))
+      .toEqual([['heading', 'Why it matters.'], ['para', 'Body text here.']])
+  })
+  test('the titles become the table of contents of the full audio', () => {
+    const u = speechUnits(reported)
+    const toc = speechToc(u, u.map((_, i) => ({ start: i * 10, end: i * 10 + 9 })))
+    expect(toc).toEqual([{ at: 0, title: '2. Why Americans are more anti-AI than Europeans' }, { at: 20, title: '3. "Bad" is worse than "evil"' }])
+  })
+  test('a break later in a block is a sentence break, not a title', () => {
+    expect(speechUnits('It went well.\nThe numbers are in\nRevenue is up.').map(u => [u.kind, u.text]))
+      .toEqual([['para', 'It went well. The numbers are in. Revenue is up.']])
+  })
+  test('a sentence wrapped mid-way still reads as one sentence', () => {
+    expect(speechUnits('This sentence was wrapped in the\nmiddle and should read as one.').map(u => u.text))
+      .toEqual(['This sentence was wrapped in the middle and should read as one.'])
+  })
+  test('a line that already ends in punctuation joins as before', () => {
+    expect(speechUnits('- **Cause:** the first line\n  goes on here.\n1. Steps:\n   Run the tests.').map(u => [u.kind, u.text]))
+      .toEqual([['item', 'Cause: the first line goes on here.'], ['item', '1. Steps: Run the tests.']])
+  })
+})
+
 describe('speechChunkSeconds — the ramp', () => {
   test('the first two chunks are short so the first note arrives fast', () => {
     // Synthesis measured at 0.65-0.68x realtime, so 45s of audio is ~30s of wait.
@@ -444,6 +484,26 @@ describe('parseDirs', () => {
   })
   test('newline-separated', () => {
     expect(parseDirs('/import /a\n/b')).toEqual(['/a', '/b'])
+  })
+})
+
+describe('getPathArg — what /get was asked for', () => {
+  test('an absolute path is a path, not a missing argument (reported 2026-09-25)', () => {
+    expect(getPathArg('/get /home/u/reports/auto-mode.html', '/home/u')).toBe('/home/u/reports/auto-mode.html')
+  })
+  test('a bare /get has no argument — not the command itself', () => {
+    expect(getPathArg('/get', '/home/u')).toBe('')
+    expect(getPathArg('/get@some_bot', '/home/u')).toBe('')
+  })
+  test('a relative path, and one after the bot name, as given', () => {
+    expect(getPathArg('/get reports/a.html', '/home/u')).toBe('reports/a.html')
+    expect(getPathArg('/get@some_bot ../a b.txt', '/home/u')).toBe('../a b.txt')
+  })
+  test('shell habits: quotes come off and ~ means home', () => {
+    expect(getPathArg('/get "/home/u/my file.txt"', '/home/u')).toBe('/home/u/my file.txt')
+    expect(getPathArg("/get 'a.txt'", '/home/u')).toBe('a.txt')
+    expect(getPathArg('/get ~/notes.md', '/home/u')).toBe('/home/u/notes.md')
+    expect(getPathArg('/get ~other/x', '/home/u')).toBe('~other/x')
   })
 })
 

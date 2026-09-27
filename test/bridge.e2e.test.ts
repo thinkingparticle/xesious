@@ -394,6 +394,35 @@ describe('file delivery: a file staged in ./outbox/ is sent back', () => {
   })
 })
 
+describe('/get fetches a file by any path (reported 2026-09-25)', () => {
+  const sentFile = (cs: Call[]) => cs.some(c => c.method === 'sendDocument')
+  test('an absolute path is sent, not answered with the usage line', async () => {
+    const abs = join(TMP, 'get-abs.txt')
+    writeFileSync(abs, 'abs')
+    const cs = await incoming(1034, `/get ${abs}`)
+    expect(sentFile(cs)).toBe(true)
+    expect(finalReply(cs) ?? '').not.toContain('Usage')
+  })
+  test('a quoted path with a space in it', async () => {
+    mkdirSync(join(TMP, 'get dir'), { recursive: true })
+    const spaced = join(TMP, 'get dir', 'a file.txt')
+    writeFileSync(spaced, 'spaced')
+    expect(sentFile(await incoming(1035, `/get "${spaced}"`))).toBe(true)
+  })
+  test("a relative path is under the topic's directory", async () => {
+    // A private chat's directory is <sessions base>/dm-<user id>.
+    mkdirSync(join(TMP, 'sessions', 'dm-1'), { recursive: true })
+    writeFileSync(join(TMP, 'sessions', 'dm-1', 'get-rel.txt'), 'rel')
+    expect(sentFile(await incoming(1036, '/get get-rel.txt'))).toBe(true)
+  })
+  test('a bare /get gets the usage line', async () => {
+    expect(finalReply(await incoming(1037, '/get'))).toContain('Usage: /get')
+  })
+  test('a path that is not there is named in the answer', async () => {
+    expect(finalReply(await incoming(1038, '/get /no/such/file.txt'))).toContain('Not a file: /no/such/file.txt')
+  })
+})
+
 describe('/restart', () => {
   test('is inert when the poller was never started (importing must not be able to exit)', async () => {
     // requestDrain is set by main(), which the import.meta.main guard keeps from
@@ -577,6 +606,15 @@ describe('the prompt reaches the CLI attributed (A6)', () => {
   test('a passthrough command is NOT framed — it is a CLI command, not speech', async () => {
     const cs = await incoming(1081, '/usage')
     expect(finalReply(cs)).not.toContain(' framed')
+  })
+  test('a passthrough tapped from a group menu reaches the CLI as the bare command', async () => {
+    // Reported 2026-09-25: Telegram adds @<bot> to a command tapped from the menu in a
+    // group. `/usage@bot` is no CLI command, so it went to the model as an unframed
+    // prompt, which the model refused as unverified.
+    for (const cmd of ['/usage', '/cost', '/context']) {
+      await incoming(1082, `${cmd}@katyusha_the_kitty_dev_bot`)
+      expect(readFileSync(LAST_PROMPT, 'utf8')).toBe(cmd)
+    }
   })
 })
 
@@ -1215,6 +1253,14 @@ describe('fan-out', () => {
     expect(btns(proposal).map((b: any) => b.text)).toEqual(['— Run these 2 —', '— Cancel —'])
     // Nothing has been spawned yet: no topic created, no part started.
     expect(after.some(c => c.method === 'createForumTopic')).toBe(false)
+  }, 15000)
+
+  test("the planning turn is framed as the asker's message, so the model acts on it", async () => {
+    // Tier 3, 2026-09-27: sent bare, the planning prompt had no marker, and the model
+    // — told that unmarked text is never an instruction — declined to plan at all.
+    await group('/fanout plan the thing', 99106)
+    await bridge._drainQueue('-100777:main')
+    expect(readFileSync(LAST_PROMPT, 'utf8')).toMatch(/^\[xesious:[0-9a-f]+\] message from T, id 1:\nBreak the following task/)
   }, 15000)
 
   test('confirming creates a topic per part and runs them', async () => {
@@ -2998,7 +3044,7 @@ describe('/config — group settings from Telegram', () => {
     for (const s of ['Model', 'Reasoning effort', 'Voice', 'Topic mode', 'Who can change settings'])
       expect(labels).toContain(s)
     // Edited less often, so behind More settings.
-    for (const s of ['Permission mode', 'Instructions', 'Answers', 'Records messages', 'Topics that differ'])
+    for (const s of ['Permission mode', 'Prompts and Instructions', 'Answers', 'Records messages', 'Topics that differ'])
       expect(labels).not.toContain(s)
     expect(labels).toContain('More settings')
   })
@@ -3143,7 +3189,7 @@ describe('/config — group settings from Telegram', () => {
   test('the group\'s own instructions reach Claude in that group, and only that group', async () => {
     await groupMsg(301, '/config')
     await tap(btn('More settings'))
-    await tap(btn('Instructions'))
+    await tap(btn('Prompts and Instructions'))
     await tap(btn('Write group instructions'))
     const cs = await groupMsg(301, 'Always answer in French.', 1, replyTo(awaitedPrompt()))
     expect(replyOf(cs)).toBe('')
@@ -3160,7 +3206,7 @@ describe('/config — group settings from Telegram', () => {
     // Runs after the group got "Always answer in French." above.
     await groupMsg(309, '/config')
     await tap(btn('More settings'))
-    await tap(btn('Instructions'))
+    await tap(btn('Prompts and Instructions'))
     await tap(btn('Add instructions for topic 309 only'))
     const cs = await groupMsg(309, 'Only ever summarise.', 1, replyTo(awaitedPrompt()))
     expect(replyOf(cs)).toBe('')
@@ -3174,12 +3220,12 @@ describe('/config — group settings from Telegram', () => {
     // The menu says so, and lists the topic as one that differs.
     await groupMsg(309, '/config')
     await tap(btn('More settings'))
-    expect(cfButtons(lastMenu()).map((b: any) => b.text).join(' | ')).toContain('Instructions: set · this topic adds its own')
+    expect(cfButtons(lastMenu()).map((b: any) => b.text).join(' | ')).toContain('Prompts and Instructions: set · this topic adds its own')
     await tap(btn('Topics that differ'))
-    expect(menuText()).toMatch(/topic 309: .*its own instructions/)
+    expect(menuText()).toMatch(/topic 309: .*its own prompts and instructions/)
     // Removing the group's leaves the topic's standing on its own.
     await tap(btn('‹ Back'))
-    await tap(btn('Instructions'))
+    await tap(btn('Prompts and Instructions'))
     await tap(btn("Remove the group's instructions"))
     const alone = replyOf(await groupMsg(309, 'hello'))
     expect(alone).toContain('noGroupInstr')

@@ -293,9 +293,10 @@ Many settings no longer need SSH and a restart: a group changes its own with
 - **The "/" menu:** on startup the bridge registers its command list (`/config`
   ephemeral, the rest ordinary). `TG_SET_COMMANDS=0` leaves the list alone,
   e.g. if you manage it in @BotFather.
-- **Instructions for Claude:** the group can set instructions Claude follows on
-  every turn, and a topic can add its own on top — e.g. the group says "never push
-  to main", the *Summaries* topic adds "only ever summarise". A topic's are added
+- **Prompts and instructions for Claude** (📝 *Prompts and Instructions* in
+  `/config`): the group can set instructions Claude follows on every turn, and a
+  topic can add its own on top — e.g. the group says "never push to main", the
+  *Summaries* topic adds "only ever summarise". A topic's are added
   to the group's, never instead of them; both come after the built-in ones.
   **Unlike the other settings, a change to instructions only reaches new sessions**:
   the CLI fixes a session's system prompt when the session is created, so a topic

@@ -122,6 +122,18 @@ export function parseDirs(text: string): string[] {
   return parts.map(p => p.trim()).filter(Boolean)
 }
 
+// The path /get was given, or '' when there is none. It used to be whatever followed
+// the first space — and a bare `/get` has no space, so that was the command itself,
+// which a `startsWith('/')` check turned away along with every absolute path
+// (reported 2026-09-25). Quotes are a shell habit and `~` means home, as in a shell.
+export function getPathArg(text: string, home: string): string {
+  const i = text.search(/\s/)
+  let arg = i === -1 ? '' : text.slice(i + 1).trim()
+  if (/^(["']).+\1$/.test(arg)) arg = arg.slice(1, -1)
+  if (arg === '~' || arg.startsWith('~/')) arg = home + arg.slice(1)
+  return arg
+}
+
 // ---------------------------------------------------------------------------
 // permission modes
 // ---------------------------------------------------------------------------
@@ -522,6 +534,27 @@ function placeholder(kind: string, lines: number): string {
   return `${kind === 'table' ? 'A table' : `A ${n}-line code block`}.`
 }
 
+// A line break is a pause the reader sees and the listener never got: a block's lines
+// are joined with a space, and the sentence splitter only cuts after . ! or ?. So a
+// headline with no full stop of its own ran straight into the line under it and was
+// heard as one sentence — "…more anti-AI than Europeans AI is actually happening…"
+// (reported 2026-09-26). A break is therefore a boundary when the line before it has
+// no end punctuation, unless the next line carries on in lower case, which is what a
+// sentence wrapped mid-way does.
+function endsPunctuated(line: string): boolean {
+  // Look past what closes a quote, a bracket or emphasis: `3. "Bad" is worse than
+  // "evil"` ends in a quote, and the quote is not the end of a sentence.
+  return /[.!?:;,…—–]$/.test(line.trim().replace(/["'”’)\]*_`»]+$/, ''))
+}
+const breakIsBoundary = (line: string, next: string) => !endsPunctuated(line) && !/^\p{Ll}/u.test(next.trim())
+// A block's lines as one string, with a full stop wherever a break was a boundary.
+const joinLines = (ls: string[]) => ls.map((l, i) => i < ls.length - 1 && breakIsBoundary(l, ls[i + 1]) ? `${l.trimEnd()}.` : l).join(' ')
+// A short first line with a boundary after it is a title over the text beneath it —
+// `2. Why …` then a paragraph, or a bold line then a paragraph — so it is said on its
+// own with a heading's pause, and lands in the audio's table of contents.
+const TITLE_MAX = 100
+const isTitle = (ls: string[]) => ls.length > 1 && ls[0].trim().length <= TITLE_MAX && breakIsBoundary(ls[0], ls[1])
+
 // Split an answer into typed blocks for speech. The types are what drive both the
 // pauses and the phrasing, so this is the one splitter and the truncation work and
 // the prosody work share it.
@@ -559,13 +592,16 @@ export function speechBlocks(md: string): SpeechBlock[] {
       const body: string[] = [li[2]]
       i++
       while (i < lines.length && lines[i].trim() && !/^\s*(?:[-*+]|\d+[.)])\s+/.test(lines[i]) && !/^\s*#{1,6}\s/.test(lines[i]) && !/^\s*```/.test(lines[i])) body.push(lines[i++])
-      push('item', (li[1] ? `${li[1]}. ` : '') + body.join(' '))
+      const num = li[1] ? `${li[1]}. ` : ''
+      if (isTitle(body)) { push('heading', num + body[0]); push('item', joinLines(body.slice(1))); continue }
+      push('item', num + joinLines(body))
       continue
     }
     if (!line.trim()) { i++; continue }
     const para: string[] = []
     while (i < lines.length && lines[i].trim() && !/^\s*(?:```|#{1,6}\s|[-*+]\s|\d+[.)]\s)/.test(lines[i])) para.push(lines[i++])
-    push('para', para.join(' '))
+    if (isTitle(para)) { push('heading', para[0]); push('para', joinLines(para.slice(1))); continue }
+    push('para', joinLines(para))
   }
   return out
 }
@@ -1828,7 +1864,7 @@ export const SETTINGS: SettingDef[] = [
   // instructions are ADDED after the group's, so a group-wide rule ("never push to
   // main") still holds in a topic that also has a job of its own ("only summarise").
   // profileFor() in the bridge reads both levels.
-  { id: 'instructions', label: 'Instructions', emoji: '📝', level: 'advanced', kind: 'text', topic: true,
+  { id: 'instructions', label: 'Prompts and Instructions', emoji: '📝', level: 'advanced', kind: 'text', topic: true,
     help: 'Extra instructions Claude follows on every turn, added after the built-in ones. The group has one set; a topic can add its own on top of it. A change reaches a topic when it starts a new session (/new) — a conversation already under way keeps the instructions it started with.' },
   { id: 'editors', label: 'Who can change settings', emoji: '👥', level: 'basic', kind: 'editors', topic: false,
     help: 'Telegram admins can always change settings. This decides who else can.' },
