@@ -1,0 +1,624 @@
+[
+ {
+  "id": "q01",
+  "type": "vague-reference",
+  "found": true,
+  "cited": [
+   278,
+   279
+  ],
+  "answer": "Based on the search results, Ali suggested a sandbox project for onboarding—a sample project for new signups with a feature flag called `onboarding_sandbox`. According to the engineering topic from July 20th, Reza started working on it and Ali was working on the seed endpoint with a PR promised for the next day. I don't see a more recent update on its status, so it may still be in progress or completed.",
+  "gold": "Ali proposed (Jul 7) giving every new signup a ready-made example project with a sample form and fake submissions instead of an empty dashboard. It was built as the 'sandbox' project; the A/B test showed 44% activation with it vs 31% without (n=412), and on Aug 10 it was turned on for 100% of signups.",
+  "cost": 0.0047150000000000004,
+  "turns": 2,
+  "ms": 6753.451195
+ },
+ {
+  "id": "q02",
+  "type": "latest-state",
+  "found": true,
+  "cited": [
+   487,
+   488,
+   489
+  ],
+  "answer": "Yes, the Friday demo idea is still on! It started as a weekly thing in early July and evolved into every other Friday with customer invitations—the next one was scheduled for August 14th, with each team member showing what they've built that week. (#487, #488, #489)",
+  "gold": "Yes, but since Aug 6 it runs every other Friday and one customer is invited each time. The last one was Aug 14 with a customer guest (Birgit); the next one is Aug 28.",
+  "cost": 0.00477,
+  "turns": 2,
+  "ms": 7266.935827
+ },
+ {
+  "id": "q03",
+  "type": "alias",
+  "found": false,
+  "cited": [
+   149
+  ],
+  "answer": "Based on the search results, Tom came up with the idea for demo day! He announced it on July 9th, saying \"I've decided we're calling it demo day, no objections allowed.\"",
+  "gold": "Maryam's. On Jul 2 she proposed a short Friday-afternoon session where everyone shows what they built that week (5 minutes each, no slides). Tom later named it 'demo day'.",
+  "cost": 0.00431,
+  "turns": 2,
+  "ms": 7095.5118410000005
+ },
+ {
+  "id": "q04",
+  "type": "distractor",
+  "found": true,
+  "cited": [
+   498
+  ],
+  "answer": "Yes! The Friday Persian lunches are scheduled to resume on September 4th. Ali announced on August 7th that they were pausing Friday lunch for August since half the team was on holiday and it was too hot (35°C), but they'll restart on September 4th with the company covering up to €100 per lunch.",
+  "gold": "No, they are paused. On Aug 7 Ali paused the Persian Friday lunch until September because of holidays and the heat; it restarts on Sep 4. (The Friday demo session is a different thing and is still on.)",
+  "cost": 0.004616,
+  "turns": 2,
+  "ms": 6109.332331999999
+ },
+ {
+  "id": "q05",
+  "type": "alias",
+  "found": true,
+  "cited": [
+   113,
+   209
+  ],
+  "answer": "Based on the group's history, **Maryam designed the sample form** for the sandbox—a clinic visit survey with 24 fake submissions including photos and GPS pins to ensure the map and charts aren't empty on day one. This was shared in the Figma designs on July 14th.",
+  "gold": "Maryam. It is a clinic visit survey with 24 fake submissions that include photos and GPS pins, so the map and charts are not empty on day one.",
+  "cost": 0.004989,
+  "turns": 2,
+  "ms": 7496.277285
+ },
+ {
+  "id": "q06",
+  "type": "latest-state",
+  "found": true,
+  "cited": [
+   438,
+   439
+  ],
+  "answer": "The enterprise tier is currently €7,200/year for up to 100 users, with a 15% discount available for 2-year prepay deals.",
+  "gold": "€7,200 per year for up to 100 users (raised from €6,000 on Aug 3). The 15% discount for a 2-year prepay still applies.",
+  "cost": 0.00431,
+  "turns": 2,
+  "ms": 6347.12897
+ },
+ {
+  "id": "q07",
+  "type": "distractor",
+  "found": true,
+  "cited": [
+   438,
+   439
+  ],
+  "answer": "Based on the latest discussion, your enterprise tier is **€7,200/year** for up to 100 users (with €50 per user per year above that), and there's a **15% discount available for customers who prepay for 2 years**. This pricing includes SSO and priority support.",
+  "gold": "15% if they prepay 2 years (decided Jul 15 and kept when the tier went to €7,200 on Aug 3). The 40% discount is only for small nonprofits on the Team plan, not for Enterprise.",
+  "cost": 0.004785,
+  "turns": 2,
+  "ms": 6589.884717000001
+ },
+ {
+  "id": "q08",
+  "type": "who-said",
+  "found": true,
+  "cited": [
+   131,
+   223
+  ],
+  "answer": "Tom pushed for replacing per-seat pricing with a flat enterprise tier. He proposed the €6,000/year for up to 100 users model on July 8th (#131), and Sara approved this approach on July 15th (#223).",
+  "gold": "Tom, on Jul 8: per-seat pricing (€12/user/month) was scaring procurement, so he proposed a flat Enterprise tier of €6,000/year for up to 100 users with SSO and priority support included.",
+  "cost": 0.004769,
+  "turns": 2,
+  "ms": 6911.348197000001
+ },
+ {
+  "id": "q09",
+  "type": "followup",
+  "found": true,
+  "cited": [
+   309
+  ],
+  "answer": "Based on our earlier decision, the nonprofit discount \"Fieldnote for Good\" is **40% off the Team plan, only for registered nonprofits with under 50 staff**, and it needs to be verified manually by Nika using registration certificates. It's not available on the Enterprise plan.",
+  "gold": "The nonprofit discount (Fieldnote for Good) is 40% off the Team plan, only for registered nonprofits with fewer than 50 staff, verified manually by Nika with their registration certificate. It is not available on Enterprise.",
+  "cost": 0.004831,
+  "turns": 2,
+  "ms": 6625.996726999998
+ },
+ {
+  "id": "q10",
+  "type": "alias",
+  "found": true,
+  "cited": [
+   535
+  ],
+  "answer": "Based on the group's records, as of August 11th, Nika had approved 12 nonprofit applications for Fieldnote for Good and rejected 3 (including a timeshare \"foundation\"). Since today is August 19th, there may be more approvals since then, but the most recent number I can find is 12.",
+  "gold": "12 approved and 3 rejected, as of Nika's update on Aug 11.",
+  "cost": 0.004758,
+  "turns": 2,
+  "ms": 6283.262924999999
+ },
+ {
+  "id": "q11",
+  "type": "who-said",
+  "found": false,
+  "cited": [
+   309
+  ],
+  "answer": "Based on my searches, I can see that Sara announced the NGO discount decision on July 21 (#309), but the search results don't show an explicit earlier message where someone first suggested it. Let me try searching for who it might have been based on Lena's enthusiastic response.\n\nBased on my search through the group's history, I can see that **Sara announced the NGO discount decision on July 21**, but I wasn't able to find the original message where someone first suggested it—the search results don't show an explicit prior discussion thread about proposing the nonprofit discount. It's possible it was discussed in a separate private conversation or thread that isn't fully captured in these search results.",
+  "gold": "Lena, on Jul 13 in General: small NGOs kept saying the Team plan was too expensive, so she suggested a nonprofit discount.",
+  "cost": 0.0520144,
+  "turns": 11,
+  "ms": 27259.017609
+ },
+ {
+  "id": "q12",
+  "type": "alias",
+  "found": false,
+  "cited": [
+   89
+  ],
+  "answer": "Based on the group's history, Operation Elephant was the database migration from self-hosted Postgres 12 to managed Postgres 16 on DigitalOcean, and the expected downtime was approximately 30 minutes. The actual downtime duration isn't explicitly stated in the messages, only that the operation concluded successfully on August 10, 2026.",
+  "gold": "42 minutes: the cutover to managed Postgres 16 on Saturday night, Jul 25.",
+  "cost": 0.004909,
+  "turns": 2,
+  "ms": 6523.626392999999
+ },
+ {
+  "id": "q13",
+  "type": "temporal",
+  "found": true,
+  "cited": [
+   242,
+   247,
+   359
+  ],
+  "answer": "The database migration was initially planned for the weekend of July 18, but it got postponed to July 25 because logical replication kept lagging on the submissions table (up to 40 minutes behind). Ali discovered the issue was due to a nightly photo-metadata backfill running as one giant transaction, which he fixed. The migration ultimately completed successfully on July 25–26, with the cutover taking 42 minutes and all checks passing.",
+  "gold": "It did not happen that weekend. On Jul 16 Ali postponed it because logical replication kept lagging on the big submissions table (up to 40 minutes behind). It moved to Saturday Jul 25 and was done that night, with a 42-minute cutover.",
+  "cost": 0.005444,
+  "turns": 2,
+  "ms": 7028.220427000004
+ },
+ {
+  "id": "q14",
+  "type": "distractor",
+  "found": true,
+  "cited": [
+   365,
+   517
+  ],
+  "answer": "No, the old DB server is no longer around. Ali deleted the old Hetzner DB box on August 10th, about two weeks after the migration was completed on July 25th—it had been kept read-only as a fallback during that window, but is now gone.",
+  "gold": "No. The old Hetzner DB box was kept read-only for 2 weeks as a fallback, and Ali deleted it on Aug 10.",
+  "cost": 0.005153,
+  "turns": 2,
+  "ms": 6676.523567
+ },
+ {
+  "id": "q15",
+  "type": "distractor",
+  "found": true,
+  "cited": [
+   388,
+   389,
+   390
+  ],
+  "answer": "Based on the history, Nika completed the email migration to Google Workspace on July 29th. A small number of emails sent between 8–10 PM that night may have been lost (they were caught in the old Strato server after the MX records switched), but she asked people to report any missing emails and Tom's lost email was actually found in spam.",
+  "gold": "Yes, it is done: on Jul 29 Nika confirmed all mailboxes are on Google Workspace. Only mail sent to us between about 20:00 and 22:00 on Jul 28 may be missing, because some servers still delivered to the old Strato host. Check spam first, otherwise ask the sender to resend.",
+  "cost": 0.009503000000000001,
+  "turns": 3,
+  "ms": 8728.948459
+ },
+ {
+  "id": "q16",
+  "type": "persian",
+  "found": true,
+  "cited": [
+   378,
+   388
+  ],
+  "answer": "بر اساس تاریخچه گروه، ایمیل‌های شرکت الان روی **Google Workspace** هستن و از **۲۸ جولای ۲۰۲۶** (پیش از کنونی) منتقل شدند. نیکا مایگریشن رو از **Strato** (سرویس قدیم) به Google انجام داد و MX records رو عوض کرد.",
+  "gold": "On Google Workspace. Nika moved all mailboxes off Strato; the cutover was on the evening of Jul 28 and she confirmed on Jul 29 that it was finished.",
+  "cost": 0.006921999999999999,
+  "turns": 3,
+  "ms": 8920.546411000003
+ },
+ {
+  "id": "q17",
+  "type": "latest-state",
+  "found": false,
+  "cited": [
+   10,
+   206,
+   417
+  ],
+  "answer": "Based on the conversation history, there have been three Open Futures deadlines mentioned: the original deadline was **July 31**, then it was extended to **August 14**, and Sara joked on July 31 that the original deadline \"would have been today\" — so those are the three dates causing confusion. The current deadline is **August 14, 2026**.",
+  "gold": "Aug 28, 23:59 CET. It moved from Jul 31 to Aug 14 and then to Aug 28 after the fund's portal was down; the team still aims to submit on Aug 21.",
+  "cost": 0.004507000000000001,
+  "turns": 2,
+  "ms": 8979.769153000001
+ },
+ {
+  "id": "q18",
+  "type": "temporal",
+  "found": true,
+  "cited": [
+   10
+  ],
+  "answer": "The grant call you looked at on July 1st was the **Open Futures Fund call**, offering up to **€80,000** for digital tools serving civil society with 12-month projects (deadline July 31). Your team identified it as a perfect fit for offline data collection for NGOs.",
+  "gold": "The Open Futures Fund call: up to €80k for digital tools serving civil society, for 12-month projects.",
+  "cost": 0.004361,
+  "turns": 2,
+  "ms": 7440.755900999997
+ },
+ {
+  "id": "q19",
+  "type": "persian",
+  "found": true,
+  "cited": [
+   597
+  ],
+  "answer": "Based on the Grants topic, the last amount requested from Open Futures was **€60,000** (mentioned on August 17th when the budget table was finalized).",
+  "gold": "€60k. Sara and Nika agreed on it on Jul 22 (which makes the 20% co-funding €12k), and the final budget table on Aug 17 says €60k requested.",
+  "cost": 0.004344000000000001,
+  "turns": 2,
+  "ms": 6274.973874999996
+ },
+ {
+  "id": "q20",
+  "type": "followup",
+  "found": true,
+  "cited": [
+   322,
+   323,
+   324
+  ],
+  "answer": "Found it! The co-funding amount is **€12,000** — they're requesting €60,000 from Open Futures Fund, which requires 20% co-funding from your side, so that's €12,000.",
+  "gold": "€12k. On Jul 22 Sara and Nika agreed to request €60k, so the 20% co-funding comes to €12,000.",
+  "cost": 0.005234,
+  "turns": 2,
+  "ms": 7418.5875860000015
+ },
+ {
+  "id": "q21",
+  "type": "distractor",
+  "found": true,
+  "cited": [
+   512
+  ],
+  "answer": "Yes! The Berlin Digital Voucher grant for the pen test was approved on August 10th for €12,000, with the condition that the pen test must start before October 31st.",
+  "gold": "Yes. The Berlin Digital Voucher was approved on Aug 10 for €12k (50% of the €24k pen test + ISO 27001 prep project). The pen test has to start before Oct 31.",
+  "cost": 0.004416,
+  "turns": 2,
+  "ms": 6600.551414999994
+ },
+ {
+  "id": "q22",
+  "type": "latest-state",
+  "found": true,
+  "cited": [
+   138,
+   533,
+   534
+  ],
+  "answer": "We went with **Crisp** for the customer support chat tool. It's already live in the web app and Android app, with iOS coming the following week.",
+  "gold": "Crisp, at €95/month. Intercom, the first choice, was dropped on Aug 4; Crisp went live in the web app and the Android app on Aug 11, with iOS next.",
+  "cost": 0.004495,
+  "turns": 2,
+  "ms": 6464.1790580000015
+ },
+ {
+  "id": "q23",
+  "type": "who-said",
+  "found": true,
+  "cited": [
+   138,
+   447
+  ],
+  "answer": "Nika originally picked Intercom on 2026-07-08, after comparing it with Crisp and Zendesk because of the best mobile SDK and because Kessler's team already uses it. However, you later switched to Crisp on 2026-08-04 due to cost.",
+  "gold": "Nika, on Jul 8: she compared Intercom, Crisp and Zendesk and chose Intercom for its mobile SDK. It was later dropped for Crisp.",
+  "cost": 0.011604,
+  "turns": 4,
+  "ms": 8709.616327000003
+ },
+ {
+  "id": "q24",
+  "type": "vague-reference",
+  "found": true,
+  "cited": [
+   480,
+   482
+  ],
+  "answer": "Yes! Nika warned about the expired card issue on August 6th—the domain's auto-renew failed because the old Visa on file had expired, which caused the DNS to be suspended and the site to go down for about 3 hours. Nika caught it, paid with the new card, and then moved all subscriptions off the old one.",
+  "gold": "Yes. On Jul 3 Nika mentioned in Random that the company Visa ending 4471 expired at the end of July and many subscriptions were still on it. The domain auto-renew then failed on Aug 1 on that card, which caused the outage.",
+  "cost": 0.004782,
+  "turns": 2,
+  "ms": 7521.597351999997
+ },
+ {
+  "id": "q25",
+  "type": "temporal",
+  "found": true,
+  "cited": [
+   478,
+   479,
+   480,
+   482
+  ],
+  "answer": "On the morning of August 6th, **fieldnote.app went down** due to a DNS issue caused by a failed domain auto-renewal—the payment card on file had expired, so the registrar suspended DNS resolution. The outage lasted about three hours until Nika renewed the domain with the new card.",
+  "gold": "fieldnote.app stopped resolving (web and app sync down). The domain auto-renew had failed on Aug 1 because the card on file had expired, so the registrar suspended DNS. Nika renewed it with the new card; about 3 hours of downtime.",
+  "cost": 0.00451,
+  "turns": 2,
+  "ms": 6555.12696899999
+ },
+ {
+  "id": "q26",
+  "type": "persian",
+  "found": true,
+  "cited": [
+   404,
+   531
+  ],
+  "answer": "پایلوت Relief Grid ۳۰۰ نفر کارمند میدانی در ۴ سازمان شریک است، ۱۵ سپتامبر شروع میشه، و ۹,۰۰۰ یورو برای ۳ ماه قیمت دادیم.",
+  "gold": "300 field workers across 4 partner organisations, starting Sep 15 for 3 months, at a one-off pilot price of €9,000. It needs Arabic UI and RTL forms working by the start.",
+  "cost": 0.004966,
+  "turns": 2,
+  "ms": 8145.993549999999
+ },
+ {
+  "id": "q27",
+  "type": "vague-reference",
+  "found": true,
+  "cited": [
+   170,
+   561,
+   593
+  ],
+  "answer": "Yes, it did bite you! Reza warned in July about the Android API level 35 deadline, and on August 13th Google Play rejected your 2.8.0 update for exactly that reason—but Reza fixed it and 2.8.1 was approved by August 17th.",
+  "gold": "Yes. On Jul 10 Reza flagged that Google Play requires targeting Android API 35 by Aug 31. On Aug 13 Play rejected the 2.8.0 update for exactly that, and 2.8.1 with targetSdk 35 was approved on Aug 17.",
+  "cost": 0.010082,
+  "turns": 3,
+  "ms": 10372.009880000012
+ },
+ {
+  "id": "q28",
+  "type": "paraphrase",
+  "found": true,
+  "cited": [
+   292
+  ],
+  "answer": "Yes! On July 20th, Nika ordered a new Jura espresso machine that was arriving that Friday. The replacement has been in place since late July.",
+  "gold": "Yes. Nika ordered a new Jura on Jul 20, and it arrived and worked on Jul 24.",
+  "cost": 0.01602,
+  "turns": 4,
+  "ms": 9620.83772000001
+ },
+ {
+  "id": "q29",
+  "type": "paraphrase",
+  "found": true,
+  "cited": [
+   301,
+   302,
+   304
+  ],
+  "answer": "Right now, whoever syncs last overwrites the other person's changes—it's a last-write-wins conflict on the entire entry. But Ali and the team are working on per-field merge with individual timestamps so most changes sync automatically, and only true conflicts on the same field get shown to the user to resolve manually.",
+  "gold": "Both, mostly. Instead of last-write-wins on the whole record, sync now merges field by field. If both people changed the same field, the app shows a conflict and the user chooses. Shipped on Aug 7 in API v2.14 and app 2.7.3.",
+  "cost": 0.0175171,
+  "turns": 4,
+  "ms": 10142.784580000007
+ },
+ {
+  "id": "q30",
+  "type": "paraphrase",
+  "found": false,
+  "cited": [],
+  "answer": "I couldn't find any information about a new part-time helper for the web interface in the group's history. Could you provide more details about when this was discussed, or check if the information might be in a different topic or channel?",
+  "gold": "Mina, the new frontend working student, starts on Sep 1 at 20 hours a week (the role was approved on Jul 17 at €15/h).",
+  "cost": 0.020417,
+  "turns": 5,
+  "ms": 10132.758310999998
+ },
+ {
+  "id": "q31",
+  "type": "paraphrase",
+  "found": true,
+  "cited": [
+   261,
+   263
+  ],
+  "answer": "Great! I found it. Based on the conversation from July 17th, Lena mentioned the NGO Tech Summit in Amsterdam (Netherlands) in October, with a booth costing €4,500, but Sara decided it was too expensive and the team decided to go as visitors instead, with Lena submitting a talk proposal. So no, the company is not paying for a stand—they decided against it.",
+  "gold": "No. Lena suggested a €4,500 booth at the NGO Tech Summit in Amsterdam (Oct 8–9), but on Jul 17 Sara said it was too much. The team goes as visitors, and Lena's talk was accepted for Oct 9.",
+  "cost": 0.008856,
+  "turns": 3,
+  "ms": 8606.671101
+ },
+ {
+  "id": "q32",
+  "type": "cross-topic",
+  "found": false,
+  "cited": [],
+  "answer": "I couldn't find any previous discussion about Lena's webinar in the Engineering channel. Could you provide more context—like when the webinar is scheduled or what it's about? That would help me search more effectively or find the information in another topic.",
+  "gold": "212 registrations as of Aug 10, mostly small NGOs (Lena, in General).",
+  "cost": 0.010507,
+  "turns": 4,
+  "ms": 9307.189123000004
+ },
+ {
+  "id": "q33",
+  "type": "cross-topic",
+  "found": true,
+  "cited": [
+   250
+  ],
+  "answer": "Maryam said the drag handles end up on the wrong side, the date picker doesn't mirror, and the progress bar runs backwards in the form builder with right-to-left layouts.",
+  "gold": "On Jul 16, in Product: in RTL the drag handles end up on the wrong side, the date picker doesn't mirror, and the progress bar runs backwards.",
+  "cost": 0.004789,
+  "turns": 2,
+  "ms": 6095.0130999999965
+ },
+ {
+  "id": "q34",
+  "type": "cross-topic",
+  "found": true,
+  "cited": [
+   456
+  ],
+  "answer": "The budget cap for the offsite is **€3,000 all-in**, which covers the house, food, and train tickets. Nika has the company card for managing these expenses.",
+  "gold": "€3,000 all-in, covering the house, food and train tickets (Sara, Aug 4, in General).",
+  "cost": 0.004337000000000001,
+  "turns": 2,
+  "ms": 5705.705394000004
+ },
+ {
+  "id": "q35",
+  "type": "cross-topic",
+  "found": false,
+  "cited": [
+   131,
+   134,
+   225,
+   543
+  ],
+  "answer": "Based on my search of the conversation history, I don't have a clear update on whether SSO actually ended up working with Kessler's identity provider. The most recent relevant discussion shows that Ali put SAML (which is what SSO requires) at the top of his list after the DB migration on 2026-07-15 (#225), and Kessler's ops lead Birgit was scheduled to join a meeting on 2026-08-14 (#543), but there's no follow-up saying whether the implementation succeeded. You might want to ask Ali or Tom directly about the current status.",
+  "gold": "Yes. On Aug 12 Ali reported in Engineering that SAML SSO works with Kessler's Entra ID test tenant, so their staff can log in with their company accounts.",
+  "cost": 0.009738,
+  "turns": 3,
+  "ms": 9823.896154999995
+ },
+ {
+  "id": "q36",
+  "type": "temporal",
+  "found": true,
+  "cited": [
+   393,
+   394,
+   395,
+   396,
+   397
+  ],
+  "answer": "At the end of July, you discussed the office situation: the cowork was raising rent to €2,300 from September, and the team decided to move to Option B—the smaller room on the 2nd floor for €1,650 with 6 desks—since you're rarely all in on the same day. Everyone agreed (Reza, Tom, Lena, and Ali all approved).",
+  "gold": "On Jul 29 Sara proposed option B: instead of paying €2,300 (up from €1,800) for the current room from September, move to the smaller 2nd-floor room for €1,650 with 6 desks. Nobody objected; the others voted B.",
+  "cost": 0.005175,
+  "turns": 2,
+  "ms": 6877.1315500000055
+ },
+ {
+  "id": "q37",
+  "type": "persian",
+  "found": true,
+  "cited": [
+   469
+  ],
+  "answer": "The office contract is done! Nika signed it for the 2nd floor room at €1,650/month starting September 1st, and the moving was scheduled for Wednesday, August 26th. Since today is August 20th, the move should have happened recently.",
+  "gold": "Nika signed for the smaller room on the 2nd floor: €1,650 a month from Sep 1. The move is on Wednesday, Aug 26.",
+  "cost": 0.008525999999999999,
+  "turns": 4,
+  "ms": 8806.550384000002
+ },
+ {
+  "id": "q38",
+  "type": "temporal",
+  "found": true,
+  "cited": [
+   575,
+   584
+  ],
+  "answer": "Tom announced that Kessler signed an enterprise contract for 2 years with prepayment covering 86 users—it was huge news for the company! He also voted for \"Tahdig United\" as the office fantasy football league name, but the big announcement was definitely the Kessler deal.",
+  "gold": "That Kessler signed: the Enterprise tier with a 2-year prepay, for 86 users (Aug 14).",
+  "cost": 0.008752,
+  "turns": 3,
+  "ms": 8624.094540000006
+ },
+ {
+  "id": "q39",
+  "type": "latest-state",
+  "found": true,
+  "cited": [
+   595
+  ],
+  "answer": "Based on the group's history, Amina Wanjiru from GreenRoots will be presenting at tomorrow's webinar. She runs their field operations and is stepping in because Daniel from GreenRoots got sick.",
+  "gold": "Amina Wanjiru, who runs GreenRoots' field ops. Daniel Ochieng was the original guest but he is sick.",
+  "cost": 0.004645,
+  "turns": 2,
+  "ms": 8155.889198000004
+ },
+ {
+  "id": "q40",
+  "type": "vague-reference",
+  "found": false,
+  "cited": [
+   480,
+   482,
+   483
+  ],
+  "answer": "I found it! On August 6th, Nika discovered that the domain auto-renewal failed because the payment card on file had expired, which caused DNS to be suspended and fieldnote.app to go down for about 3 hours. Nika paid with the new card and the domain was renewed, and then moved all subscriptions off the old card to prevent it happening again.",
+  "gold": "Yes. On Jul 21 Nika noticed the July Hetzner bill was €412 (about €190 in May) because three leftover load-test servers (loadtest-1/2/3) were still running. Ali deleted them and their volumes on Jul 22, saving about €150/month.",
+  "cost": 0.005525,
+  "turns": 2,
+  "ms": 8709.463195999997
+ },
+ {
+  "id": "q41",
+  "type": "who-said",
+  "found": false,
+  "cited": [
+   250,
+   531
+  ],
+  "answer": "Based on the conversation history, **Tom** first brought up Relief Grid on 2026-07-16 in a call, which prompted Maryam to start looking at RTL support (#250). The earliest explicit mention in the chat is Sara discussing the Relief Grid pilot price on 2026-08-11 (#531).",
+  "gold": "Tom, on Jul 8 in General, after an intro call: Relief Grid is a network of humanitarian NGOs in Jordan and Lebanon that needed Arabic and right-to-left forms.",
+  "cost": 0.004529,
+  "turns": 2,
+  "ms": 6456.561056000006
+ },
+ {
+  "id": "q42",
+  "type": "alias",
+  "found": true,
+  "cited": [
+   375
+  ],
+  "answer": "Perfect! I found it. The lake house trip is scheduled for **September 17–18 (Thursday–Friday)**.",
+  "gold": "Sep 17–18 (Thursday–Friday): that is the team offsite, at the place Nika booked in Buckow.",
+  "cost": 0.0248203,
+  "turns": 6,
+  "ms": 13813.370920999994
+ },
+ {
+  "id": "q43",
+  "type": "followup",
+  "found": true,
+  "cited": [
+   557
+  ],
+  "answer": "Based on the history, it's Hana from Relief Grid—Lena mentioned on Aug 12 (#557) that Relief Grid is providing her as a volunteer translator for the Arabic strings, and she started that week.",
+  "gold": "Hana, a volunteer that Relief Grid provides to translate our Arabic strings, so not a freelancer we pay. Lena announced it on Aug 12 and said she would start the following week.",
+  "cost": 0.004796,
+  "turns": 2,
+  "ms": 7384.016516999996
+ },
+ {
+  "id": "q44",
+  "type": "followup",
+  "found": true,
+  "cited": [
+   6
+  ],
+  "answer": "At the start of July, Ali deployed a fix (#6) where CSV timestamps now use the org's own timezone setting instead of UTC—that's what GreenRoots had been asking about. So if they're seeing a 2-hour offset again, it likely means their org's timezone setting is wrong, as Ali suggested.",
+  "gold": "On Jul 1 Ali deployed a fix so that CSV export timestamps use the organisation's own timezone instead of UTC (GreenRoots had asked about it twice).",
+  "cost": 0.0053349999999999995,
+  "turns": 2,
+  "ms": 8768.371517000007
+ },
+ {
+  "id": "q45",
+  "type": "followup",
+  "found": true,
+  "cited": [
+   319
+  ],
+  "answer": "Perfect! Nika posted the lake house details on July 22nd. The place has wifi with about 50 Mbit speed, so you should be able to take your call on September 18th without issues. It's a lake house in Buckow about 1 hour from Berlin by train, and it even has a sauna!",
+  "gold": "Nika's post from Jul 22: a lake house in Buckow (Märkische Schweiz) that sleeps 8, 1 hour from Berlin by train, with wifi (they say ~50 Mbit) and a sauna.",
+  "cost": 0.005265,
+  "turns": 2,
+  "ms": 6254.376117000007
+ }
+]

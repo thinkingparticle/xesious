@@ -1,0 +1,6 @@
+== embeddinggemma
+630 messages, 163 episodes; index 120ms, embedded 163 in 71557ms; search p50 428ms
+hit@1 44%  hit@3 76%  hit@5 80%  hit@10 84%  MRR 0.60  gold covered by top 5: 69%
+by type (hit@5): alias 2/5  cross-topic 4/4  distractor 4/5  followup 4/5  latest-state 5/5  paraphrase 0/4  persian 4/4  temporal 5/5  vague-reference 4/4  who-said 4/4
+missed at 5: q03(alias) q12(alias) q15(distractor) q20(followup) q28(paraphrase) q29(paraphrase) q30(paraphrase) q31(paraphrase) q42(alias)
+recall block (what a mention is handed): answer in it for 64% of questions; 2.4 stretches on average; empty for 9; on 10 unrelated questions it attached something 1 times (3 stretches)
