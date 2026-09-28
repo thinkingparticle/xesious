@@ -37,6 +37,9 @@ const JUDGE_LOG = join(TMP, 'judge.jsonl')
 process.env.XESIOUS_STUB_JUDGE_LOG = JUDGE_LOG
 const QUERY_LOG = join(TMP, 'query.jsonl')
 process.env.XESIOUS_STUB_QUERY_LOG = QUERY_LOG
+// While this file exists the query writer takes a second and a half.
+const SLOW_QUERY = join(TMP, 'slow-query')
+process.env.XESIOUS_STUB_QUERY_SLOW = SLOW_QUERY
 process.env.TG_AUTO_QUIET_MS = '300'
 // A stand-in for a local model server (llama.cpp's llama-server): OpenAI-style chat
 // completions with first-token logprobs, JOIN when the new messages say stubJOIN.
@@ -117,8 +120,12 @@ let nextEphemeralId = 1
 // cannot be read is not given a Topic mode from it.
 const memberCount: Record<number, number> = {}
 
+// Told of each call the moment it goes out, for a test about the ORDER of two things:
+// what had already happened when this call was made.
+let onCall: ((c: Call) => void) | undefined
 bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
   calls.push({ method, payload })
+  onCall?.({ method, payload })
   if (method === 'getMe') {
     return {
       ok: true,
@@ -3676,6 +3683,78 @@ describe('context engine', () => {
     expect(edits).toContain('Recalled')
     expect(edits).toContain('stubQueryWords')
   })
+
+  const replied = (cs: Call[]) => sends(cs).some(c => textOf(c).includes('okReply'))
+  // A turn's status used to wait for the recall, whose search words take a real model
+  // seconds to write: the bot looked slow before it had started. It goes up first now.
+  test('the status goes up before the recall searches, and says it is searching', async () => {
+    mode(C, 915, 'conversation')
+    const before = queries().length
+    let written = -1
+    onCall = c => { if (c.method === 'sendMessage' && textOf(c) === THINKING) written = queries().length }
+    let cs: Call[] = []
+    try { cs = await say(915, '@testbot remind me what we agreed about the Friday demo?') } finally { onCall = undefined }
+    expect(written).toBe(before)
+    expect(queries().length).toBe(before + 1)
+    // Interrupt is on it from the start, as on every status…
+    const status = sends(cs).find(c => textOf(c) === THINKING)
+    expect(String(status?.payload.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data)).toMatch(/^int:[0-9a-f]{8}$/)
+    // …then it says what it is doing, then what it found.
+    const edits = cs.filter(c => c.method === 'editMessageText').map(textOf)
+    const searching = edits.findIndex(t => t.includes('Searching the history'))
+    expect(searching).toBeGreaterThanOrEqual(0)
+    expect(edits.findIndex(t => /Recalled|nothing close enough/.test(t))).toBeGreaterThan(searching)
+    expect(replied(cs)).toBe(true)
+  })
+
+  // A status with Interrupt on it has to mean it while the recall is still searching.
+  // Sends a message and returns once its search words are being written: the (slow)
+  // writer logs its call before it sleeps. The status must already be up by then.
+  async function searching(threadId: number, text: string): Promise<{ before: number; status?: Call }> {
+    const before = calls.length, q0 = queries().length
+    void bridge.bot.handleUpdate({ update_id: updateId++, message: {
+      message_id: mid++, date: Math.floor(Date.now() / 1000) - 86400 * 3, text, message_thread_id: threadId, is_topic_message: true,
+      chat: { id: C, type: 'supergroup', title: 'Team', is_forum: true }, from: ADA } })
+    for (let i = 0; i < 150 && queries().length === q0; i++) await new Promise(r => setTimeout(r, 20))
+    return { before, status: calls.slice(before).find(c => c.method === 'sendMessage' && textOf(c) === THINKING) }
+  }
+
+  test('Interrupt while the recall is still searching ends the turn before a run starts', async () => {
+    mode(C, 916, 'conversation')
+    writeFileSync(SLOW_QUERY, '')
+    try {
+      const { before, status } = await searching(916, '@testbot what did we decide on the Friday demo in the end?')
+      const data = String(status?.payload.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data)
+      expect(data).toMatch(/^int:/)
+      await bridge.bot.handleUpdate({ update_id: updateId++, callback_query: { id: `int${updateId}`, from: ADA, chat_instance: 'x', data,
+        message: { message_id: 1, date: 0, chat: { id: C, type: 'supergroup' } } } })
+      await bridge._drainQueue(`${C}:916`)
+      const cs = calls.slice(before)
+      expect(sends(cs).some(c => textOf(c).includes('Interrupted before it produced anything'))).toBe(true)
+      expect(replied(cs)).toBe(false)
+      // The search words were written, and no run was ever started.
+      expect(readFileSync(LAST_ARGS, 'utf8')).not.toContain('stream-json')
+      expect(cs.some(c => c.method === 'deleteMessage')).toBe(true)
+      expect(finalReply(await say(916, '/jobs'))).toMatch(/nothing running/i)
+    } finally { rmSync(SLOW_QUERY, { force: true }) }
+  }, 15000)
+
+  test('/stop while the recall is still searching discards the turn', async () => {
+    mode(C, 917, 'conversation')
+    writeFileSync(SLOW_QUERY, '')
+    try {
+      const { before, status } = await searching(917, '@testbot who suggested the Friday demo originally?')
+      expect(status).toBeTruthy()
+      await say(917, '/stop')
+      await bridge._drainQueue(`${C}:917`)
+      const cs = calls.slice(before)
+      expect(sends(cs).some(c => textOf(c).includes('Cancelled'))).toBe(true)
+      expect(sends(cs).some(c => textOf(c).includes('Interrupted before'))).toBe(false)
+      expect(replied(cs)).toBe(false)
+      expect(readFileSync(LAST_ARGS, 'utf8')).not.toContain('stream-json')
+      expect(finalReply(await say(917, '/jobs'))).toMatch(/nothing running/i)
+    } finally { rmSync(SLOW_QUERY, { force: true }) }
+  }, 15000)
 
   test('a message that points back at nothing costs no model call', async () => {
     const before = queries().length

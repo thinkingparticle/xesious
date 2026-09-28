@@ -32,7 +32,7 @@
  *                            instructions from /config
  *   topicInstr / noTopicInstr — …and a topic's own, on top of the group's
  */
-import { mkdirSync, writeFileSync, appendFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync, appendFileSync, existsSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 
@@ -111,6 +111,9 @@ async function main() {
   // the written words were used; every call is logged.
   if (/You write the search query for a search over a team chat/.test(val('--system-prompt') ?? '')) {
     if (process.env.XESIOUS_STUB_QUERY_LOG) appendFileSync(process.env.XESIOUS_STUB_QUERY_LOG, JSON.stringify({ model, prompt: rawPrompt }) + '\n')
+    // As slow as a real writer when the test asks: time to act while the recall is
+    // still searching.
+    if (process.env.XESIOUS_STUB_QUERY_SLOW && existsSync(process.env.XESIOUS_STUB_QUERY_SLOW)) await new Promise(r => setTimeout(r, 1500))
     const msg = (rawPrompt.match(/<message>\n([\s\S]*?)\n<\/message>/)?.[1] ?? '').replace(/\s+/g, ' ').trim()
     result({ result: `${msg} stubQueryWords` })
     return

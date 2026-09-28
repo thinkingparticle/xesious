@@ -128,6 +128,8 @@ const QUIET_NOTE_MS = Number(process.env.TG_QUIET_NOTE_MS || 90 * 1000)
 // its first second — a button that materialises later is a control you have to
 // notice arriving, exactly when you are already waiting on something.
 const INTERRUPT_LABEL = '— Interrupt —'
+// What a run stopped by Interrupt delivers when it had produced nothing yet.
+const INTERRUPTED_EMPTY = '⏹ Interrupted before it produced anything.'
 // Every message that will WAIT gets the offer — there is no delay threshold.
 //
 // There used to be one, to keep a burst of messages from sprouting a button each.
@@ -868,7 +870,10 @@ type Job = {
   // this job — the interrupt acknowledgement, the cancellation notice, its files —
   // quotes it, because by then those messages are far from what caused them.
   askedBy?: number
-  child: ChildProcess
+  // Unset while the turn is still preparing: a turn whose status went up before its
+  // run started (the recall first — see handlePrompt) is a job from that moment, so
+  // Interrupt, /stop and /jobs reach it; the run gives it its process.
+  child?: ChildProcess
   pgid: number
   startedAt: number
   outcome?: RunOutcome     // set when a human ends it early
@@ -879,6 +884,11 @@ const jobs = new Map<string, Job>()
 const jobsFor = (key: string) => [...jobs.values()].filter(j => j.key === key)
 // Short, because callback_data caps at 64 bytes and the id has to fit in a button.
 const newJobId = () => randomUUID().replace(/-/g, '').slice(0, 8)
+// Keyed by JOB id, never by topic (see the note in runStreaming's editStatus).
+const interruptKeyboard = (jobId: string) => ({ inline_keyboard: [[{ text: INTERRUPT_LABEL, callback_data: `int:${jobId}` }]] })
+// A turn whose status went up before its run started (see handlePrompt): its job is
+// registered from that moment, without a process until the run takes it over.
+type EarlyTurn = { job: Job; statusId: number; edit?: Promise<void> }
 
 // Signal a run's whole process group, falling back to the bare child if the group
 // is gone. NEVER call this on a child spawned without `detached`: such a child
@@ -889,6 +899,8 @@ function signalJob(job: Job, sig: NodeJS.Signals): boolean {
   // signal the bridge's OWN process group and take the bridge down. Signal the
   // child directly instead (it likely never started, so this is usually a no-op).
   if (job.pgid > 0) { try { process.kill(-job.pgid, sig); return true } catch {} }
+  // No child: a turn still preparing, which checks its outcome before it starts one.
+  if (!job.child) return false
   try { job.child.kill(sig); return true } catch {}
   return false
 }
@@ -896,6 +908,9 @@ function signalJob(job: Job, sig: NodeJS.Signals): boolean {
 // Members of a run's process group that are still alive. After the run ends these
 // are, by construction, processes it left behind — no command-line guessing.
 function groupSurvivors(pgid: number): number[] {
+  // 0 is no group at all (a job with no process yet, or a spawn that failed), and the
+  // kernel's own threads sit in process group 0: they are nobody's leftovers.
+  if (pgid <= 0) return []
   const out: number[] = []
   try {
     for (const name of readdirSync('/proc')) {
@@ -1101,6 +1116,23 @@ function voiceEnv(key?: string): NodeJS.ProcessEnv {
 // so each run passes the value in effect for its own topic.
 const renderSteps = (steps: Step[], total: number, detail: boolean, headline?: string, note?: string) => libRenderSteps(steps, total, { progressDetail: detail, headline, note })
 const renderStepsHtml = (steps: Step[], detail: boolean) => libRenderStepsHtml(steps, { progressDetail: detail })
+// One edit of a status message: `body` (the rich rendering of `shown`), else the HTML
+// one, else plain labels. Same posture as sendRich: formatting is best-effort, the
+// update is not. reply_markup has to ride on EVERY edit: an edit without it drops the
+// keyboard. Verified against the API that a rich message keeps its keyboard across
+// editMessageText.
+async function editStatusMessage(ctx: Context, msgId: number, body: string, shown: Step[], detail: boolean, markup?: any): Promise<void> {
+  try {
+    await ctx.api.raw.editMessageText({ chat_id: ctx.chat!.id, message_id: msgId, rich_message: { markdown: body }, ...(markup ? { reply_markup: markup } : {}) })
+  } catch {
+    try {
+      await ctx.api.editMessageText(ctx.chat!.id, msgId, renderStepsHtml(shown, detail), { parse_mode: 'HTML', reply_markup: markup })
+    } catch {
+      const plain = [THINKING, ...shown.map(s => s.label)].join('\n').slice(0, 3500)
+      await ctx.api.editMessageText(ctx.chat!.id, msgId, plain).catch(() => {})
+    }
+  }
+}
 
 // Run a prompt with streaming output, editing a single "status" message in the
 // topic to show live tool-step progress, then return the final result.
@@ -1124,9 +1156,13 @@ type RunOpts = {
   // a "turn": /usage and friends take no model time, so the status flashed for two
   // seconds offering an Interrupt button for a run that does nothing.
   silent?: boolean
+  // A status message and job the caller already put up, because the turn had work to
+  // do before its run could start (see handlePrompt). The run takes both over
+  // instead of posting its own.
+  early?: EarlyTurn
 }
 async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE, model: string = MODEL, ro: RunOpts = {}): Promise<ClaudeResult> {
-  const { onInit, effort = EFFORT_TIER, askedBy, fork, silent } = ro
+  const { onInit, effort = EFFORT_TIER, askedBy, fork, silent, early } = ro
   const history = historyMcp(key)
   const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...permissionArgs(mode, history?.tools), ...(history?.args ?? [])]
   const profile = profileFor(key)
@@ -1143,14 +1179,14 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
   const opts: any = threadId ? { message_thread_id: threadId } : {}
   // Minted before the status message so its keyboard can name this run from the
   // start. If the spawn below fails the id never registers, and a tap on it is told
-  // the task has already finished — which is true.
-  const jobId = newJobId()
-  const interruptKb = { inline_keyboard: [[{ text: INTERRUPT_LABEL, callback_data: `int:${jobId}` }]] }
+  // the task has already finished — which is true. An early turn has both already.
+  const jobId = early?.job.id ?? newJobId()
+  const interruptKb = interruptKeyboard(jobId)
   // Status is machine chatter, not an answer — post and edit it silently so only
   // the real reply buzzes the user's phone.
-  const status = silent ? null : await ctx.api.sendMessage(ctx.chat!.id, THINKING,
+  const status = silent ? null : early ? { message_id: early.statusId } : await ctx.api.sendMessage(ctx.chat!.id, THINKING,
     { ...opts, disable_notification: true, reply_markup: interruptKb }).catch(() => null)
-  if (status) { pending.push({ chat: ctx.chat!.id, id: status.message_id }); saveState() }
+  if (status && !early) { pending.push({ chat: ctx.chat!.id, id: status.message_id }); saveState() }
   const steps: Step[] = []
   // What the automatic recall did just before this turn, as its first step.
   const recalled = recallSteps.get(key)
@@ -1181,22 +1217,12 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     // and end whatever is running today. A tap on a finished job is told so.
     const markup = interruptKb
     while (body.length > 15000 && shown.length > 1) { shown = shown.slice(1); body = renderSteps(shown, steps.length, detail, undefined, note) }
-    try {
-      // reply_markup has to ride on EVERY edit: an edit without it drops the
-      // keyboard. Verified against the API that a rich message keeps its keyboard
-      // across editMessageText.
-      await ctx.api.raw.editMessageText({ chat_id: ctx.chat!.id, message_id: status.message_id, rich_message: { markdown: body }, ...(markup ? { reply_markup: markup } : {}) })
-    } catch {
-      // Same posture as sendRich: formatting is best-effort, the update is not.
-      try {
-        await ctx.api.editMessageText(ctx.chat!.id, status.message_id, renderStepsHtml(shown, detail), { parse_mode: 'HTML', reply_markup: markup })
-      } catch {
-        const plain = [THINKING, ...shown.map(s => s.label)].join('\n').slice(0, 3500)
-        await ctx.api.editMessageText(ctx.chat!.id, status.message_id, plain).catch(() => {})
-      }
-    }
+    await editStatusMessage(ctx, status.message_id, body, shown, detail, markup)
   }
   const ticker = setInterval(() => void editStatus(), 4000)
+  // What the recall found, as soon as there is a run to show it on, not at the CLI's
+  // first event seconds later. With nothing to show this edits nothing.
+  void editStatus()
 
   return await new Promise<ClaudeResult>(resolve => {
     let buf = '', err = '', finalText = '', sessionId: string | undefined, isError = false, got = false
@@ -1210,12 +1236,17 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     // group — where a group signal would kill the bridge — and killing the child
     // alone orphans every grandchild it spawned.
     const child = spawn(CLAUDE_BIN, args, { cwd, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'], detached: true })
-    const job: Job = {
-      id: jobId, key, threadId, prompt, child, pgid: child.pid ?? 0, askedBy,
-      startedAt: Date.now(), statusMsgId: status?.message_id, steps: () => steps.length,
-    }
+    // An early turn's job has been registered since its status went up, with the
+    // prompt as it was asked (for /jobs); the run gives it its process.
+    const job: Job = early?.job ?? { id: jobId, key, threadId, prompt, pgid: 0, askedBy, startedAt: Date.now(), statusMsgId: status?.message_id, steps: () => 0 }
+    job.child = child
+    job.pgid = child.pid ?? 0
+    job.steps = () => steps.length
     jobs.set(job.id, job)
     runningJob = job
+    // Ended before the run took it over: handlePrompt checks first, so this only
+    // matters if an await ever lands between that check and this spawn.
+    if (job.outcome) void endJob(job, job.outcome)
     const timer = setTimeout(() => child.kill('SIGKILL'), CLAUDE_TIMEOUT_MS)
     // Keyed on stream events, not wall-clock: a long turn emits them steadily even
     // when each step takes minutes, while a hung child emits nothing at all.
@@ -1309,7 +1340,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
         // an error, and what they asked for is whatever it had.
         const partial = textBlocks.join('\n\n').trim()
         void finish({
-          text: partial || (got && !isError ? finalText : '') || '⏹ Interrupted before it produced anything.',
+          text: partial || (got && !isError ? finalText : '') || INTERRUPTED_EMPTY,
           sessionId, isError: false, blocks: textBlocks,
         })
         return
@@ -2798,7 +2829,7 @@ const recallSteps = new Map<string, { step: Step; at: number }>()
 // earlier stretches of conversation that match what was asked, from any topic, when
 // the message points back at something and they match well enough (recallPick).
 // Talk the turn already has (this topic's recent messages) is left out.
-async function recallBlock(chatId: number, key: string, text: string, o: { exclude: Set<number>; context?: string; recentSince?: number }): Promise<string> {
+async function recallBlock(chatId: number, key: string, text: string, o: { exclude: Set<number>; context?: string; recentSince?: number; onSearch?: () => void }): Promise<string> {
   if (!text.trim() || !contextIndex()) return ''
   const hchat = historyOf(key), linked = hchat !== String(chatId)
   const store = storeFor(hchat)
@@ -2812,6 +2843,8 @@ async function recallBlock(chatId: number, key: string, text: string, o: { exclu
   // Only a message the recall will act on is worth a model call for search words:
   // unless recall is on for every message, one that points back at something.
   if (!always && !refersBack(said, { names })) return ''
+  // It searches: seconds, when a model writes the words. The turn's status says so.
+  o.onSearch?.()
   const { q, by, model } = await recallQuery(key, text, o.context)
   // Words written from the message and the talk before it already carry that talk;
   // the message as typed leans on it as before. A linked archive shares nothing with
@@ -2854,8 +2887,11 @@ const convFetched = new Map<string, string>()
 // `through`: an Auto turn has no message of its own, so msgId is instead the newest
 // message it covers, and that one is included. It also carries what the context
 // engine recalls from the rest of the group's history for `text`, the message being
-// answered — or, on an Auto turn, what was just said (see recallBlock).
-async function conversationContext(ctx: Context, key: string, threadId: number | undefined, msgId: number, reply: any, cwd: string, through = false, text = ''): Promise<string> {
+// answered — or, on an Auto turn, what was just said (see recallBlock). `onSearch` is
+// told when the recall starts searching, which is the slow part.
+async function conversationContext(ctx: Context, key: string, threadId: number | undefined, msgId: number, reply: any, cwd: string,
+  o: { through?: boolean; text?: string; onSearch?: () => void } = {}): Promise<string> {
+  const { through = false, text = '' } = o
   const chatId = ctx.chat!.id
   const recording = recordsFor(key)
   const recs = recording ? readTopicLog(chatId, threadId) : []
@@ -2871,7 +2907,7 @@ async function conversationContext(ctx: Context, key: string, threadId: number |
   const recalled = recallFor(key) ? await recallBlock(chatId, key, text, {
     exclude: new Set([msgId, ...since.map(r => r.id), ...window.map(r => r.id)]),
     context: [...window, ...since].slice(-6).map(r => r.text).join('\n') || undefined,
-    recentSince: mark,
+    recentSince: mark, onSearch: o.onSearch,
   }).catch(e => { console.error(`[ctx] recall: ${e}`); return '' }) : ''
   if (!since.length && !window.length) return recalled
   const saved = new Map<number, string>()
@@ -4735,6 +4771,43 @@ const frameFrom = (ctx: Context, text: string) => frameUserMessage(text, {
   name: [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || ctx.from?.username,
   id: ctx.from?.id,
 })
+// Put a turn's status up now, Interrupt and all, as a job with no process yet (see
+// handlePrompt). Undefined when Telegram refuses: the run then posts its own, as it
+// always did.
+async function postEarlyStatus(ctx: Context, threadId: number | undefined, key: string, prompt: string, askedBy?: number): Promise<EarlyTurn | undefined> {
+  const id = newJobId()
+  const status = await ctx.api.sendMessage(ctx.chat!.id, THINKING, { ...(threadId ? { message_thread_id: threadId } : {}),
+    disable_notification: true, reply_markup: interruptKeyboard(id) }).catch(() => null)
+  if (!status) return undefined
+  pending.push({ chat: ctx.chat!.id, id: status.message_id }); saveState()
+  const job: Job = { id, key, threadId, prompt, askedBy, pgid: 0, startedAt: Date.now(), statusMsgId: status.message_id, steps: () => 0 }
+  jobs.set(id, job)
+  return { job, statusId: status.message_id }
+}
+// What an early turn is busy with before its run takes the status over.
+function showEarlyStep(ctx: Context, e: EarlyTurn, label: string): Promise<void> {
+  // Already ended: its keyboard is gone, and this edit would put it back.
+  if (e.job.outcome) return Promise.resolve()
+  const steps: Step[] = [{ label }]
+  return editStatusMessage(ctx, e.statusId, renderSteps(steps, 1, false), steps, false, interruptKeyboard(e.job.id))
+}
+// Take down an early status no run took over — the turn ended before its run
+// started, or the run failed to start — and its job with it, and what its recall
+// left for the run to show (or the topic's next turn would show it). Once only.
+async function dropEarlyStatus(ctx: Context, e: EarlyTurn): Promise<void> {
+  if (!jobs.delete(e.job.id)) return
+  recallSteps.delete(e.job.key)
+  pending = pending.filter(p => !(p.chat === ctx.chat!.id && p.id === e.statusId)); saveState()
+  await ctx.api.deleteMessage(ctx.chat!.id, e.statusId).catch(() => {})
+}
+// A turn ended while it was still preparing — by Interrupt, /stop, or a newer message
+// in interrupt mode — never started a run, so there is nothing to stop. It ends the
+// way a run stopped before it produced anything does (a discard then returns on
+// `stopped`, as always).
+async function endEarly(ctx: Context, e: EarlyTurn): Promise<ClaudeResult> {
+  await dropEarlyStatus(ctx, e)
+  return { text: INTERRUPTED_EMPTY, isError: false }
+}
 async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string, replyTo?: number, kind: PromptKind = {}): Promise<void> {
   // Renamed off `promoted` on the way in, because `promoteBlock`'s result already
   // owns that name further down this function. Left as-is it SHADOWED this flag, so
@@ -4789,9 +4862,21 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   const shareNote = topicsSharing(cwd, key)
     ? `[xesious:${BRIDGE_NONCE}] this directory is shared with another topic (a fork). Files sent to THIS conversation are in ./${INBOX_DIR}/${topicTag(key)}/, and anything you want delivered here goes in ./${OUTBOX_DIR}/${topicTag(key)}/ — not the shared ./${OUTBOX_DIR}/ itself.\n\n`
     : ''
-  const convBlock = kind.conv && !background && ctx.chat?.type !== 'private'
-    ? await conversationContext(ctx, key, threadId, kind.conv.msgId, kind.conv.reply, cwd, !!kind.auto, kind.auto ? kind.auto.text ?? '' : prompt).catch(e => { console.error(`[conv] ${key}: ${e}`); return '' })
+  const conv = !background && ctx.chat?.type !== 'private' ? kind.conv : undefined
+  // The status goes up before the conversation is gathered, not when the run starts:
+  // gathering it can take seconds (the recall has a model write its search words, then
+  // embeds them), and a bot that shows nothing for that long looks slow. The turn is a
+  // job from this moment, so Interrupt, /stop and /jobs reach it while it prepares.
+  // An Auto turn has no status at all.
+  const early = conv && !kind.auto ? await postEarlyStatus(ctx, threadId, key, prompt, replyTo) : undefined
+  const convBlock = conv
+    ? await conversationContext(ctx, key, threadId, conv.msgId, conv.reply, cwd, {
+        through: !!kind.auto, text: kind.auto ? kind.auto.text ?? '' : prompt,
+        onSearch: early && (() => { early.edit = showEarlyStep(ctx, early, '🔎 Searching the history…') }),
+      }).catch(e => { console.error(`[conv] ${key}: ${e}`); return '' })
     : ''
+  // Landed before the run shows what the recall found, so it can never overwrite it.
+  await early?.edit
   const framed = shareNote + filesPreamble(BRIDGE_NONCE, arrived) + preamble + convBlock + (kind.auto ? autoFrame(kind.auto.reason) : frameFrom(ctx, prompt))
   // If this topic has a live link, the shared link is the source of truth for the
   // session id, so a conversation held over the live web call continues here (and
@@ -4837,7 +4922,8 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     if (linked) { const l = loadLinks(); if (l[linked.uuid]) { l[linked.uuid].sessionId = sessionId; l[linked.uuid].updated = at; saveLinks(l) } }
   }
   try {
-    const res = await runStreaming(ctx, threadId, key, framed, cwd, resumeId, mode ?? modeFor(key), modelFor(key), { onInit: background ? undefined : bindSession, effort: effortFor(key), askedBy: replyTo, fork: background, silent: !!kind.auto })
+    const res = early?.job.outcome ? await endEarly(ctx, early)
+      : await runStreaming(ctx, threadId, key, framed, cwd, resumeId, mode ?? modeFor(key), modelFor(key), { onInit: background ? undefined : bindSession, effort: effortFor(key), askedBy: replyTo, fork: background, silent: !!kind.auto, early })
     if (stopped.has(key)) {
       stopped.delete(key)
       // Interrupting a part is not the same as the part finishing. It means you are
@@ -4967,6 +5053,9 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     }
   } catch (e) {
     await send(ctx, threadId, `⚠️ ${e}`, false, replyLink())
+  } finally {
+    // Put up for a run that then failed to start: nothing else would take it down.
+    if (early && !early.job.child) await dropEarlyStatus(ctx, early)
   }
 }
 
