@@ -14,11 +14,12 @@
  *            the bridge sends it stretches as they change and asks it to rank them.
  *            txtai (engines/txtai_service.py) is one.
  *
- * The config is a JSON file (state/context-engines.json, or TG_CONTEXT_ENGINES):
+ * The config is a JSON file (state/context-engines.json, or TG_CONTEXT_ENGINES;
+ * context/setup.sh writes one from context/context-engines.example.json):
  *
  *   {
  *     "default": "xesious-bge-m3",
- *     "embeddings": { "url": "http://127.0.0.1:8091", "model": "bge-m3", "maxChars": 4000 },
+ *     "embeddings": { "url": "http://127.0.0.1:8093", "model": "bge-m3", "maxChars": 2000 },
  *     "summaries": { "model": "haiku" },
  *     "engines": {
  *       "xesious-keywords": { "kind": "xesious", "label": "Keywords" },
@@ -33,7 +34,7 @@
  * `archives` are imported histories (import-telegram.ts) kept in their own file;
  * `links` point a whole group ("chat") or one topic ("chat:topic") at one of them, so
  * questions asked there search that history instead. Links are set here, on the
- * server, never from a chat: a group's history is never another group's to read.
+ * server, never from a chat. A link may also name another group's chat id.
  */
 import { existsSync, readFileSync } from 'node:fs'
 import { ContextIndex, ftsQuery, textHash, type Embedder, type Hit, type SearchOptions } from './engine'
@@ -211,6 +212,25 @@ registerKind('http', (id, def, cfg) => {
 // Loading
 // ---------------------------------------------------------------------------
 
+// The default meaning model: bge-m3 served by llama.cpp, behind the cache that
+// context/setup.sh and context/services.sh run on this port.
+export const DEFAULT_EMBED_URL = 'http://127.0.0.1:8093'
+export const DEFAULT_EMBED_NAME = 'bge-m3'
+
+// What TG_CONTEXT_EMBED / TG_CONTEXT_EMBED_URL ask for. `1` (or a server's model
+// name) is an embeddings server, at DEFAULT_EMBED_URL unless the URL says otherwise;
+// a transformers.js model id ("Xenova/multilingual-e5-small", with a slash) runs in
+// the bridge instead, when its runtime was installed by hand into context/.deps.
+export function envEmbedding(env: Record<string, string | undefined> = process.env): { url: string; model: string } | { local: string } | undefined {
+  const url = (env.TG_CONTEXT_EMBED_URL || '').trim()
+  const m = (env.TG_CONTEXT_EMBED || '').trim()
+  if (/^(0|false|no|off)$/i.test(m)) return undefined
+  const model = !m || /^(1|true|yes|on)$/i.test(m) ? DEFAULT_EMBED_NAME : m
+  if (url) return { url, model }
+  if (!m) return undefined
+  return model.includes('/') ? { local: model } : { url: DEFAULT_EMBED_URL, model }
+}
+
 // The config in effect: the file when there is one, else what the environment
 // variables of the first version of the context engine describe.
 export function loadEnginesConfig(path: string | undefined, env: Record<string, string | undefined> = process.env): EnginesConfig {
@@ -219,13 +239,13 @@ export function loadEnginesConfig(path: string | undefined, env: Record<string, 
     if (!cfg.engines || !Object.keys(cfg.engines).length) throw new Error(`${path}: no engines`)
     return cfg
   }
-  const url = (env.TG_CONTEXT_EMBED_URL || '').trim()
+  const emb = envEmbedding(env)
   const digest = (env.TG_CONTEXT_DIGEST || '').trim().toLowerCase()
   const summaries = digest ? { summaries: digest, summaryUse: 'with-text' as const } : {}
   const cfg: EnginesConfig = { engines: { 'xesious-keywords': { kind: 'xesious', label: 'keywords', ...summaries } } }
   if (digest) cfg.summaries = { model: digest }
-  if (url || (env.TG_CONTEXT_EMBED || '').trim()) {
-    if (url) cfg.embeddings = { url, model: (env.TG_CONTEXT_EMBED || 'default').trim() }
+  if (emb) {
+    if ('url' in emb) cfg.embeddings = { url: emb.url, model: emb.model }
     cfg.engines['xesious-meaning'] = { kind: 'xesious', label: 'keywords + meaning', meaning: true, ...summaries }
     cfg.default = 'xesious-meaning'
   } else cfg.default = 'xesious-keywords'

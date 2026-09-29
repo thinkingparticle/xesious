@@ -15,7 +15,7 @@
  *     and decisions in plain words (see digest.ts).
  *
  * Search ranks episodes by reciprocal-rank fusion of those signals (see FUSION),
- * scoped to ONE chat: a group's history never answers another group's question.
+ * scoped to ONE chat; which chat a topic searches is the bridge's choice (links).
  *
  * No server, no GPU, nothing outside bun:sqlite unless vectors are wanted — and then
  * only an embedder passed in (see embed.ts), so the index works, and is tested,
@@ -430,7 +430,7 @@ export function refersBack(text: string, o: { names?: string[]; now?: number } =
 // What a turn is handed without asking: for a message that points back, up to
 // `max` stretches found by two signals (or by several of their messages); for any
 // other message, nothing — the model still has the search tools. Measured in
-// research/context: without the gate, 9 of 10 questions that had nothing to do with
+// on a test chat: without the gate, 9 of 10 questions that had nothing to do with
 // the past came with three stretches of old talk; with it, 1 of 10.
 // `strength: false` for an engine that ranks by a single signal of its own (an
 // external one): its top results are taken as they come.
@@ -468,7 +468,7 @@ export function rrf(lists: { name: string; ids: string[]; weight?: number }[], k
 // message that says exactly the thing, in a stretch about other things too). So each
 // pair counts once, by its better rank, with a little credit when both agree; and k
 // is 10, not 60, so the top of a list counts for more than being somewhere in it.
-// Measured on a real team's archive of 16k messages (research/context/fusion-eval.ts, 2026-09-28): an
+// Measured on a real team's archive of 16k messages (context/fusion-eval.ts, 2026-09-28): an
 // answer in the top 5 for 78% of real questions as the recall searches them (67%
 // before), and a question's own stretch in the top 5 for 78% of questions written
 // for one message (65% before); on the synthetic chat, within a question of before.

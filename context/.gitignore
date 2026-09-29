@@ -1,2 +1,2 @@
-# installed by context/setup.sh
+# the transformers.js runtime and its models, for in-process embeddings (context/embed.ts)
 .deps/

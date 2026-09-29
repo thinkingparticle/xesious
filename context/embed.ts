@@ -1,11 +1,17 @@
 /**
- * embed.ts — the context engine's optional "meaning" signal: a small embedding model
- * run locally on the CPU through transformers.js (ONNX Runtime).
+ * embed.ts — the context engine's optional "meaning" signal: embedding models, run
+ * two ways.
  *
- * Optional on purpose. Keyword search needs nothing beyond bun:sqlite; vectors need
- * ~60 MB of runtime and a ~120 MB model, so they are installed only by
- * context/setup.sh, into context/.deps, and loaded from there when TG_CONTEXT_EMBED
- * is on. Missing, the engine says so once and carries on with keywords alone.
+ * The default is httpEmbedder: bge-m3 served by llama.cpp's llama-server in its own
+ * process, installed and started by context/setup.sh. It ranked best when measured
+ * (right stretch in the top 5 for 82% of questions, e5-small 78%; MRR 0.63 vs 0.57),
+ * and nothing native loads into the bridge.
+ *
+ * localEmbedder runs a small model inside the process through transformers.js (ONNX
+ * Runtime) — multilingual-e5-small and the others below, used by the benchmarks.
+ * Nothing installs it: `mkdir -p context/.deps && cd context/.deps && bun add
+ * @huggingface/transformers`, then TG_CONTEXT_EMBED=<model id>. Missing, the engine
+ * says so once and carries on with keywords alone.
  *
  * Models are presets because they disagree on how to be asked: e5 wants "query: " and
  * "passage: " prefixes, EmbeddingGemma wants task prompts, and they pool differently.
@@ -38,7 +44,7 @@ export const EMBED_PRESETS: Record<string, EmbedPreset> = {
 }
 export const DEFAULT_EMBED_MODEL = 'Xenova/multilingual-e5-small'
 
-// Where setup.sh installs the runtime, next to this file.
+// Where localEmbedder looks for the transformers.js runtime, next to this file.
 export const DEPS_DIR = join(import.meta.dir, '.deps')
 
 export async function localEmbedder(o: { model?: string; cacheDir?: string; depsDir?: string } = {}): Promise<Embedder | undefined> {

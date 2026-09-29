@@ -2,7 +2,8 @@
 # The context engine's optional local services, each in its own process and kept
 # running by a restart loop:
 #
-#   emb    an embeddings server: llama.cpp's llama-server with bge-m3 (MIT)
+#   emb    an embeddings server: llama.cpp's llama-server with bge-m3 (MIT),
+#          installed by context/setup.sh
 #   cache  a cache in front of it (context/embed-cache.ts), so a text two engines
 #          both embed is embedded once; engines point at this one ($CACHE_PORT)
 #   txtai  the txtai engine (context/engines/txtai_service.py, Apache-2.0)

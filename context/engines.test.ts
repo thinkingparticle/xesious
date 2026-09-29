@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { ContextIndex, recallPick, type CtxMessage, type Embedder, type Hit } from './engine'
-import { buildEngines, defaultEngineId, historyChat, loadEnginesConfig, type EnginesConfig } from './engines'
+import { buildEngines, defaultEngineId, envEmbedding, DEFAULT_EMBED_URL, historyChat, loadEnginesConfig, type EnginesConfig } from './engines'
 import { importExport, topicsOf, messageText, botApiChatId } from './import-telegram'
 import { cleanDigest, splitDigests, digestBatchUser } from './digest'
 import { linkTemplate, recallBody, RECALL_CAVEAT } from './recall'
@@ -142,6 +142,25 @@ describe('engines by config', () => {
     const withEmbed = loadEnginesConfig(undefined, { TG_CONTEXT_EMBED_URL: 'http://e', TG_CONTEXT_EMBED: 'bge-m3', TG_CONTEXT_DIGEST: 'haiku' })
     expect(defaultEngineId(withEmbed)).toBe('xesious-meaning')
     expect(withEmbed.engines['xesious-meaning']).toMatchObject({ meaning: true, summaries: 'haiku' })
+  })
+
+  test('TG_CONTEXT_EMBED=1 is bge-m3 on the local server; a model id with a slash runs in-process', () => {
+    expect(envEmbedding({})).toBeUndefined()
+    expect(envEmbedding({ TG_CONTEXT_EMBED: '1' })).toEqual({ url: DEFAULT_EMBED_URL, model: 'bge-m3' })
+    expect(envEmbedding({ TG_CONTEXT_EMBED_URL: 'http://e' })).toEqual({ url: 'http://e', model: 'bge-m3' })
+    expect(envEmbedding({ TG_CONTEXT_EMBED_URL: 'http://e', TG_CONTEXT_EMBED: 'other' })).toEqual({ url: 'http://e', model: 'other' })
+    expect(envEmbedding({ TG_CONTEXT_EMBED: 'Xenova/multilingual-e5-small' })).toEqual({ local: 'Xenova/multilingual-e5-small' })
+    expect(envEmbedding({ TG_CONTEXT_EMBED: 'off', TG_CONTEXT_EMBED_URL: 'http://e' })).toBeUndefined()
+    const cfg = loadEnginesConfig(undefined, { TG_CONTEXT_EMBED: '1' })
+    expect(cfg.embeddings).toEqual({ url: DEFAULT_EMBED_URL, model: 'bge-m3' })
+    expect(defaultEngineId(cfg)).toBe('xesious-meaning')
+  })
+
+  test('the example config setup.sh installs defaults to bge-m3', () => {
+    const cfg = loadEnginesConfig(join(import.meta.dir, 'context-engines.example.json'))
+    expect(defaultEngineId(cfg)).toBe('xesious-bge-m3')
+    expect(cfg.embeddings).toMatchObject({ url: DEFAULT_EMBED_URL, model: 'bge-m3' })
+    expect([...buildEngines(cfg).keys()]).toEqual(['xesious-keywords', 'xesious-bge-m3'])
   })
 
   test('an unknown kind is refused by name', () => {

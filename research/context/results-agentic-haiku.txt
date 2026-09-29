@@ -1,3 +1,0 @@
-== agentic, haiku: 45 questions
-cited a gold message: 80%; avg 2.7 turns, 8s; list-price cost $0.364 ($0.0081/question)
-by type: alias 3/5  cross-topic 2/4  distractor 5/5  followup 5/5  latest-state 4/5  paraphrase 3/4  persian 4/4  temporal 5/5  vague-reference 3/4  who-said 2/4

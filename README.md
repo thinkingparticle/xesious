@@ -45,6 +45,14 @@ cp .env.example .env          # then edit it
    - In @BotFather, `/setprivacy` → your bot → **Disable**, so it sees every message in topics (not just @mentions).
    - Add the bot, send `/whoami` in the group, put the chat id into `TG_ALLOWED_CHATS`, restart.
    - Now each topic is its own session.
+5. **(Optional) Meaning search for group history:** `context/setup.sh`. Keyword search
+   of what a group said works without it. This installs llama.cpp's `llama-server`
+   and the bge-m3 embedding model (~700 MB, into `~/xesious-data`), starts them,
+   writes `state/context-engines.json`, and checks that an embedding comes back.
+   Then restart with `./update.sh`. The services don't start themselves after a
+   reboot: `context/services.sh start emb && context/services.sh start cache`.
+   Details: [Group settings](#group-settings) → *Recall earlier talk*, and
+   `context/ENGINES.md`.
 
 ## Updating
 
@@ -93,6 +101,7 @@ off is now a **hard startup error**, not a warning.
 | `/sessions <dir…>` | List the Claude sessions stored for one or more directories (what the IDE/CLI picker shows), as a **tappable picker** — tap one to bind this topic to it, page through with `‹ Prev` / `Next ›` |
 | `/import <dir…>` | Make a topic for each session in the given directories — bound + recent history backfilled |
 | `/history [N]` | Re-post the last N turns of this topic's bound session |
+| `/recall <question>` | What each context engine finds in this group's history for a question, side by side (no answer from Claude) |
 | `/help` | Usage |
 
 ## Import existing sessions
@@ -261,25 +270,37 @@ Many settings no longer need SSH and a restart: a group changes its own with
   any of its topics, and hands Claude up to three earlier stretches of conversation
   that match well. A message that doesn't point back gets none: old talk that
   merely shares a word is noise. Either way Claude can search further on its own
-  with three history tools (search, read around a message, list topics). Both stay
-  inside the one group: another group's history is never searched.
+  with three history tools (search, read around a message, list topics). A topic or
+  group can search another history instead — an imported archive or another group —
+  through `links` in `state/context-engines.json` (`context/ENGINES.md`).
   - The index is `state/context.db`, derived from the recorded topic logs: rebuilt
     from them at startup, pruned with them by *Keep recorded messages*, and safe to
     delete. Only recorded messages can be found.
   - **Keywords** (SQLite FTS5, with Persian spelling normalised) need nothing extra.
-    **Meaning** search — finding "the Friday thing" from "weekly demo session" — needs
-    a small local embedding model: run `context/setup.sh` and set `TG_CONTEXT_EMBED=1`,
-    or point `TG_CONTEXT_EMBED_URL` at an embeddings server such as llama.cpp's.
-    **Digests** — a few lines per finished stretch naming its ideas and decisions,
-    written by Haiku — are on with `TG_CONTEXT_DIGEST=haiku`; they cost one short
-    call per stretch. `research/context/` has the benchmark behind these choices.
+    **Meaning** search — finding "the Friday thing" from "weekly demo session" — uses
+    the bge-m3 embedding model on llama.cpp, in its own process on the server's CPU:
+    run `context/setup.sh` (it installs, starts and checks it, and writes
+    `state/context-engines.json` with keywords + bge-m3 as the default engine). To use
+    an embeddings server you already run, set `TG_CONTEXT_EMBED_URL` and
+    `TG_CONTEXT_EMBED` (its model name) instead, or edit the JSON file.
+    **Summaries** (also called digests) — a few lines per finished stretch naming its
+    ideas and decisions — are written when a model is set: `TG_CONTEXT_DIGEST=haiku`,
+    or `"summaries"` in the JSON file. Then every recorded topic gets them unless
+    `/config` turns them off there; one short call per few stretches.
   - **Photos** are found by the text in them (a screenshot of an email, an error, a
     dashboard) with a local OCR service: run `context/setup-ocr.sh`, then
     `context/services.sh start ocr`, and add `"ocr": { "url": "http://127.0.0.1:8094" }`
     to `context-engines.json` (or set `TG_CONTEXT_OCR_URL`). A photo posted in a
     recorded topic is then saved to `state/media/` and read in the background, on the
-    server's CPU; nothing is sent anywhere. `context/OCR.md` has how it was chosen.
-  - *Recall earlier talk* under More settings turns it off for a group or topic.
+    server's CPU. The text read joins the history, so it reaches Claude like any
+    message. `context/OCR.md` has how it was chosen.
+  - **Settings** (`/config` → More settings → *Context engine*, per group or topic):
+    *Recall earlier talk* (when a message points back / on every message / off),
+    *Search words* (written by Haiku, by Sonnet, or the message as typed), *Search
+    engine*, and *Summarise conversations*.
+  - **Cost:** keywords, meaning search and photo reading run locally for free. Two
+    parts use your Claude usage: summaries, and Claude-written search words — one
+    small call each time the recall searches (and for each `/recall`).
 
 - **Three levels, most specific wins:** a topic's own value → the group's value →
   the server's `.env`. The `.env` keys below are now the *defaults*.
@@ -324,7 +345,7 @@ defaults now — a group can override them with `/config` (see above). Highlight
 - `TG_AUTO_JUDGE` / `TG_AUTO_EAGERNESS` — defaults for Auto mode's judge (`haiku`, `sonnet`, `local`) and eagerness (`reserved`, `balanced`, `chatty`); `/config` overrides both.
 - `TG_AUTO_LOCAL_URL` / `TG_AUTO_LOCAL_MODEL` — the OpenAI-compatible server (e.g. `http://127.0.0.1:8090`) and model name for the *local* judge. It is scored from the first token's logprobs, so the server must return them (llama-server does).
 - `TG_AUTO_MAX_LOOKS_PER_HOUR` — a ceiling on judge calls per topic per hour (default 40).
-- `TG_CONTEXT` — the context engine (default on; `0` turns it off entirely). `TG_CONTEXT_EMBED` / `TG_CONTEXT_EMBED_URL` add meaning search, `TG_CONTEXT_DIGEST=haiku` adds digests (see Group settings), `TG_CONTEXT_OCR_URL` reads the text in photos (or `"ocr"` in `context-engines.json`).
+- `TG_CONTEXT` — the context engine (default on; `0` turns it off entirely). `state/context-engines.json` (written by `context/setup.sh`; `TG_CONTEXT_ENGINES` for another path) lists the search engines — see `context/ENGINES.md`. Without it, `TG_CONTEXT_EMBED=1` adds meaning search with bge-m3 on the local server `context/setup.sh` runs, or `TG_CONTEXT_EMBED_URL` (+ `TG_CONTEXT_EMBED`, the model name) another one; `TG_CONTEXT_DIGEST=haiku` adds summaries (see Group settings), `TG_CONTEXT_OCR_URL` reads the text in photos (or `"ocr"` in `context-engines.json`), `TG_CONTEXT_QUERY=typed` searches with the message as typed instead of Haiku's words, `TG_CONTEXT_DB` moves the index.
 - `TG_PROGRESS_DETAIL` — show the real command/path/query in the status message (default on).
 - `TG_BOT_LOGO` / `TG_SET_LOGO` — avatar to set on startup **if the bot has none**.
 - `TG_GROUP_LOGO` / `TG_SET_GROUP_LOGO` — group photo to set **if the group has none**

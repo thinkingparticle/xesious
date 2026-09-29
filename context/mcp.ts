@@ -5,7 +5,7 @@
  *
  * The bridge starts one of these per turn in a group (through --mcp-config) and pins
  * it to that group with XESIOUS_CONTEXT_CHAT: the model chooses what to search for,
- * never which group — one group's history is never another's.
+ * never which history.
  *
  * A minimal MCP server over stdio (newline-delimited JSON-RPC 2.0), with no SDK:
  * initialize, tools/list, tools/call, ping. Everything it returns is people's chat —

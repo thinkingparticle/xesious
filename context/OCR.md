@@ -78,5 +78,5 @@ On the question that prompted this work — about a message whose substance was 
 a screenshot — the right message went from outside the top 30 to first for most of the
 searches made for it, once its photo was read. On 16 questions written about what
 screenshots show, the right conversation was in the top 5 for about half of them
-before, and for 81–88% after. `research/context/fusion-eval.ts` measures the search as
+before, and for 81–88% after. `context/fusion-eval.ts` measures the search as
 a whole, with question sets kept outside this repository, beside the history they quote.

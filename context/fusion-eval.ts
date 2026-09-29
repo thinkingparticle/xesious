@@ -13,17 +13,17 @@
 //                   ranks (hit@5, hit@10, MRR). Comma-separated.
 //   --cases <file>  single cases: { set, q, gold (a stretch key), since?, until?, now? }
 //
-//   bun research/context/fusion-eval.ts --db <archive context.db> --chat <id> [--review <dir>] [--known a.jsonl,b.jsonl]
+//   bun context/fusion-eval.ts --db <archive context.db> --chat <id> [--review <dir>] [--known a.jsonl,b.jsonl]
 //        [--cases cases.jsonl] [--variants a,b] [--embed-url http://127.0.0.1:8093] [--json out.json]
 import { readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { ContextIndex, type FusionOpts, type SearchOptions } from '../../context/engine'
-import { httpEmbedder } from '../../context/embed'
+import { ContextIndex, type FusionOpts, type SearchOptions } from './engine'
+import { httpEmbedder } from './embed'
 
 const argv = process.argv.slice(2)
 const arg = (k: string, d?: string) => { const i = argv.indexOf(`--${k}`); return i >= 0 ? argv[i + 1] : d }
 const CHAT = arg('chat')!
-if (!arg('db') || !CHAT) { console.error('usage: bun research/context/fusion-eval.ts --db <context.db> --chat <id> [--review dir] [--known files] [--cases file]'); process.exit(2) }
+if (!arg('db') || !CHAT) { console.error('usage: bun context/fusion-eval.ts --db <context.db> --chat <id> [--review dir] [--known files] [--cases file]'); process.exit(2) }
 const idx = new ContextIndex(arg('db')!)
 const embedder = httpEmbedder(arg('embed-url', 'http://127.0.0.1:8093')!, 'bge-m3')
 const base = (o: Partial<SearchOptions>): SearchOptions => ({ k: 30, summaries: { model: 'sonnet', use: 'with-text' }, meaning: { embedder }, ...o })

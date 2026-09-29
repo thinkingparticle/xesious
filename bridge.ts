@@ -55,7 +55,7 @@ import {
 import { ContextIndex, recallPick, refersBack, type CtxMessage, type Hit, type SearchOptions } from './context/engine'
 import { QUERY_SYSTEM, languageNote, parseQuery, queryUser } from './context/query'
 import { DIGEST_BATCH_SYSTEM, digestBatchUser, splitDigests } from './context/digest'
-import { buildEngines, defaultEngineId, historyChat, loadEnginesConfig, type Engine, type EnginesConfig } from './context/engines'
+import { buildEngines, defaultEngineId, envEmbedding, historyChat, loadEnginesConfig, type Engine, type EnginesConfig } from './context/engines'
 import { readPhotos } from './context/ocr'
 import { recallBody, recallIntro, RECALL_CAVEAT, RECALL_CHARS, RECALL_MAX } from './context/recall'
 
@@ -2493,21 +2493,22 @@ function pruneConversations(): void {
 // The topic logs above stay the source of truth. The engine keeps a derived index of
 // them in one SQLite file, so a mention can bring back an earlier conversation from
 // ANY topic of the same group — "the pricing idea Sara floated last month" — without
-// replaying the history. Keywords always (FTS5); meaning as well when TG_CONTEXT_EMBED
-// is on and context/setup.sh has installed the small local model; digests when
-// TG_CONTEXT_DIGEST names a model to write them. Never across groups.
+// replaying the history. Keywords always (FTS5); meaning as well when an embeddings
+// server is configured (context/setup.sh: bge-m3 on llama.cpp); digests when
+// TG_CONTEXT_DIGEST names a model to write them. A topic searches its own group's
+// history unless context-engines.json links it to another (an archive or a group).
 //
 // Deleting state/context.db loses nothing: it is rebuilt from the logs at startup.
 
 const CONTEXT_ON = !/^(0|false|no|off)$/i.test(process.env.TG_CONTEXT || '1')
 const CONTEXT_DB = process.env.TG_CONTEXT_DB || join(dirname(STATE_FILE), 'context.db')
-// '1' for the default model, or a model id from context/embed.ts. With
-// TG_CONTEXT_EMBED_URL, the model is served by that OpenAI-compatible server instead
-// (llama-server --embedding), and TG_CONTEXT_EMBED is the model name it expects.
-const CONTEXT_EMBED = (process.env.TG_CONTEXT_EMBED || '').trim()
-const CONTEXT_EMBED_URL = (process.env.TG_CONTEXT_EMBED_URL || '').trim()
+// Meaning search without a context-engines.json: TG_CONTEXT_EMBED=1 is bge-m3 on the
+// local embeddings server context/setup.sh runs (or the one TG_CONTEXT_EMBED_URL names,
+// TG_CONTEXT_EMBED then the model name it expects); a transformers.js model id runs
+// in the bridge instead (context/embed.ts). See envEmbedding().
+const CONTEXT_EMB = envEmbedding()
 // 'haiku' or 'sonnet': a few lines per finished stretch of conversation, written by
-// that model through the CLI. Off by default: it is the one part that costs usage.
+// that model through the CLI. Off by default: it costs usage, like Claude-written search words.
 const CONTEXT_DIGEST = (process.env.TG_CONTEXT_DIGEST || '').trim().toLowerCase()
 // TG_CONTEXT_DIGEST=local: a local OpenAI-compatible server writes them instead
 // (llama.cpp's llama-server, Ollama, LM Studio): no Claude, no API key.
@@ -2738,19 +2739,19 @@ const syncIdleUntil = new Map<string, number>()
 async function contextStart(): Promise<void> {
   if (!contextIndex()) return
   contextBackfill()
-  if (CONTEXT_EMBED_URL) {
+  if (CONTEXT_EMB && 'url' in CONTEXT_EMB) {
     // A separate embeddings server (llama-server --embedding): nothing native in the
     // bridge. The model name is what the server expects, and what the vectors are
     // filed under.
     const { httpEmbedder } = await import('./context/embed')
-    contextIndex()!.useEmbedder(httpEmbedder(CONTEXT_EMBED_URL, CONTEXT_EMBED || 'default'))
-    console.log(`[ctx] meaning search on, through ${CONTEXT_EMBED_URL}`)
-  } else if (CONTEXT_EMBED && !/^(0|false|no|off)$/i.test(CONTEXT_EMBED)) {
-    const { localEmbedder, DEFAULT_EMBED_MODEL } = await import('./context/embed')
-    const model = /^(1|true|yes|on)$/i.test(CONTEXT_EMBED) ? DEFAULT_EMBED_MODEL : CONTEXT_EMBED
+    contextIndex()!.useEmbedder(httpEmbedder(CONTEXT_EMB.url, CONTEXT_EMB.model))
+    console.log(`[ctx] meaning search on, ${CONTEXT_EMB.model} through ${CONTEXT_EMB.url}`)
+  } else if (CONTEXT_EMB && 'local' in CONTEXT_EMB) {
+    const { localEmbedder } = await import('./context/embed')
+    const model = CONTEXT_EMB.local
     const e = await localEmbedder({ model }).catch(err => { console.error(`[ctx] ${model}: ${err}`); return undefined })
     if (e) { contextIndex()!.useEmbedder(e); console.log(`[ctx] meaning search on, with ${model}`) }
-    else console.error(`[ctx] TG_CONTEXT_EMBED is set but the model could not be loaded; run context/setup.sh. Keyword search still works.`)
+    else console.error(`[ctx] TG_CONTEXT_EMBED names an in-process model, but it could not be loaded (context/embed.ts says how to install its runtime). Keyword search still works.`)
   }
   // One tick at a time: embedding a backlog on a small CPU can outlast the minute.
   let ticking = false
@@ -2810,7 +2811,7 @@ function historyMcp(key: string): { args: string[]; tools: string[] } | undefine
   const title = historyTitle(hchat)
   if (title) env.XESIOUS_CONTEXT_TITLE = title
   if (contextIndex()?.embedder) {
-    if (CONTEXT_EMBED_URL) { env.XESIOUS_CONTEXT_EMBED_URL = CONTEXT_EMBED_URL; env.XESIOUS_CONTEXT_EMBED = CONTEXT_EMBED || 'default' }
+    if (CONTEXT_EMB && 'url' in CONTEXT_EMB) { env.XESIOUS_CONTEXT_EMBED_URL = CONTEXT_EMB.url; env.XESIOUS_CONTEXT_EMBED = CONTEXT_EMB.model }
     else env.XESIOUS_CONTEXT_EMBED = contextIndex()!.embedder!.name
   }
   for (const k of ['TG_CONTEXT_EMBED', 'TG_CONTEXT_EMBED_URL', 'TG_CONTEXT_DIGEST']) if (process.env[k]) env[k] = process.env[k]!
