@@ -296,7 +296,7 @@ Many settings no longer need SSH and a restart: a group changes its own with
     message. `context/OCR.md` has how it was chosen.
   - **Settings** (`/config` → More settings → *Context engine*, per group or topic):
     *Recall earlier talk* (when a message points back / on every message / off),
-    *Search words* (written by Haiku, by Sonnet, or the message as typed), *Search
+    *Search words* (written by Sonnet — the default — by Haiku, or the message as typed), *Search
     engine*, and *Summarise conversations*.
   - **Cost:** keywords, meaning search and photo reading run locally for free. Two
     parts use your Claude usage: summaries, and Claude-written search words — one
@@ -345,7 +345,7 @@ defaults now — a group can override them with `/config` (see above). Highlight
 - `TG_AUTO_JUDGE` / `TG_AUTO_EAGERNESS` — defaults for Auto mode's judge (`haiku`, `sonnet`, `local`) and eagerness (`reserved`, `balanced`, `chatty`); `/config` overrides both.
 - `TG_AUTO_LOCAL_URL` / `TG_AUTO_LOCAL_MODEL` — the OpenAI-compatible server (e.g. `http://127.0.0.1:8090`) and model name for the *local* judge. It is scored from the first token's logprobs, so the server must return them (llama-server does).
 - `TG_AUTO_MAX_LOOKS_PER_HOUR` — a ceiling on judge calls per topic per hour (default 40).
-- `TG_CONTEXT` — the context engine (default on; `0` turns it off entirely). `state/context-engines.json` (written by `context/setup.sh`; `TG_CONTEXT_ENGINES` for another path) lists the search engines — see `context/ENGINES.md`. Without it, `TG_CONTEXT_EMBED=1` adds meaning search with bge-m3 on the local server `context/setup.sh` runs, or `TG_CONTEXT_EMBED_URL` (+ `TG_CONTEXT_EMBED`, the model name) another one; `TG_CONTEXT_DIGEST=haiku` adds summaries (see Group settings), `TG_CONTEXT_OCR_URL` reads the text in photos (or `"ocr"` in `context-engines.json`), `TG_CONTEXT_QUERY=typed` searches with the message as typed instead of Haiku's words, `TG_CONTEXT_DB` moves the index.
+- `TG_CONTEXT` — the context engine (default on; `0` turns it off entirely). `state/context-engines.json` (written by `context/setup.sh`; `TG_CONTEXT_ENGINES` for another path) lists the search engines — see `context/ENGINES.md`. Without it, `TG_CONTEXT_EMBED=1` adds meaning search with bge-m3 on the local server `context/setup.sh` runs, or `TG_CONTEXT_EMBED_URL` (+ `TG_CONTEXT_EMBED`, the model name) another one; `TG_CONTEXT_DIGEST=haiku` adds summaries (see Group settings), `TG_CONTEXT_OCR_URL` reads the text in photos (or `"ocr"` in `context-engines.json`), `TG_CONTEXT_QUERY=haiku|typed` has Haiku write the recall's search words, or searches with the message as typed, instead of Sonnet, `TG_CONTEXT_DB` moves the index.
 - `TG_PROGRESS_DETAIL` — show the real command/path/query in the status message (default on).
 - `TG_BOT_LOGO` / `TG_SET_LOGO` — avatar to set on startup **if the bot has none**.
 - `TG_GROUP_LOGO` / `TG_SET_GROUP_LOGO` — group photo to set **if the group has none**

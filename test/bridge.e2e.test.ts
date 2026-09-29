@@ -3668,13 +3668,13 @@ describe('context engine', () => {
   })
 
   const queries = (): any[] => existsSync(QUERY_LOG) ? readFileSync(QUERY_LOG, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)) : []
-  test('the recall searches with words Claude Haiku wrote from the message and the talk before it', async () => {
+  test('the recall searches with words Claude Sonnet wrote from the message and the talk before it', async () => {
     const before = queries().length
     await say(911, 'the demo slot clashes with standup, maybe move it later?', MARYAM)
     await say(912, '@testbot so what did we decide about the Friday demo?')
     const q = queries().slice(before)
     expect(q.length).toBe(1)
-    expect(q[0].model).toBe('haiku')
+    expect(q[0].model).toBe('sonnet')
     expect(q[0].prompt).toContain('<message>\n@testbot so what did we decide about the Friday demo?\n</message>')
     expect(handed()).toContain('earlier conversations in this group')
   })
@@ -3764,12 +3764,12 @@ describe('context engine', () => {
     expect(queries().length).toBe(before)
   })
 
-  test('with Search words set to Sonnet, Sonnet writes them', async () => {
-    bridge._topicStore('recallQuery')[`${C}:912`] = 'sonnet'
+  test('with Search words set to Haiku, Haiku writes them', async () => {
+    bridge._topicStore('recallQuery')[`${C}:912`] = 'claude'
     const before = queries().length
     await say(912, '@testbot what came of the Friday demo plan, remember?')
     const q = queries().slice(before)
-    expect(q.map(x => x.model)).toEqual(['sonnet'])
+    expect(q.map(x => x.model)).toEqual(['haiku'])
     delete bridge._topicStore('recallQuery')[`${C}:912`]
   })
 

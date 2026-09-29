@@ -545,7 +545,7 @@ function serverDefault(id: string): SettingValue {
     case 'retention': return 0
     case 'recall': return CONTEXT_ON
     case 'contextEngine': return ''
-    case 'recallQuery': return /^typed$/i.test(process.env.TG_CONTEXT_QUERY || '') ? 'typed' : 'claude'
+    case 'recallQuery': { const q = (process.env.TG_CONTEXT_QUERY || '').trim().toLowerCase(); return q === 'typed' ? 'typed' : q === 'haiku' ? 'claude' : 'sonnet' }
     case 'summaries': return !!summaryModel()
     case 'instructions': return ''
     case 'mode': return PERMISSION_MODE

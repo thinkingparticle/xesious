@@ -8,7 +8,7 @@ uses a topic's engine twice per answer:
 1. **Automatic recall.** Before the turn, the bridge searches and hands Claude up to
    three stretches (`Recall earlier talk` in `/config` → *Context engine*: off / when a
    message points back / on every message). What it searches with is the topic's
-   *Search words* setting: by default Claude Haiku (or Sonnet) writes them from the message and the
+   *Search words* setting: by default Claude Sonnet (or Haiku) writes them from the message and the
    talk just before it (`context/query.ts`), shown the terms the searched history uses
    most, so a name typed in another script comes out spelled the way the chat spells
    it; or the message as typed, with no model involved. On a real history,
