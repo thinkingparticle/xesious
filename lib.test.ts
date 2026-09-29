@@ -245,21 +245,21 @@ describe('speechUnits — the granularity progressive delivery actually needs', 
 })
 
 describe('speechUnits — a line break with no full stop before it is a pause', () => {
-  // Reported 2026-09-26: heard as "…than Europeans AI is actually happening in the
-  // US…". The lines of a block were joined with a space, and the splitter only cuts
-  // after . ! or ?, so a headline ran into the line under it as one sentence.
-  const reported = '2. Why Americans are more anti-AI than Europeans\n' +
-    'AI is actually happening in the US, so Americans feel it. Europe is so far behind.\n' +
-    '3. "Bad" is worse than "evil"\nThiel says we moralize too much.'
+  // Reported 2026-09-26: a numbered headline and the line under it were heard as one
+  // sentence ("…why the office move is late The new lease starts…"). The lines of a
+  // block were joined with a space, and the splitter only cuts after . ! or ?.
+  const reported = '2. Why the office move is late\n' +
+    'The new lease starts in May, so the desks arrive after that. Until then we stay put.\n' +
+    '3. "Soon" is worse than "no"\nA vague date makes planning harder than a clear refusal.'
   test('a numbered title is said on its own, with a heading pause, apart from its paragraph', () => {
     const u = speechUnits(reported)
-    expect(u[0]).toMatchObject({ kind: 'heading', text: '2. Why Americans are more anti-AI than Europeans.', gap: SPEECH_GAPS.heading })
-    expect(u[1].text.startsWith('AI is actually happening in the US')).toBe(true)
+    expect(u[0]).toMatchObject({ kind: 'heading', text: '2. Why the office move is late.', gap: SPEECH_GAPS.heading })
+    expect(u[1].text.startsWith('The new lease starts in May')).toBe(true)
   })
   test('a title ending in a closing quote is still a title — the quote is not a full stop', () => {
     const u = speechUnits(reported)
-    expect(u[2]).toMatchObject({ kind: 'heading', text: '3. "Bad" is worse than "evil".' })
-    expect(u[3].text).toBe('Thiel says we moralize too much.')
+    expect(u[2]).toMatchObject({ kind: 'heading', text: '3. "Soon" is worse than "no".' })
+    expect(u[3].text).toBe('A vague date makes planning harder than a clear refusal.')
   })
   test('a bold line over a paragraph is a title too', () => {
     expect(speechUnits('**Why it matters**\nBody text here.').map(u => [u.kind, u.text]))
@@ -268,7 +268,7 @@ describe('speechUnits — a line break with no full stop before it is a pause', 
   test('the titles become the table of contents of the full audio', () => {
     const u = speechUnits(reported)
     const toc = speechToc(u, u.map((_, i) => ({ start: i * 10, end: i * 10 + 9 })))
-    expect(toc).toEqual([{ at: 0, title: '2. Why Americans are more anti-AI than Europeans' }, { at: 20, title: '3. "Bad" is worse than "evil"' }])
+    expect(toc).toEqual([{ at: 0, title: '2. Why the office move is late' }, { at: 20, title: '3. "Soon" is worse than "no"' }])
   })
   test('a break later in a block is a sentence break, not a title', () => {
     expect(speechUnits('It went well.\nThe numbers are in\nRevenue is up.').map(u => [u.kind, u.text]))
@@ -489,7 +489,7 @@ describe('parseDirs', () => {
 
 describe('getPathArg — what /get was asked for', () => {
   test('an absolute path is a path, not a missing argument (reported 2026-09-25)', () => {
-    expect(getPathArg('/get /home/u/reports/auto-mode.html', '/home/u')).toBe('/home/u/reports/auto-mode.html')
+    expect(getPathArg('/get /home/u/docs/report.html', '/home/u')).toBe('/home/u/docs/report.html')
   })
   test('a bare /get has no argument — not the command itself', () => {
     expect(getPathArg('/get', '/home/u')).toBe('')

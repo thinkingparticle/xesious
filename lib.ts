@@ -537,13 +537,13 @@ function placeholder(kind: string, lines: number): string {
 // A line break is a pause the reader sees and the listener never got: a block's lines
 // are joined with a space, and the sentence splitter only cuts after . ! or ?. So a
 // headline with no full stop of its own ran straight into the line under it and was
-// heard as one sentence — "…more anti-AI than Europeans AI is actually happening…"
+// heard as one sentence — "…why the office move is late The new lease starts…"
 // (reported 2026-09-26). A break is therefore a boundary when the line before it has
 // no end punctuation, unless the next line carries on in lower case, which is what a
 // sentence wrapped mid-way does.
 function endsPunctuated(line: string): boolean {
-  // Look past what closes a quote, a bracket or emphasis: `3. "Bad" is worse than
-  // "evil"` ends in a quote, and the quote is not the end of a sentence.
+  // Look past what closes a quote, a bracket or emphasis: `3. "Soon" is worse than
+  // "no"` ends in a quote, and the quote is not the end of a sentence.
   return /[.!?:;,…—–]$/.test(line.trim().replace(/["'”’)\]*_`»]+$/, ''))
 }
 const breakIsBoundary = (line: string, next: string) => !endsPunctuated(line) && !/^\p{Ll}/u.test(next.trim())

@@ -619,7 +619,7 @@ describe('the prompt reaches the CLI attributed (A6)', () => {
     // group. `/usage@bot` is no CLI command, so it went to the model as an unframed
     // prompt, which the model refused as unverified.
     for (const cmd of ['/usage', '/cost', '/context']) {
-      await incoming(1082, `${cmd}@katyusha_the_kitty_dev_bot`)
+      await incoming(1082, `${cmd}@some_bot`)
       expect(readFileSync(LAST_PROMPT, 'utf8')).toBe(cmd)
     }
   })
