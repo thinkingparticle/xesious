@@ -56,11 +56,15 @@ export function splitDigests(text: string): Map<number, string> {
   return out
 }
 
-// What the model wrote, tidied: no preamble, no markdown, bounded.
+// What the model wrote, tidied: no preamble, no markdown, bounded. A star between
+// two numbers and an underscore inside a word are text, not markdown: "3*20" must not
+// become "320", nor "retry_count" "retrycount".
 export function cleanDigest(text: string): string {
   return (text ?? '')
     .replace(/^\s*(here is|here's)[^\n]*\n/i, '')
-    .replace(/[*_`#]+/g, '')
+    .replace(/(?<!\d ?)\*+|\*+(?! ?\d)/g, '')
+    .replace(/(?<![\p{L}\p{N}])_+|_+(?![\p{L}\p{N}])/gu, '')
+    .replace(/[`#]+/g, '')
     .split('\n').map(l => l.trim()).filter(Boolean)
     // A title line ("Summary", "Summary: Weekly sync") and lines with nothing in
     // them ("Open: None apparent") only dilute the search.

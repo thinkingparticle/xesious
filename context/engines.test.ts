@@ -248,6 +248,10 @@ describe('summaries in batches', () => {
     expect(digestBatchUser([{ key: 'k', chat: '-1', topic: '1', topicTitle: 'T', first: 1, last: 1, t0: 0, t1: 0, ids: [1], text: 'x' }])).toContain('=== STRETCH 1 ===\nTopic: T')
     expect(cleanDigest('Summary: Releases\nAbout: release 584\nIdeas: None')).toBe('About: release 584')
   })
+  test('markdown marks go; a star between numbers and an underscore inside a word stay', () => {
+    expect(cleanDigest('**About:** limits\nDecided: 3*20 = 60, 4 * 5 = 20; rename retry_count, not _this_'))
+      .toBe('About: limits\nDecided: 3*20 = 60, 4 * 5 = 20; rename retry_count, not this')
+  })
 })
 
 describe('what a turn is handed', () => {
