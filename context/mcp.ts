@@ -35,7 +35,10 @@ const TOOLS = [
     name: 'search_history',
     description: `Search ${WHOSE}, in any of its topics, for a subject, idea, decision, person or phrase. ` +
       "Returns the best-matching stretches of conversation with message ids, dates and a link to each message. Use it when someone refers to something discussed earlier that you do not have. " +
-      "Search in the words the chat itself would have used; names may be spelled in another script or language there (for example a name in Latin letters inside messages written in another script), so try more than one spelling when the first finds nothing. " +
+      "Search in the words the chat itself would have used; names may be spelled in another script or language there (for example a name in Latin letters inside messages written in another script), so try more than one spelling. " +
+      "The results are the closest matches, not necessarily the right one: check what you found against the details the person gave (amounts, dates, names, the product or place). " +
+      "If they differ, you have not found it yet: search again with other words (the chat's own terms for the same thing, the other script or language, the number written another way) or dates around the one given, ask for more results, and read around the closest hits. " +
+      "If it still does not turn up, say plainly that you could not find it, then show the closest matches and how they differ. Never tell the person they are wrong or misremembering because a different message says otherwise. " +
       'What photos say (screenshots of emails, dashboards, errors) is searched too; it shows as [text in the photo, machine-read: …] and may have reading mistakes. ' +
       'In your answer, cite the messages you rely on as Markdown links to them, not as a bare date and number.',
     inputSchema: {
@@ -45,7 +48,7 @@ const TOOLS = [
         topic: { type: 'string', description: 'Optional: only this topic (its title, or its id from list_topics).' },
         since: { type: 'string', description: 'Optional: only conversations on or after this date, YYYY-MM-DD.' },
         until: { type: 'string', description: 'Optional: only conversations on or before this date, YYYY-MM-DD.' },
-        limit: { type: 'number', description: 'How many stretches to return, 1-10 (default 5).' },
+        limit: { type: 'number', description: 'How many stretches to return, 1-15 (default 5).' },
       },
       required: ['query'],
     },
@@ -135,7 +138,7 @@ async function call(name: string, a: any): Promise<string> {
   if (name === 'search_history') {
     const topic = a.topic ? topicId(i, String(a.topic)) : undefined
     if (a.topic && !topic) return `No topic called "${a.topic}". list_topics shows the ones there are.`
-    const k = Math.max(1, Math.min(10, Number(a.limit) || 5))
+    const k = Math.max(1, Math.min(15, Number(a.limit) || 5))
     const o = { k, topic, since: toT(a.since), until: toT(a.until, true) }
     const e = chosenEngine()
     // An engine that fails (its service is down) costs its ranking: keywords answer.

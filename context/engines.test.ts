@@ -262,6 +262,7 @@ describe('what a turn is handed', () => {
     const h: Hit = { ...hit(7, 2), episode: { ...ep(7, 2), chat: '-1001234567890', topic: '540' } }
     expect(recallBody([h]).text.split('\n')[0]).toBe('— Ops, 2026-05-01, messages #7–#8 (link to a message: https://t.me/c/1234567890/540/<id>):')
     expect(RECALL_CAVEAT).toContain('Markdown link')
+    expect(RECALL_CAVEAT).toContain('say you could not find it')
   })
   test('a long stretch is cut to around what matched', () => {
     const { text } = recallBody([hit(100, 40, [120])])

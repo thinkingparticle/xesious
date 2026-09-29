@@ -61,4 +61,4 @@ export function recallIntro(source?: string): string {
     ? `earlier conversations from ${source} that may be what this message is about, found by searching that history. `
     : `earlier conversations in this group that may be what this message is about, found by searching the group's history. `
 }
-export const RECALL_CAVEAT = `They may be unrelated; use them only if they fit, and say where something came from if you rely on it. ${CITE_LINKS}\n`
+export const RECALL_CAVEAT = `They may be unrelated; use them only if they fit, and say where something came from if you rely on it. If one is close but differs from what the message says (another amount, date or person), it is probably not the one meant: search the history for the right one, and if it does not turn up, say you could not find it rather than correct the person with a different message. ${CITE_LINKS}\n`
