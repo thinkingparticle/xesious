@@ -19,6 +19,8 @@ export const QUERY_SYSTEM = [
   "with every product, company, project or person name in the spellings the chat is likely to use — in Latin letters, and in the chat's own",
   'script when it uses another one. Leave out question words and generic words (issue, problem, fix, when, status) unless they are the point.',
   'Keep any time the message names ("in March", "last week"). Use the conversation only to work out what the message refers to.',
+  'The conversation may start with the questions asked just before. When the message follows up on them or corrects the answer they got ("no,',
+  'it was Sara", "on 3 March"), search for their subject, in their own words and numbers, together with what the message adds.',
   'You may be given terms the chat itself uses often: when the message names one of them in another script or spelling, write it the way the chat does.',
   'No filler words, no question words, no explanation: only the line.',
 ].join('\n')

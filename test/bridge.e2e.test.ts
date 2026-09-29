@@ -3773,6 +3773,22 @@ describe('context engine', () => {
     delete bridge._topicStore('recallQuery')[`${C}:912`]
   })
 
+  test("a follow-up's search words know what was asked before it, until the session changes", async () => {
+    await say(912, '@testbot what did we decide about the Friday demo?')
+    const before = queries().length
+    await say(912, '@testbot no, it was Maryam who said it')
+    const q = queries().slice(before)
+    expect(q.length).toBe(1)
+    expect(q[0].prompt).toContain('<conversation>\nAsked before:')
+    expect(q[0].prompt).toContain('Asked before: @testbot what did we decide about the Friday demo?')
+    // The question, not the answer the bot gave: a correction must not search for what it corrects.
+    expect(q[0].prompt).not.toContain('okReply')
+    await say(912, '/new')
+    const after = queries().length
+    await say(912, '@testbot and what did Maryam say before?')
+    expect(queries().slice(after)[0].prompt).not.toContain('Asked before')
+  })
+
   test('with Search words set to "as typed", no model is asked', async () => {
     bridge._topicStore('recallQuery')[`${C}:912`] = 'typed'
     const before = queries().length

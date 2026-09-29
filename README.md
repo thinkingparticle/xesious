@@ -273,6 +273,12 @@ Many settings no longer need SSH and a restart: a group changes its own with
     **Digests** — a few lines per finished stretch naming its ideas and decisions,
     written by Haiku — are on with `TG_CONTEXT_DIGEST=haiku`; they cost one short
     call per stretch. `research/context/` has the benchmark behind these choices.
+  - **Photos** are found by the text in them (a screenshot of an email, an error, a
+    dashboard) with a local OCR service: run `context/setup-ocr.sh`, then
+    `context/services.sh start ocr`, and add `"ocr": { "url": "http://127.0.0.1:8094" }`
+    to `context-engines.json` (or set `TG_CONTEXT_OCR_URL`). A photo posted in a
+    recorded topic is then saved to `state/media/` and read in the background, on the
+    server's CPU; nothing is sent anywhere. `context/OCR.md` has how it was chosen.
   - *Recall earlier talk* under More settings turns it off for a group or topic.
 
 - **Three levels, most specific wins:** a topic's own value → the group's value →
@@ -318,7 +324,7 @@ defaults now — a group can override them with `/config` (see above). Highlight
 - `TG_AUTO_JUDGE` / `TG_AUTO_EAGERNESS` — defaults for Auto mode's judge (`haiku`, `sonnet`, `local`) and eagerness (`reserved`, `balanced`, `chatty`); `/config` overrides both.
 - `TG_AUTO_LOCAL_URL` / `TG_AUTO_LOCAL_MODEL` — the OpenAI-compatible server (e.g. `http://127.0.0.1:8090`) and model name for the *local* judge. It is scored from the first token's logprobs, so the server must return them (llama-server does).
 - `TG_AUTO_MAX_LOOKS_PER_HOUR` — a ceiling on judge calls per topic per hour (default 40).
-- `TG_CONTEXT` — the context engine (default on; `0` turns it off entirely). `TG_CONTEXT_EMBED` / `TG_CONTEXT_EMBED_URL` add meaning search, `TG_CONTEXT_DIGEST=haiku` adds digests (see Group settings).
+- `TG_CONTEXT` — the context engine (default on; `0` turns it off entirely). `TG_CONTEXT_EMBED` / `TG_CONTEXT_EMBED_URL` add meaning search, `TG_CONTEXT_DIGEST=haiku` adds digests (see Group settings), `TG_CONTEXT_OCR_URL` reads the text in photos (or `"ocr"` in `context-engines.json`).
 - `TG_PROGRESS_DETAIL` — show the real command/path/query in the status message (default on).
 - `TG_BOT_LOGO` / `TG_SET_LOGO` — avatar to set on startup **if the bot has none**.
 - `TG_GROUP_LOGO` / `TG_SET_GROUP_LOGO` — group photo to set **if the group has none**

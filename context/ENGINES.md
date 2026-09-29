@@ -27,6 +27,8 @@ Engines are listed in a JSON file — `state/context-engines.json`, or the path 
   "embeddings": { "url": "http://127.0.0.1:8093", "model": "bge-m3", "maxChars": 2000 },
   // the model that writes per-stretch summaries (haiku / sonnet through the CLI, or "local")
   "summaries": { "model": "haiku" },
+  // the service that reads the text in photos (context/OCR.md); without it, photos are known by their captions
+  "ocr": { "url": "http://127.0.0.1:8094" },
   "engines": {
     "xesious-keywords": { "kind": "xesious", "label": "keywords" },
     "xesious-bge-m3":   { "kind": "xesious", "label": "keywords + bge-m3", "meaning": true },
@@ -49,8 +51,9 @@ here, on the server: a group's history is never another group's to read.
 ## The built-in engine (`kind: "xesious"`)
 
 Signals fused by rank (reciprocal-rank fusion): keywords over whole stretches and over
-single messages (SQLite FTS5, Persian spelling normalised), the conversation just
-before the question, a date the question names, and optionally:
+single messages (SQLite FTS5, Persian spelling and thousands separators normalised), the
+conversation just before the question, a date the question names (English or Persian,
+Gregorian or Solar Hijri months), and optionally:
 
 | option | effect |
 |---|---|
@@ -58,6 +61,20 @@ before the question, a date the question names, and optionally:
 | `"summaries": "<model>"` | also search the summaries that model wrote (words, and vectors when `meaning` is on) |
 | `"summaryUse": "with-text"` | summaries are extra signals next to the talk (default) |
 | `"summaryUse": "alone"` | only the summaries are searched, in place of the talk |
+
+Two pairs of signals measure the same thing — a stretch's words and its best message's
+words; the meaning of the talk and of its summary — so each pair counts once, by its
+better rank, with a little extra when both agree; and the rank constant is 10, not the
+usual 60, so the top of a list counts for more than being somewhere in it (`FUSION` in
+`context/engine.ts`). Without this, a stretch found half-way down by every list
+outranked the one a single message answers exactly. Measured on a real archive
+(`research/context/fusion-eval.ts`): an answer in the top 5 for 78% of real questions
+as the recall searches them, up from 67%.
+
+A question's words are searched along with numbers it writes in words (`هزار` → 1000,
+"ten thousand" → 10000) and, for a name it writes in Persian letters, the spelling the
+chat itself uses in Latin ones (`داکر` → docker), found by consonants among the chat's
+own frequent words (`expandQuery`).
 
 ## An engine in any language (`kind: "http"`)
 

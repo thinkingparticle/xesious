@@ -56,6 +56,7 @@ import { ContextIndex, recallPick, refersBack, type CtxMessage, type Hit, type S
 import { QUERY_SYSTEM, languageNote, parseQuery, queryUser } from './context/query'
 import { DIGEST_BATCH_SYSTEM, digestBatchUser, splitDigests } from './context/digest'
 import { buildEngines, defaultEngineId, historyChat, loadEnginesConfig, type Engine, type EnginesConfig } from './context/engines'
+import { readPhotos } from './context/ocr'
 import { recallBody, recallIntro, RECALL_CAVEAT, RECALL_CHARS, RECALL_MAX } from './context/recall'
 
 // ---------------------------------------------------------------------------
@@ -269,6 +270,7 @@ function resumeIdFor(key: string): string | undefined {
 // the topic's record so it outranks an older link, and carries the change to the
 // link, so the call follows a /new in Telegram too.
 function topicSessionChanged(key: string): void {
+  lastAsked.delete(key)
   const at = new Date().toISOString()
   const e = sessions[key]
   if (e) e.updated = at
@@ -2436,6 +2438,7 @@ function recordMessage(msg: any, toBot: boolean, edited = false): void {
   if (!r) return
   appendRecord(msg.chat.id, msg.message_thread_id, edited ? { ...r, edited: true } : r)
   contextAdd(msg.chat.id, msg.message_thread_id, [r])
+  if (r.kind === 'photo' && r.file) queuePhoto(msg.chat.id, r.id, r.file)
 }
 
 function readTopicLog(chatId: number, threadId: number | undefined): ConvRecord[] {
@@ -2470,6 +2473,16 @@ function pruneConversations(): void {
     }
     const gone = contextIndex()?.pruneBefore(chat, cutoff) ?? 0
     if (gone) console.log(`[ctx] pruned ${gone} message(s) older than ${days} days from the index of ${chat}`)
+    // Photos downloaded to be read go with their messages (a photo is saved when it
+    // is posted, so its file is as old as the message).
+    const dir = join(MEDIA_DIR, chat)
+    let photos: string[] = []
+    try { photos = readdirSync(dir) } catch {}
+    let removed = 0
+    for (const f of photos) {
+      try { if (statSync(join(dir, f)).mtimeMs / 1000 < cutoff) { rmSync(join(dir, f), { force: true }); removed++ } } catch {}
+    }
+    if (removed) console.log(`[ctx] removed ${removed} photo(s) older than ${days} days from ${dir}`)
   }
 }
 
@@ -2593,6 +2606,58 @@ function contextAdd(chatId: number, threadId: number | undefined, recs: ConvReco
   try { contextIndex()?.add(ctxMessages(chatId, threadId, recs)) } catch (e) { console.error(`[ctx] index: ${e}`) }
 }
 
+// Photos, read for their text (context/ocr.ts) when the server has the service for it
+// ("ocr" in context-engines.json): a screenshot is found by what it says. Files are
+// otherwise kept as Telegram file ids and fetched only when a mention needs them; a
+// photo posted in a recorded topic is instead saved once, to state/media/<chat>/<id>,
+// and read in the background. Retention removes it with its message.
+const MEDIA_DIR = join(dirname(STATE_FILE), 'media')
+const OCR_PER_TICK = 3        // each is seconds of CPU on a small server
+const ocrUrl = (): string | undefined => ctxCfg.ocr?.url || process.env.TG_CONTEXT_OCR_URL || undefined
+const photoQueue: { chat: string; id: number; file: { id: string; size: number } }[] = []
+function queuePhoto(chatId: number, id: number, file: { id: string; size: number }): void {
+  if (CONTEXT_ON && ocrUrl() && photoQueue.length < 500) photoQueue.push({ chat: String(chatId), id, file })
+}
+async function savePhotos(idx: ContextIndex): Promise<void> {
+  for (let p = photoQueue.shift(); p; p = photoQueue.shift()) {
+    if (idx.mediaOf(p.chat, [p.id]).size || (p.file.size && p.file.size > TG_DOWNLOAD_LIMIT)) continue
+    const { chat, id } = p
+    try {
+      const dest = await fetchTelegramFile(bot.api, p.file.id, ext => join(ensureDir(join(MEDIA_DIR, chat)), `${id}${ext || '.jpg'}`))
+      idx.setMedia(chat, id, 'photo', dest)
+    } catch (e) { console.error(`[ocr] could not save photo ${chat}#${id}: ${e}`) }
+  }
+}
+// The saved photos an index lost track of (it was deleted and rebuilt from the logs).
+function relinkPhotos(idx: ContextIndex): void {
+  let chats: string[] = []
+  try { chats = readdirSync(MEDIA_DIR) } catch { return }
+  for (const chat of chats) {
+    let files: string[] = []
+    try { files = readdirSync(join(MEDIA_DIR, chat)) } catch { continue }
+    for (const f of files) {
+      const id = Number(f.replace(/\.[^.]*$/, ''))
+      if (!Number.isInteger(id) || idx.mediaOf(chat, [id]).size) continue
+      if (idx.db.query('SELECT 1 FROM msgs WHERE chat = ? AND id = ?').get(chat, id)) idx.setMedia(chat, id, 'photo', join(MEDIA_DIR, chat, f))
+    }
+  }
+}
+// The groups' photos: save what was posted since the last tick, and read a few.
+let ocrQuietUntil = 0
+async function ocrTick(idx: ContextIndex): Promise<void> {
+  const url = ocrUrl()
+  if (!url) return
+  await savePhotos(idx)
+  if (Date.now() < ocrQuietUntil) return
+  const n = await readPhotos(idx, url, { limit: OCR_PER_TICK }).catch(e => {
+    // A service that is down is said once, then left alone for a while.
+    console.error(`[ocr] ${url}: ${e} — trying again in 10 minutes`)
+    ocrQuietUntil = Date.now() + 10 * 60_000
+    return 0
+  })
+  if (n) { idx.refresh(); console.log(`[ocr] read the text in ${n} photo(s)`) }
+}
+
 // Bring the index up to date with the logs: at startup, and cheap when nothing
 // changed (a log whose size is what the index last saw is skipped).
 function contextBackfill(): void {
@@ -2618,6 +2683,7 @@ function contextBackfill(): void {
       files++; msgs += recs.length
     }
   }
+  relinkPhotos(idx)
   idx.refresh()
   const st = idx.stats()
   console.log(`[ctx] index: ${st.messages} messages in ${st.episodes} stretches${files ? ` (read ${msgs} from ${files} log(s))` : ''}` +
@@ -2629,6 +2695,7 @@ async function contextTick(): Promise<void> {
   const idx = contextIndex()
   if (!idx) return
   idx.refresh()
+  await ocrTick(idx)
   if (idx.embedder) {
     const n = await idx.embedPending(16, 64).catch(e => { console.error(`[ctx] embedding: ${e}`); return 0 })
     if (n) console.log(`[ctx] embedded ${n} stretch(es)`)
@@ -2825,11 +2892,29 @@ async function recallCompare(key: string, question: string): Promise<string[]> {
 // and what it handed over — for that turn's live status (runStreaming).
 const recallSteps = new Map<string, { step: Step; at: number }>()
 
+// What was last asked in a topic, for the recall's search words: a follow-up ("no,
+// it was Sara who said it") does not say what "it" is, and a question the bot
+// answered is not in the topic's log. The last few questions, since a follow-up can
+// follow a follow-up. The questions only, not the answers: a follow-up that corrects
+// an answer would have the search look for what the answer claimed (measured on the
+// case that prompted this). Kept a few hours, and forgotten when the topic's session
+// changes (/new, /resume).
+const lastAsked = new Map<string, { q: string; at: number }[]>()
+function rememberAsked(key: string, q: string): void {
+  lastAsked.set(key, [...(lastAsked.get(key) ?? []), { q, at: Date.now() }].slice(-3))
+}
+function lastAskedFor(key: string): string | undefined {
+  const qs = (lastAsked.get(key) ?? []).filter(x => Date.now() - x.at < 3 * 3600_000)
+  if (!qs.length) return undefined
+  const cut = (s: string) => { const t = s.replace(/\s+/g, ' ').trim(); return t.length > 400 ? `${t.slice(0, 399)}…` : t }
+  return qs.map(x => `Asked before: ${cut(x.q)}`).join('\n')
+}
+
 // What a turn in a group is handed from the rest of the group's history: up to three
 // earlier stretches of conversation that match what was asked, from any topic, when
 // the message points back at something and they match well enough (recallPick).
 // Talk the turn already has (this topic's recent messages) is left out.
-async function recallBlock(chatId: number, key: string, text: string, o: { exclude: Set<number>; context?: string; recentSince?: number; onSearch?: () => void }): Promise<string> {
+async function recallBlock(chatId: number, key: string, text: string, o: { exclude: Set<number>; context?: string; asked?: string; recentSince?: number; onSearch?: () => void }): Promise<string> {
   if (!text.trim() || !contextIndex()) return ''
   const hchat = historyOf(key), linked = hchat !== String(chatId)
   const store = storeFor(hchat)
@@ -2841,11 +2926,14 @@ async function recallBlock(chatId: number, key: string, text: string, o: { exclu
   const names = store.people(hchat)
   const said = o.context ? `${text}\n${o.context}` : text
   // Only a message the recall will act on is worth a model call for search words:
-  // unless recall is on for every message, one that points back at something.
-  if (!always && !refersBack(said, { names })) return ''
+  // unless recall is on for every message, one that points back at something. A
+  // topic linked to an archive exists to ask about it, so there every message does.
+  if (!always && !linked && !refersBack(said, { names })) return ''
   // It searches: seconds, when a model writes the words. The turn's status says so.
   o.onSearch?.()
-  const { q, by, model } = await recallQuery(key, text, o.context)
+  // The questions asked just before help the search words (a follow-up), not the
+  // decision to search: "write me a haiku" after a question about the past is not one.
+  const { q, by, model } = await recallQuery(key, text, [o.asked, o.context].filter(Boolean).join('\n') || undefined)
   // Words written from the message and the talk before it already carry that talk;
   // the message as typed leans on it as before. A linked archive shares nothing with
   // this topic's own recent talk.
@@ -2858,7 +2946,7 @@ async function recallBlock(chatId: number, key: string, text: string, o: { exclu
   // 'always': the best few, whatever the message. Otherwise the ones that match well
   // enough (see recallPick): old talk that merely shares a word is noise.
   const strong = always ? hits.slice(0, RECALL_MAX)
-    : recallPick(hits, said, { names, max: RECALL_MAX, strength: engine.def.kind === 'xesious' })
+    : recallPick(hits, said, { names, max: RECALL_MAX, strength: engine.def.kind === 'xesious', gate: !linked })
   // Shown as the first step of the turn's live status: what was searched, and found.
   const words = by === 'claude' ? `"${q.length > 70 ? `${q.slice(0, 69)}…` : q}" (${model === 'sonnet' ? 'Sonnet' : 'Haiku'}'s words)` : 'the message as typed'
   if (!strong.length) {
@@ -2906,7 +2994,7 @@ async function conversationContext(ctx: Context, key: string, threadId: number |
   if (targetId !== undefined && !window.length) { const r = recordOf(reply, false); if (r) window = [r] }
   const recalled = recallFor(key) ? await recallBlock(chatId, key, text, {
     exclude: new Set([msgId, ...since.map(r => r.id), ...window.map(r => r.id)]),
-    context: [...window, ...since].slice(-6).map(r => r.text).join('\n') || undefined,
+    context: [...window, ...since].slice(-6).map(r => r.text).join('\n') || undefined, asked: lastAskedFor(key),
     recentSince: mark, onSearch: o.onSearch,
   }).catch(e => { console.error(`[ctx] recall: ${e}`); return '' }) : ''
   if (!since.length && !window.length) return recalled
@@ -3274,9 +3362,16 @@ async function receiveFile(ctx: Context, att: { fileId: string; name: string; si
     throw new Error(
       `file is ${fmtBytes(att.size)}, over the ${fmtBytes(TG_DOWNLOAD_LIMIT)} the cloud Bot API lets bots fetch.\n` +
       `To lift this, run a local Bot API server and set TG_API_ROOT (see README) — or copy the file to ${cwd}/${INBOX_DIR}/ directly.`)
-  const file = await ctx.api.getFile(att.fileId)
+  const dest = await fetchTelegramFile(ctx.api, att.fileId, ext => uniquePath(ensureDir(boxDir(cwd, key, INBOX_DIR)), safeName(att.name, ext)))
+  console.log(`[file<-] ${dest} (${fmtBytes(statSync(dest).size)})`)
+  return dest
+}
+
+// A Telegram file saved to disk, at the path `destFor` picks from its extension.
+async function fetchTelegramFile(api: Context['api'], fileId: string, destFor: (ext: string) => string): Promise<string> {
+  const file = await api.getFile(fileId)
   if (!file.file_path) throw new Error('Telegram returned no file_path')
-  const dest = uniquePath(ensureDir(boxDir(cwd, key, INBOX_DIR)), safeName(att.name, extname(file.file_path)))
+  const dest = destFor(extname(file.file_path))
   // A local server in --local mode has already written the file to its own disk
   // and hands back an absolute path; there is nothing to download.
   if (LOCAL_API && isAbsolute(file.file_path) && existsSync(file.file_path)) {
@@ -3290,7 +3385,6 @@ async function receiveFile(ctx: Context, att: { fileId: string; name: string; si
     if (!res.ok) throw new Error(`download failed (HTTP ${res.status})`)
     writeFileSync(dest, Buffer.from(await res.arrayBuffer()))
   }
-  console.log(`[file<-] ${dest} (${fmtBytes(statSync(dest).size)})`)
   return dest
 }
 
@@ -4963,6 +5057,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
       await sendNoAnswer(ctx, threadId, key, prompt, replyLink())
       return
     }
+    if (!background && !res.isError && res.text.trim()) rememberAsked(key, prompt)
     // When the turn's closing block only promises future work or refers to work
     // the user never saw, deliver the substantive block before it as well. The
     // rest of the turn's text is in the run record above, so this is an

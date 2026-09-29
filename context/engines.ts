@@ -60,6 +60,9 @@ export interface EnginesConfig {
   default?: string
   embeddings?: { url: string; model: string; maxChars?: number }
   summaries?: { model?: string }
+  // The service that reads the text in photos (context/ocr_service.py); without it,
+  // photos are known by their captions only.
+  ocr?: { url: string }
   engines: Record<string, EngineDef>
   archives?: Record<string, { db: string; title?: string }>
   links?: Record<string, string>

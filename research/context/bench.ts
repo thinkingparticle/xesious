@@ -25,6 +25,8 @@ const digestFile = arg('digests')
 const withContext = !has('no-context')
 const depsDir = arg('deps')
 const cacheDir = arg('cache', process.env.HF_CACHE)
+// How the signals are fused (context/engine.ts FusionOpts), as JSON: --fusion '{"k":10}'
+const fusion = arg('fusion') ? JSON.parse(arg('fusion')!) : undefined
 
 const CHAT = '-1'
 const slug = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '-')
@@ -69,7 +71,7 @@ for (const q of queries) {
   const s0 = performance.now()
   // As the bridge does: the topic's own recent talk is already in the turn.
   const recentFrom = q.recent?.length ? Math.min(...q.recent) : undefined
-  const hits = await idx.search(CHAT, question, { k: 10, context, exclude, now: Math.floor(Date.parse(q.t) / 1000),
+  const hits = await idx.search(CHAT, question, { k: 10, context, exclude, fusion, now: Math.floor(Date.parse(q.t) / 1000),
     recent: recentFrom !== undefined ? { topic: slug(q.topic), from: recentFrom } : undefined })
   const ms = performance.now() - s0
   const gold = new Set<number>(q.gold)
@@ -85,7 +87,7 @@ const at = (rs: R[], k: number) => rs.filter(r => r.rank > 0 && r.rank <= k).len
 const mrr = (rs: R[]) => rs.reduce((s, r) => s + (r.rank ? 1 / r.rank : 0), 0) / rs.length
 const pct = (x: number) => `${(100 * x).toFixed(0)}%`
 const types = [...new Set(results.map(r => r.type))].sort()
-const name = `${embedModel ?? 'keywords only'}${digestFile ? ' + digests' : ''}${withContext ? '' : ' (no recent context)'}${Object.keys(rules).length ? ` ${JSON.stringify(rules)}` : ''}`
+const name = `${embedModel ?? 'keywords only'}${digestFile ? ' + digests' : ''}${fusion ? ` fusion ${JSON.stringify(fusion)}` : ''}${withContext ? '' : ' (no recent context)'}${Object.keys(rules).length ? ` ${JSON.stringify(rules)}` : ''}`
 console.log(`== ${name}`)
 console.log(`${st.messages} messages, ${st.episodes} episodes; index ${Math.round(tIdx - t0)}ms, embedded ${embedded} in ${Math.round(tEmb - tIdx)}ms; search p50 ${Math.round(results.map(r => r.ms).sort((a, b) => a - b)[Math.floor(results.length / 2)])}ms`)
 console.log(`hit@1 ${pct(at(results, 1))}  hit@3 ${pct(at(results, 3))}  hit@5 ${pct(at(results, 5))}  hit@10 ${pct(at(results, 10))}  MRR ${mrr(results).toFixed(2)}  gold covered by top 5: ${pct(results.reduce((s, r) => s + r.cover5, 0) / results.length)}`)
@@ -97,7 +99,7 @@ const unrelated = ['can you write a regex that matches email addresses?', 'what 
   'چطوری یه فایل CSV رو تو پایتون بخونم؟', 'give me three name ideas for a cat', 'how many days until Christmas?']
 let noise = 0, noisy = 0
 const uNow = Date.parse('2026-08-20T10:00:00Z') / 1000
-for (const u of unrelated) { const b = strongOf(await idx.search(CHAT, u, { k: 10, now: uNow }), u, uNow); noise += b.length; if (b.length) noisy++ }
+for (const u of unrelated) { const b = strongOf(await idx.search(CHAT, u, { k: 10, now: uNow, fusion }), u, uNow); noise += b.length; if (b.length) noisy++ }
 const withBlock = results.filter(r => r.block > 0)
 console.log(`recall block (what a mention is handed): answer in it for ${pct(results.filter(r => r.blockHit).length / results.length)} of questions; ` +
   `${(results.reduce((s, r) => s + r.block, 0) / results.length).toFixed(1)} stretches on average; empty for ${results.length - withBlock.length}; ` +
