@@ -1760,3 +1760,41 @@ describe('Auto mode', () => {
     expect(L.asEagerness('nonsense')).toBe('balanced')
   })
 })
+
+describe('ephemeral commands delivered again', () => {
+  const L = require('./lib') as typeof import('./lib')
+  const now = Date.parse('2026-09-30T08:00:00Z') / 1000
+  test('a fresh one is answered, and the same one again is left alone', () => {
+    const e = new L.EphemeralCommands()
+    expect(e.check(-100123, 7, 555, now - 1, now)).toBeUndefined()
+    expect(e.check(-100123, 7, 555, now - 1, now + 5)).toBe('again')
+  })
+  test('one past the reply window is left alone, however late', () => {
+    const e = new L.EphemeralCommands()
+    expect(e.check(-100123, 7, 556, now - L.EPHEMERAL_REPLY_WINDOW_S, now)).toBeUndefined()
+    expect(e.check(-100123, 7, 557, now - L.EPHEMERAL_REPLY_WINDOW_S - 1, now)).toBe('late')
+    expect(e.check(-100123, 7, 558, now - 5 * 3600, now)).toBe('late')
+  })
+  test('the same id from another person or in another chat is a command of its own', () => {
+    const e = new L.EphemeralCommands()
+    expect(e.check(-100123, 7, 559, now, now)).toBeUndefined()
+    expect(e.check(-100123, 8, 559, now, now)).toBeUndefined()
+    expect(e.check(-100456, 7, 559, now, now)).toBeUndefined()
+  })
+  test('a date of 0 is no date: only a repeat is left alone', () => {
+    const e = new L.EphemeralCommands()
+    expect(e.check(-100123, 7, 560, 0, now)).toBeUndefined()
+    expect(e.check(-100123, 7, 560, 0, now)).toBe('again')
+  })
+  test('an id is forgotten after a while, since Telegram may give it to a new message', () => {
+    const e = new L.EphemeralCommands(3600)
+    expect(e.check(-100123, 7, 561, now, now)).toBeUndefined()
+    expect(e.check(-100123, 7, 561, now + 3600, now + 3600)).toBeUndefined()
+  })
+  test('what it remembers is bounded, oldest out first', () => {
+    const e = new L.EphemeralCommands(48 * 3600, 3)
+    for (const id of [1, 2, 3, 4]) e.check(-100123, 7, id, now, now)
+    expect(e.check(-100123, 7, 1, now, now)).toBeUndefined()
+    expect(e.check(-100123, 7, 4, now, now)).toBe('again')
+  })
+})

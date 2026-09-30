@@ -3090,6 +3090,30 @@ describe('/config — group settings from Telegram', () => {
     expect(menus[0].payload.reply_parameters).toEqual({ ephemeral_message_id: 55 })
   })
 
+  // Seen in production: /config commands answered in the evening arrived again the
+  // next morning, ids unchanged. A private reply was refused by then
+  // (REPLY_TO_INVALID), and the fallback posted each menu for the whole group.
+  const ephemeralCmd = (id: number, date: number) => ({ message_id: 0, ephemeral_message_id: id, date,
+    receiver_user: { id: 42, is_bot: true, first_name: 'TestBot' } })
+  const nowS = () => Math.floor(Date.now() / 1000)
+
+  test('an ephemeral /config delivered hours after it was sent is left alone: no menu, private or public', async () => {
+    const cs = await groupMsg(undefined, '/config', 1, ephemeralCmd(61, nowS() - 5 * 3600))
+    expect(sends(cs).filter(c => cfButtons(c).length)).toEqual([])
+  })
+
+  test('the same ephemeral /config delivered twice is answered once', async () => {
+    const first = await groupMsg(undefined, '/config', 1, ephemeralCmd(62, nowS()))
+    const again = await groupMsg(undefined, '/config', 1, ephemeralCmd(62, nowS()))
+    expect(sends(first).filter(c => cfButtons(c).length).length).toBe(1)
+    expect(sends(again).filter(c => cfButtons(c).length)).toEqual([])
+  })
+
+  test('a typed /config that waited while the bridge was down still gets its menu', async () => {
+    const cs = await groupMsg(301, '/config', 1, { date: nowS() - 3600 })
+    expect(sends(cs).filter(c => cfButtons(c).length).length).toBe(1)
+  })
+
   test('the command list is registered, with /config ephemeral', async () => {
     const before = calls.length
     await bridge._ensureCommands()

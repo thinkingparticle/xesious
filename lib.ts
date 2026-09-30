@@ -2323,3 +2323,34 @@ export function triageNeed(fresh: TriageMsg[], botNames: string[]): 'urgent' | '
   }
   return human.every(trivial) ? 'skip' : 'ask'
 }
+
+// ---------------------------------------------------------------------------
+// Ephemeral commands delivered again
+// ---------------------------------------------------------------------------
+//
+// A command registered with is_ephemeral (/config), picked from the menu, arrives
+// with an ephemeral id instead of a message id, and can be answered only privately
+// and only within this many seconds of being sent. Telegram has delivered such
+// commands a second time, hours later and several at once, their ids unchanged; by
+// then the only answer the bridge could give was one the whole group sees. So an
+// ephemeral command that is past the window, or was already handled, is left alone.
+// Ordinary commands are not: one that waited while the bridge was down is still
+// wanted. A date of 0 is Telegram's "no date", not a time.
+export const EPHEMERAL_REPLY_WINDOW_S = 15
+
+export class EphemeralCommands {
+  // chat:user:ephemeral id → when it was first handled (unix s), oldest first.
+  private seen = new Map<string, number>()
+  constructor(private keepS = 48 * 3600, private max = 10_000) {}
+
+  // Why this command should be left alone — 'again' (handled before) or 'late'
+  // (past the reply window) — or undefined to answer it.
+  check(chat: number | string, user: number, ephemeralId: number, date: number, now: number): 'again' | 'late' | undefined {
+    for (const [k, t] of this.seen) { if (now - t < this.keepS) break; this.seen.delete(k) }
+    const key = `${chat}:${user}:${ephemeralId}`
+    if (this.seen.has(key)) return 'again'
+    this.seen.set(key, now)
+    if (this.seen.size > this.max) this.seen.delete(this.seen.keys().next().value as string)
+    return date > 0 && now - date > EPHEMERAL_REPLY_WINDOW_S ? 'late' : undefined
+  }
+}

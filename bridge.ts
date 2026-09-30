@@ -44,6 +44,7 @@ import {
   DEFAULT_EDITORS, escapeHtml, type SettingDef,
   effectiveAnswers, effectiveRecords, foldRecords, contextParts, convLine, fitNewest,
   conversationPreamble, conversationFile, type ConvRecord, type Answers, type SettingValue, type SettingSource, type EditorPolicy, type EditorMode,
+  EphemeralCommands, EPHEMERAL_REPLY_WINDOW_S,
   readsAlong, AUTO_PACE, asEagerness, triageDelay, triageSystemPrompt, triageCompactPrompt, triageUserPrompt, parseTriage, joinProbability, triageNeed,
   isSilentReply, SILENT_REPLY, type TriageMsg, type Eagerness,
   needsRich, sanitizeProse,
@@ -5463,6 +5464,9 @@ bot.api.config.use(autoRetry({ maxRetryAttempts: 5, maxDelaySeconds: 60 }))
 let botUsername = ''
 bot.use(async (ctx, next) => { noteUser(ctx); await next() })
 
+// Ephemeral commands already handled, so one delivered again is left alone.
+const ephemeralCommands = new EphemeralCommands()
+
 bot.on('message', async ctx => {
   const msg = ctx.message
   if (!msg || !ctx.from || ctx.from.is_bot) return
@@ -5559,6 +5563,19 @@ bot.on('message', async ctx => {
   if (!text) return
   const key = keyFor(chatId, threadId)
   console.log(`[in] chat=${chatId}(${ctx.chat.type}) topic=${threadId ?? '-'} from=${ctx.from.id}${(msg as any).ephemeral_message_id ? ' (ephemeral)' : ''} ${JSON.stringify(text).slice(0, 100)}`)
+  // An ephemeral command (picked from the menu, e.g. /config) can be answered only
+  // privately and only for a few seconds; one Telegram delivers again later would get
+  // a menu the whole group sees (lib.ts: EphemeralCommands).
+  const ephemeralId = (msg as any).ephemeral_message_id as number | undefined
+  if (ephemeralId) {
+    const now = Math.floor(Date.now() / 1000)
+    const why = ephemeralCommands.check(chatId, ctx.from.id, ephemeralId, msg.date, now)
+    if (why) {
+      console.log(`[in] left alone: ${why === 'again' ? `ephemeral command ${ephemeralId} was already handled`
+        : `sent ${now - msg.date} s ago, past the ${EPHEMERAL_REPLY_WINDOW_S} s in which it can be answered privately`}`)
+      return
+    }
+  }
 
   const cmd = text.startsWith('/') ? text.split(/\s+/)[0].replace(/@.*$/, '').toLowerCase() : ''
   // Track EVERY inbound message, commands included. A /interrupt typed while a
